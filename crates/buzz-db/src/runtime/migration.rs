@@ -735,6 +735,7 @@ mod postgres_tests {
         assert_eq!(migrations[64].version, 66);
         let retire_nip_rs = strip_sql_comments(migrations[64].sql.as_str());
         for statement in [
+            "SET LOCAL lock_timeout = '5s';",
             "DROP TRIGGER trg_events_nip_rs_watermark ON events;",
             "DROP TRIGGER trg_events_guard_nip_rs_hard_delete ON events;",
             "DROP TRIGGER trg_events_purge_soft_deleted_nip_rs ON events;",
@@ -751,6 +752,11 @@ mod postgres_tests {
                 "0066 must run {statement}"
             );
         }
+        assert!(
+            retire_nip_rs.find("SET LOCAL lock_timeout").unwrap()
+                < retire_nip_rs.find("DROP TRIGGER").unwrap(),
+            "0058 must bound its ACCESS EXCLUSIVE lock on events before the first DROP"
+        );
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql
@@ -2794,8 +2800,7 @@ mod postgres_tests {
 
         // Every migration-only trigger on the event tables is retired, so a
         // fully migrated database carries exactly the desired-state triggers.
-        MIGRATOR
-            .run(&migrated)
+        run_migrations(&migrated)
             .await
             .expect("apply remaining migrations");
         for table in ["events", "event_mentions"] {
