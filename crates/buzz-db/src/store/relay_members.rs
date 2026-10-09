@@ -188,6 +188,10 @@ pub async fn claim_relay_membership(
         observability::WriterOperation::Authorization,
     )
     .await?;
+    super::relay_invite::lock_admission(tx.conn(), community).await?;
+    if super::relay_invite::principal_restricted(tx.conn(), community, pubkey).await? {
+        return Err(DbError::InviteRestricted);
+    }
     let inserted = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, 'invite') \
