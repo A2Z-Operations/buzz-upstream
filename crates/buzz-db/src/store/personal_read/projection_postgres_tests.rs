@@ -1,26 +1,16 @@
 use super::{postgres_tests::fixture, *};
 use crate::Db;
 use nostr::{EventBuilder, Keys, Kind, Tag};
-use serde_json::json;
 
+/// Eligibility is classified at ingest (kind) and at read (author, deletion,
+/// horizon). Each case is stored through ingest, then rewritten in place for
+/// the read-time facts.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn sidebar_sql_eligibility_follows_kind_author_deletion_and_horizon() {
-    let (db, pool, community, _, actor, event) = fixture().await;
+    let (db, pool, community, channel, actor, _) = fixture().await;
     let now = chrono::Utc::now().timestamp_millis();
     let horizon = i64::from(DEFAULT_RETENTION_SECONDS) * 1000;
-    // Addressed to the actor, so a counted message is also exactly one mention.
-    let tags = json!([["p", actor.public_key().to_hex()]]);
-    sqlx::query(
-        "INSERT INTO event_mentions
-            (community_id,pubkey_hex,event_id,event_created_at,channel_id,event_kind)
-         SELECT community_id,$2,id,created_at,channel_id,kind FROM events WHERE community_id=$1",
-    )
-    .bind(community.as_uuid())
-    .bind(actor.public_key().to_hex())
-    .execute(&pool)
-    .await
-    .unwrap();
     for (kind, eligible_kind) in [
         (9, true),
         (40002, true),
@@ -28,9 +18,22 @@ async fn sidebar_sql_eligibility_follows_kind_author_deletion_and_horizon() {
         (45003, true),
         (1, false),
         (7, false),
-        (39002, false),
         (40008, false),
     ] {
+        sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Addressed to the actor, so a counted message is also exactly one mention.
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(kind), "case")
+            .tags([Tag::public_key(actor.public_key())])
+            .sign_with_keys(&author)
+            .unwrap();
+        db.insert_event(community, &event, Some(channel))
+            .await
+            .unwrap();
         for own in [false, true] {
             for deleted in [false, true] {
                 // Now, then one minute inside and one minute outside the horizon.
@@ -40,12 +43,13 @@ async fn sidebar_sql_eligibility_follows_kind_author_deletion_and_horizon() {
                     (horizon + 60_000, false),
                 ] {
                     let created = now - age;
-                    sqlx::query("UPDATE events SET kind=$2,pubkey=$3,deleted_at=CASE WHEN $4 THEN now() ELSE NULL END,created_at=to_timestamp($5::double precision/1000),tags=$6 WHERE community_id=$1")
-                        .bind(community.as_uuid()).bind(kind)
-                        .bind(if own { actor.public_key().to_bytes() } else { event.pubkey.to_bytes() }.as_slice())
-                        .bind(deleted).bind(created as f64).bind(&tags).execute(&pool).await.unwrap();
-                    sqlx::query("UPDATE event_mentions SET event_created_at=to_timestamp($2::double precision/1000) WHERE community_id=$1")
-                        .bind(community.as_uuid()).bind(created as f64).execute(&pool).await.unwrap();
+                    sqlx::query("UPDATE events SET pubkey=$3,deleted_at=CASE WHEN $4 THEN now() ELSE NULL END,created_at=to_timestamp($5::double precision/1000) WHERE community_id=$1 AND id=$2")
+                        .bind(community.as_uuid()).bind(event.id.as_bytes().as_slice())
+                        .bind(if own { actor.public_key() } else { author.public_key() }.to_bytes().as_slice())
+                        .bind(deleted).bind(created as f64).execute(&pool).await.unwrap();
+                    sqlx::query("UPDATE event_mentions SET event_created_at=to_timestamp($3::double precision/1000) WHERE community_id=$1 AND event_id=$2")
+                        .bind(community.as_uuid()).bind(event.id.as_bytes().as_slice())
+                        .bind(created as f64).execute(&pool).await.unwrap();
                     let page = db
                         .personal_read_sidebar(
                             community,
@@ -69,10 +73,12 @@ async fn sidebar_sql_eligibility_follows_kind_author_deletion_and_horizon() {
     }
 }
 
+/// A message with a NIP-10 reply marker but no recorded ancestry is on
+/// neither read path, by the shared parser's definition of a reply.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn sidebar_ancestry_fact_matches_shared_nip10_parser() {
-    let (db, pool, community, _, actor, _) = fixture().await;
+    let (db, pool, community, channel, actor, _) = fixture().await;
     let ids = [
         "a".repeat(64),
         "A".repeat(64),
@@ -104,10 +110,20 @@ async fn sidebar_ancestry_fact_matches_shared_nip10_parser() {
             buzz_core::nip10::parse_thread_markers_from_parts(tags.iter().map(Vec::as_slice))
                 .resolve()
                 .is_some();
-        sqlx::query("UPDATE events SET tags=$2 WHERE community_id=$1")
+        sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1")
             .bind(community.as_uuid())
-            .bind(json!(tags))
             .execute(&pool)
+            .await
+            .unwrap();
+        let parsed: Vec<Tag> = tags
+            .iter()
+            .map(|tag| Tag::parse(tag.iter().map(String::as_str)).unwrap())
+            .collect();
+        let event = EventBuilder::new(Kind::Custom(9), "case")
+            .tags(parsed)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        db.insert_event(community, &event, Some(channel))
             .await
             .unwrap();
         let page = db

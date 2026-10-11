@@ -1,5 +1,5 @@
-//! Read state that ingest writes. A thread frontier row exists only for a
-//! thread its actor follows; only this module creates one.
+//! Read state that ingest writes. A thread frontier row exists for a thread
+//! its actor follows or has unfollowed; ingest and follow intents create one.
 use super::model::ELIGIBLE_KINDS;
 use crate::{AdmittedTx, Result};
 use chrono::{DateTime, Utc};
@@ -11,19 +11,75 @@ use uuid::Uuid;
 pub(crate) enum Place<'a> {
     /// A top-level timeline message.
     TopLevel,
-    /// A reply in the thread rooted at `root`.
-    Reply { root: &'a [u8] },
+    /// A reply in the thread rooted at `root`, authored at `root_created_at`;
+    /// a broadcast reply is also on the channel timeline.
+    Reply {
+        root: &'a [u8],
+        root_created_at: DateTime<Utc>,
+        broadcast: bool,
+    },
+}
+
+impl Place<'_> {
+    /// Whether the message counts on its channel timeline (`read_timeline`).
+    pub(crate) fn on_timeline(&self) -> bool {
+        matches!(
+            self,
+            Place::TopLevel
+                | Place::Reply {
+                    broadcast: true,
+                    ..
+                }
+        )
+    }
+}
+
+/// A reply's recorded ancestry: its root, the root's author time, and whether
+/// it is a broadcast.
+pub(crate) type Ancestry<'a> = (&'a [u8], Option<DateTime<Utc>>, bool);
+
+/// Where an eligible channel message sits, from its recorded ancestry. None
+/// for other events, and for a reply whose ancestry was never (fully)
+/// recorded: it is on neither read path.
+pub(crate) fn place<'a>(
+    event: &Event,
+    channel: Option<Uuid>,
+    reply: Option<Ancestry<'a>>,
+) -> Option<(Uuid, Place<'a>)> {
+    let channel = channel?;
+    if !ELIGIBLE_KINDS.contains(&i32::from(event.kind.as_u16())) {
+        return None;
+    }
+    match reply {
+        Some((root, root_created_at, broadcast)) => Some((
+            channel,
+            Place::Reply {
+                root,
+                root_created_at: root_created_at?,
+                broadcast,
+            },
+        )),
+        None if buzz_core::nip10::parse_thread_markers(&event.tags)
+            .resolve()
+            .is_some() =>
+        {
+            None
+        }
+        None => Some((channel, Place::TopLevel)),
+    }
 }
 
 /// Record what a newly stored eligible message changes, in its transaction:
 /// - its author has read through it: the timeline for a top-level message,
-///   otherwise the thread, which the author then follows;
+///   otherwise the thread, which the author then follows (and the timeline
+///   too for a broadcast reply);
 /// - each channel member it mentions follows its thread (for a top-level
 ///   message, the thread rooted at it);
 /// - a reply makes the root's author, and in a DM every member, follow too.
 ///
 /// Everyone but the author starts just before the message, so it is unread
-/// to them. A follower keeps an existing position.
+/// to them. A follower keeps an existing position. An unfollow sticks until
+/// its actor posts in the thread or is mentioned there again.
 pub(crate) async fn record_message(
     tx: &mut AdmittedTx,
     event: &Event,
@@ -41,40 +97,49 @@ pub(crate) async fn record_message(
         .public_keys()
         .map(|key| key.to_bytes().to_vec())
         .collect();
-    let (read, thread, reply) = match place {
-        Place::TopLevel => (&[][..], id, false),
-        Place::Reply { root } => (root, root, true),
+    let (read, thread, reply, root_created_at, broadcast) = match place {
+        Place::TopLevel => (&[][..], id, false, None, false),
+        Place::Reply {
+            root,
+            root_created_at,
+            broadcast,
+        } => (root, root, true, Some(root_created_at), broadcast),
     };
     // Accounts, then frontiers, each in key order, so concurrent messages that
     // involve the same people cannot deadlock: the frontier insert joins the
     // finished account insert. Foreign-key checks run at the end of the
     // statement, after the account rows exist.
     sqlx::query(
-        "WITH involved (actor, root_id, through, message) AS (
-            SELECT $4::bytea, $5::bytea, $6::timestamptz, $3::bytea
+        "WITH involved (actor, root_id, through, message, refollow) AS (
+            SELECT $4::bytea, $5::bytea, $6::timestamptz, $3::bytea, true
             UNION ALL
-            SELECT cm.pubkey, $7, $6-interval '1 microsecond', NULL FROM channel_members cm
+            SELECT $4, ''::bytea, $6, $3, true WHERE $11
+            UNION ALL
+            SELECT cm.pubkey, $7, $6-interval '1 microsecond', NULL, true FROM channel_members cm
             WHERE cm.community_id=$1 AND cm.channel_id=$2 AND cm.removed_at IS NULL
                 AND cm.pubkey=ANY($8) AND cm.pubkey<>$4
             UNION ALL
-            SELECT e.pubkey, $7, $6-interval '1 microsecond', NULL FROM events e
-            WHERE $9 AND e.community_id=$1 AND e.channel_id=$2 AND e.id=$7 AND e.pubkey<>$4
+            SELECT e.pubkey, $7, $6-interval '1 microsecond', NULL, false FROM events e
+            WHERE $9 AND e.community_id=$1 AND e.created_at=$10 AND e.id=$7
+                AND e.channel_id=$2 AND e.pubkey<>$4
             UNION ALL
-            SELECT cm.pubkey, $7, $6-interval '1 microsecond', NULL
+            SELECT cm.pubkey, $7, $6-interval '1 microsecond', NULL, false
             FROM channel_members cm JOIN channels c
                 ON c.community_id=cm.community_id AND c.id=cm.channel_id
             WHERE $9 AND cm.community_id=$1 AND cm.channel_id=$2 AND cm.removed_at IS NULL
                 AND c.channel_type='dm' AND cm.pubkey<>$4
          ), rows AS (
-            -- An existing follower keeps their position, so is not touched.
-            -- Existence probes are LIMIT 1 laterals: always one index lookup.
+            -- An existing follower keeps their position, so is not touched;
+            -- nor is an unfollow, unless this message re-follows (the author
+            -- posting, or a mention). Existence probes are LIMIT 1 laterals:
+            -- always one index lookup.
             SELECT DISTINCT ON (i.actor, i.root_id) i.* FROM involved i
             LEFT JOIN LATERAL (
-                SELECT true AS found FROM personal_read_frontiers f WHERE f.community_id=$1
+                SELECT f.unfollowed FROM personal_read_frontiers f WHERE f.community_id=$1
                     AND f.actor=i.actor AND f.channel_id=$2 AND f.root_id=i.root_id LIMIT 1
             ) f ON true
-            WHERE i.message IS NOT NULL OR f.found IS NULL
-            ORDER BY i.actor, i.root_id
+            WHERE i.message IS NOT NULL OR f.unfollowed IS NULL OR (i.refollow AND f.unfollowed)
+            ORDER BY i.actor, i.root_id, i.message IS NULL, NOT i.refollow
          ), accounts AS (
             INSERT INTO personal_read_accounts (community_id, actor)
             SELECT $1, r.actor FROM (SELECT DISTINCT actor FROM rows) r
@@ -85,6 +150,9 @@ pub(crate) async fn record_message(
             WHERE a.found IS NULL ORDER BY r.actor
             ON CONFLICT DO NOTHING RETURNING 1
          )
+         -- A re-follow starts just before this message, like a new follow,
+         -- unless the unfollow is later. A row that a concurrent message
+         -- created is only advanced when it carries an anchor.
          INSERT INTO personal_read_frontiers
             (community_id, actor, channel_id, root_id, through_timestamp, through_message_id)
          SELECT $1, actor, $2, root_id, through, message
@@ -95,8 +163,10 @@ pub(crate) async fn record_message(
                 excluded.through_timestamp),
             through_message_id=CASE
                 WHEN excluded.through_timestamp > personal_read_frontiers.through_timestamp
-                THEN excluded.through_message_id ELSE personal_read_frontiers.through_message_id END
-         WHERE excluded.through_message_id IS NOT NULL",
+                THEN excluded.through_message_id ELSE personal_read_frontiers.through_message_id END,
+            unfollowed=false
+         WHERE excluded.through_message_id IS NOT NULL OR (personal_read_frontiers.unfollowed
+            AND excluded.through_timestamp > personal_read_frontiers.through_timestamp)",
     )
     .bind(community.as_uuid())
     .bind(channel)
@@ -107,6 +177,8 @@ pub(crate) async fn record_message(
     .bind(thread)
     .bind(&mentioned)
     .bind(reply)
+    .bind(root_created_at)
+    .bind(broadcast)
     .execute(tx.conn())
     .await?;
     Ok(())

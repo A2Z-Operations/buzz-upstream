@@ -363,6 +363,115 @@ async fn accessory_batch_outcomes_are_independent_and_return_applied_rows() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn accessory_follow_intents_and_threads_view() {
+    let fixture = crate::api::bridge::postgres_tests::bridge_handler_test_state()
+        .await
+        .unwrap();
+    let mut state = (*fixture).clone();
+    Arc::make_mut(&mut state.config).buzz_v1_enabled = true;
+    let state = Arc::new(state);
+    let host = format!("bff-threads-{}.local", uuid::Uuid::new_v4());
+    let community = state
+        .db
+        .ensure_configured_community(&host)
+        .await
+        .unwrap()
+        .id;
+    let actor = Keys::generate();
+    let channel = state
+        .db
+        .create_channel(
+            community,
+            "threads",
+            buzz_db::channel::ChannelType::Stream,
+            buzz_db::channel::ChannelVisibility::Open,
+            None,
+            &actor.public_key().to_bytes(),
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    start_before_everything(&state, community, &actor).await;
+    let mut roots = Vec::new();
+    for _ in 0..2 {
+        let root = EventBuilder::new(Kind::Custom(9), "root")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        state
+            .db
+            .insert_event(community, &root, Some(channel))
+            .await
+            .unwrap();
+        roots.push(root);
+    }
+    let write_path = "/buzz/v1/me/read-state";
+    let body = serde_json::to_vec(&json!({"intents":[
+        {"type":"follow","target":{"channel_id":channel}},
+        {"type":"follow","target":{"channel_id":channel,"root_id":roots[0].id.to_hex()}},
+        {"type":"follow","target":{"channel_id":channel,"root_id":roots[1].id.to_hex()}},
+        {"type":"unfollow","target":{"channel_id":channel,"root_id":roots[1].id.to_hex()}}
+    ]}))
+    .unwrap();
+    let auth = proof(&actor, &host, write_path, "POST", Some(&body));
+    let result = request(state.clone(), &host, write_path, "POST", Some(&auth), &body).await;
+    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
+    assert_eq!(
+        result.1["outcomes"],
+        json!([{"status":"invalid"},{"status":"applied"},{"status":"applied"},{"status":"applied"}])
+    );
+    assert_eq!(result.1["channels"][0]["channel_id"], json!(channel));
+
+    let mut replies = Vec::new();
+    for root in &roots {
+        let reply = EventBuilder::new(Kind::Custom(9), "reply")
+            .tags([Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let at = |e: &nostr::Event| {
+            chrono::DateTime::from_timestamp(e.created_at.as_secs() as i64, 0).unwrap()
+        };
+        state
+            .db
+            .insert_event_with_thread_metadata(
+                community,
+                &reply,
+                Some(channel),
+                Some(buzz_db::event::ThreadMetadataParams {
+                    event_id: reply.id.as_bytes(),
+                    event_created_at: at(&reply),
+                    channel_id: channel,
+                    parent_event_id: Some(root.id.as_bytes()),
+                    parent_event_created_at: Some(at(root)),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(at(root)),
+                    depth: 1,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .unwrap();
+        replies.push(reply);
+    }
+    let path = "/buzz/v1/me/threads?limit=1";
+    let auth = proof(&actor, &host, path, "GET", None);
+    let result = request(state.clone(), &host, path, "GET", Some(&auth), b"").await;
+    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
+    // Only the followed thread, unread since the follow.
+    assert_eq!(
+        result.1,
+        json!({"threads":[{"channel_id":channel,"root_id":roots[0].id.to_hex(),
+            "unread":true,"mentions":0,"read_through_id":null,
+            "latest_id":replies[0].id.to_hex()}],"next_cursor":null})
+    );
+    let path = "/buzz/v1/me/threads?cursor=not-a-cursor";
+    let auth = proof(&actor, &host, path, "GET", None);
+    let result = request(state.clone(), &host, path, "GET", Some(&auth), b"").await;
+    assert_eq!(result.0, StatusCode::BAD_REQUEST, "{}", result.1);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn accessory_write_revocation_is_terminal_before_persistence() {
     let fixture = crate::api::bridge::postgres_tests::bridge_handler_test_state()
         .await
@@ -495,7 +604,8 @@ async fn accessory_discovery_is_host_bound_and_opt_in() {
                         doc["buzz_v1"],
                         json!({"version":1,"base_path":"/buzz/v1","retention_seconds":1234,
                             "max_channels":20,"max_intents":100,
-                            "eligible_kinds":[9, 40002, 45001, 45003]})
+                            "eligible_kinds":[9, 40002, 45001, 45003],
+                            "capabilities":["follow","threads"],"max_threads":50})
                     );
                 }
             }

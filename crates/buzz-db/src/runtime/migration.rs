@@ -705,7 +705,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 60);
+        assert_eq!(migrations.len(), 61);
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
@@ -713,6 +713,11 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("ALTER TABLE push_leases DROP COLUMN app_profile"));
+        assert_eq!(migrations[60].version, 61);
+        assert!(migrations[60]
+            .sql
+            .as_str()
+            .contains("idx_events_read_timeline"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql
@@ -2253,6 +2258,16 @@ mod postgres_tests {
             .sql
             .as_str();
         assert!(through_message.contains("DROP COLUMN threads_through_timestamp"));
+        // 0061 adds the sticky thread unfollow.
+        let unfollowed_column = "unfollowed boolean not null default false \
+            check (not unfollowed or root_id <> ''::bytea), ";
+        assert!(MIGRATOR
+            .iter()
+            .find(|m| m.version == 61)
+            .expect("read-state access path migration")
+            .sql
+            .as_str()
+            .contains("$d$BOOLEAN NOT NULL DEFAULT false CHECK (NOT unfollowed OR root_id <> ''::bytea)$d$"));
         for (table, definition) in personal.tables {
             let in_schema = schema.tables.get(&table).map(|schema_definition| {
                 if table == "personal_read_accounts" {
@@ -2262,7 +2277,11 @@ mod postgres_tests {
                 }
             });
             let definition = if table == "personal_read_frontiers" {
-                definition.replacen(threads_through_column, through_message_column, 1)
+                definition.replacen(
+                    threads_through_column,
+                    &format!("{through_message_column}{unfollowed_column}"),
+                    1,
+                )
             } else {
                 definition
             };

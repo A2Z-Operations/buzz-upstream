@@ -28,6 +28,29 @@ pub enum ReadIntent {
         /// Fixed anchor; retry must not substitute the latest message.
         message_id: String,
     },
+    /// Follow a thread. A new follow, or one after an unfollow, starts now;
+    /// an existing follow keeps its position.
+    Follow {
+        /// The thread; a channel-only target is invalid.
+        target: ReadTarget,
+    },
+    /// Stop following a thread until the actor posts in it or is mentioned
+    /// there again.
+    Unfollow {
+        /// The thread; a channel-only target is invalid.
+        target: ReadTarget,
+    },
+}
+
+impl ReadIntent {
+    /// The intent's target.
+    pub fn target(&self) -> &ReadTarget {
+        match self {
+            ReadIntent::MarkThrough { target, .. }
+            | ReadIntent::Follow { target }
+            | ReadIntent::Unfollow { target } => target,
+        }
+    }
 }
 
 /// Outcome for one independent transaction, never acknowledged before commit.
@@ -57,16 +80,11 @@ pub const MAX_CHANNELS: usize = 20;
 /// Maximum thread rows per channel row. A POST can return rows for
 /// `MAX_INTENTS` channels, and they must fit the 1 MiB response limit.
 pub const MAX_THREAD_SUMMARIES: usize = 25;
-/// Events each walk examines before eligibility: newest-first for the
-/// newest timeline message, then for the last arrival among those authored up
-/// to twice the skew before it (in a thread too), and forward from the read
-/// position for DM counts. What lies past the budget goes unseen.
-pub const MAX_TIMELINE_SCAN: usize = 4096;
 /// Counts stop here: a count of 100 means at least 100.
 pub const MAX_UNREAD_COUNT: usize = 100;
 /// The relay accepts author times up to this far from arrival either way.
-/// Read positions are arrival times and the indexes are by author time, so
-/// every forward walk starts this much before the position.
+/// Read positions are arrival times and mentions are indexed by author time,
+/// so a mention walk starts this much before the position.
 pub const MAX_ARRIVAL_SKEW_SECONDS: u32 = 15 * 60;
 /// Conversation kinds eligible for ordinary unread state (not edits/reactions).
 pub const ELIGIBLE_KINDS: [i32; 4] = [9, 40002, 45001, 45003];
@@ -89,7 +107,7 @@ pub struct ChannelReadSummary {
     /// Last eligible top-level message to arrive, whatever its author or read
     /// progress: marking the timeline through it reads the timeline.
     pub latest_id: Option<String>,
-    /// Followed threads with unread replies, newest unread reply first.
+    /// Followed threads with unread replies, newest arrival first.
     pub threads: Vec<ThreadReadSummary>,
 }
 
@@ -98,9 +116,10 @@ pub struct ChannelReadSummary {
 pub struct ThreadReadSummary {
     /// Canonical thread-root event ID.
     pub root_id: String,
-    /// Whether an unread reply that counts was found.
+    /// Whether the last reply to arrive is unread.
     pub unread: bool,
-    /// Unread replies by others in this followed thread.
+    /// Unread replies directed at the actor: every one in a DM, otherwise
+    /// those that tag the actor with `p`.
     pub mentions: u32,
     /// The anchor of the thread's frontier: the marked or own reply that
     /// arrived last. None for a follower who has read nothing yet.
@@ -116,4 +135,44 @@ pub struct SidebarPage {
     pub channels: Vec<ChannelReadSummary>,
     /// Exclusive UUID roster cursor. None means this roster scan exhausted.
     pub next_cursor: Option<Uuid>,
+}
+
+/// Maximum rows in one threads page.
+pub const MAX_THREADS: usize = 50;
+
+/// One followed thread in the threads view.
+#[derive(Debug, Serialize)]
+pub struct FollowedThread {
+    /// Joined channel UUID.
+    pub channel_id: Uuid,
+    /// The thread's read state; `unread` may be false here.
+    #[serde(flatten)]
+    pub thread: ThreadReadSummary,
+}
+
+/// A page of followed threads, newest arrival first.
+#[derive(Debug, Serialize)]
+pub struct ThreadsPage {
+    /// Followed threads in joined channels.
+    pub threads: Vec<FollowedThread>,
+    /// Opaque exclusive cursor. None means this scan exhausted.
+    pub next_cursor: Option<String>,
+}
+
+/// Where a threads page resumes: after this arrival and root.
+#[derive(Clone, Debug)]
+pub struct ThreadsCursor {
+    pub(super) latest_at: DateTime<Utc>,
+    pub(super) root_id: Vec<u8>,
+}
+
+impl ThreadsCursor {
+    /// Parse a `next_cursor` value; None if it is not one.
+    pub fn parse(value: &str) -> Option<Self> {
+        let (micros, root) = value.split_once('.')?;
+        Some(Self {
+            latest_at: DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            root_id: super::writes::event_id(root)?,
+        })
+    }
 }

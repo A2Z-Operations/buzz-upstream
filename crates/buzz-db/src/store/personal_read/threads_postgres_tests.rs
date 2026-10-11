@@ -1,6 +1,6 @@
 //! Thread summaries, anchor validation and targeted refresh.
 use super::{
-    postgres_tests::{fixture, insert_reply},
+    postgres_tests::{fixture, insert_reply, sync_reply_arrivals},
     *,
 };
 use crate::{
@@ -179,7 +179,7 @@ async fn thread_summaries_order_cap_and_anchor() {
         channel_mark(channel, newest_root.id.to_hex()),
     )
     .await;
-    // Threads 0 and 1 tie on newest reply time and the rest follow, newest
+    // Threads 0 and 1 tie on last arrival and the rest follow, newest
     // first. Thread 2 has one directed reply and two that arrive last,
     // together.
     let offset = |i: u64| if i < 2 { n * 10 } else { (n - i) * 10 };
@@ -206,14 +206,18 @@ async fn thread_summaries_order_cap_and_anchor() {
         vec![],
     )
     .await;
+    // Replies arrive in author order, so the twin and thread 2's anchor
+    // arrive together.
     sqlx::query(
-        "UPDATE events SET received_at=(SELECT received_at FROM events WHERE id=$1) WHERE id=$2",
+        "UPDATE events e SET received_at=e.created_at FROM thread_metadata tm
+         WHERE tm.community_id=e.community_id AND tm.event_id=e.id
+             AND tm.received_at IS NOT NULL AND e.community_id=$1",
     )
-    .bind(twin.id.as_bytes().as_slice())
-    .bind(anchors[2].id.as_bytes().as_slice())
+    .bind(community.as_uuid())
     .execute(&pool)
     .await
     .unwrap();
+    sync_reply_arrivals(&pool).await;
 
     let row = sidebar(&db, community, &actor).await;
     // Every root is read; the eight unread replies count only on threads.
@@ -230,7 +234,7 @@ async fn thread_summaries_order_cap_and_anchor() {
     // The oldest unread thread is past the cap.
     assert_eq!(order(&row), [tied.to_vec(), ids(&roots[2..last])].concat());
     let third = &row.threads[2];
-    assert_eq!(third.mentions, 3);
+    assert_eq!(third.mentions, 1, "only the directed reply is a mention");
     assert_eq!(
         third.latest_id,
         std::cmp::min(anchors[2].id.to_hex(), twin.id.to_hex()),
@@ -249,8 +253,8 @@ async fn thread_summaries_order_cap_and_anchor() {
         [vec![tied[1].clone()], ids(&roots[2..])].concat()
     );
     let mentions: Vec<_> = row.threads.iter().map(|t| t.mentions).collect();
-    let mut expected = vec![1; MAX_THREAD_SUMMARIES];
-    expected[1] = 3;
+    let mut expected = vec![0; MAX_THREAD_SUMMARIES];
+    expected[1] = 1;
     assert_eq!(mentions, expected);
 }
 

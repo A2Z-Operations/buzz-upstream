@@ -95,7 +95,7 @@ async fn follow(
     .unwrap()
 }
 
-/// (root, unread replies) for each listed thread.
+/// (root, mentions) for each listed thread.
 fn threads(row: &ChannelReadSummary) -> Vec<(String, u32)> {
     row.threads
         .iter()
@@ -129,7 +129,8 @@ async fn replying_follows_the_thread_and_reads_through_the_reply() {
 
     let other = reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
     let summary = row(&db, community, channel, &actor).await;
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
+    // Unread, but not directed at the actor.
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 0)]);
     assert_eq!(summary.threads[0].latest_id, other.id.to_hex());
     assert_eq!(summary.threads[0].read_through_id, Some(own.id.to_hex()));
 }
@@ -148,9 +149,9 @@ async fn a_mention_follows_a_member_from_just_before_it() {
 
     assert_eq!(follow(&pool, community, &bee, &root).await, Some(None));
     assert_eq!(follow(&pool, community, &outsider, &root).await, None);
-    // The mention and what came after it; not the reply before it.
+    // The mention and what came after it are unread; not the reply before it.
     let summary = row(&db, community, channel, &bee).await;
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 2)]);
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
     assert_ne!(summary.threads[0].latest_id, earlier.id.to_hex());
     assert_ne!(summary.threads[0].latest_id, mentioning.id.to_hex());
 }
@@ -175,7 +176,7 @@ async fn a_later_mention_keeps_the_followers_position() {
         Some(Some(own.id.to_hex()))
     );
     let summary = row(&db, community, channel, &actor).await;
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 2)]);
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
 }
 
 #[tokio::test]
@@ -188,7 +189,7 @@ async fn the_root_author_follows_on_the_first_reply() {
     reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
     assert_eq!(follow(&pool, community, &actor, &root).await, Some(None));
     let summary = row(&db, community, channel, &actor).await;
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 0)]);
 }
 
 #[tokio::test]
@@ -202,7 +203,8 @@ async fn a_top_level_mention_follows_the_thread_rooted_at_it() {
     let summary = row(&db, community, channel, &actor).await;
     // The fixture message and the mention are unread; one is a mention.
     assert_eq!((summary.unread, summary.mentions), (true, 1));
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
+    // The reply is unread but does not mention the actor.
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 0)]);
 }
 
 #[tokio::test]
@@ -236,8 +238,9 @@ async fn an_unfollowed_thread_never_counts_and_marking_it_follows_nothing() {
     let last = reply(&db, community, channel, &root, &Keys::generate(), broadcast).await;
     let summary = row(&db, community, channel, &actor).await;
     assert!(summary.threads.is_empty());
-    // Replies are not on the timeline; only the fixture message is unread.
+    // Only the broadcast reply is also on the timeline.
     assert_eq!((summary.unread, summary.mentions), (true, 0));
+    assert_eq!(summary.latest_id, Some(last.id.to_hex()));
 
     let outcome = db
         .apply_personal_read_intent(
@@ -270,7 +273,7 @@ async fn thread_counts_stop_at_the_cap() {
     reply(&db, community, channel, &root, &actor, vec![]).await;
     let other = Keys::generate();
     for _ in 0..=MAX_UNREAD_COUNT {
-        reply(&db, community, channel, &root, &other, vec![]).await;
+        reply(&db, community, channel, &root, &other, mention(&actor)).await;
     }
     let summary = row(&db, community, channel, &actor).await;
     assert_eq!(
@@ -355,7 +358,7 @@ async fn a_nested_reply_follows_the_root_thread() {
     );
     assert_eq!(follow(&pool, community, &bee, &parent).await, None);
     let summary = row(&db, community, channel, &actor).await;
-    assert_eq!(threads(&summary), [(root.id.to_hex(), 2)]);
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 0)]);
     assert_eq!(summary.threads[0].latest_id, nested.id.to_hex());
 }
 
@@ -370,4 +373,275 @@ async fn a_message_stored_without_thread_metadata_reads_the_timeline() {
     let summary = row(&db, community, channel, &actor).await;
     assert!(!summary.unread);
     assert_eq!(summary.read_through_id, Some(own.id.to_hex()));
+}
+
+fn follow_intent(channel: Uuid, root: Option<&nostr::Event>, follow: bool) -> ReadIntent {
+    let target = ReadTarget {
+        channel_id: channel,
+        root_id: root.map(|r| r.id.to_hex()),
+    };
+    if follow {
+        ReadIntent::Follow { target }
+    } else {
+        ReadIntent::Unfollow { target }
+    }
+}
+
+async fn intent(
+    db: &Db,
+    community: CommunityId,
+    actor: &Keys,
+    intent: ReadIntent,
+) -> IntentOutcome {
+    db.apply_personal_read_intent(community, &actor.public_key(), &intent)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn following_starts_now_and_needs_a_thread() {
+    let (db, pool, community, channel, actor, root) = fixture().await;
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        intent(&db, community, &actor, follow_intent(channel, None, true)).await,
+        IntentOutcome::Invalid
+    );
+    let missing = message(&Keys::generate(), vec![]);
+    assert_eq!(
+        intent(
+            &db,
+            community,
+            &actor,
+            follow_intent(channel, Some(&missing), true)
+        )
+        .await,
+        IntentOutcome::Blocked
+    );
+    assert_eq!(
+        intent(
+            &db,
+            community,
+            &actor,
+            follow_intent(channel, Some(&root), true)
+        )
+        .await,
+        IntentOutcome::Applied
+    );
+    assert_eq!(follow(&pool, community, &actor, &root).await, Some(None));
+    // The reply before the follow is read; the next one is not.
+    assert!(row(&db, community, channel, &actor)
+        .await
+        .threads
+        .is_empty());
+    let next = reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 0)]);
+    assert_eq!(summary.threads[0].latest_id, next.id.to_hex());
+    // Following again keeps the position.
+    intent(
+        &db,
+        community,
+        &actor,
+        follow_intent(channel, Some(&root), true),
+    )
+    .await;
+    assert_eq!(
+        threads(&row(&db, community, channel, &actor).await).len(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn an_unfollow_sticks_until_a_mention_or_own_post() {
+    let (db, pool, community, channel, actor, _) = fixture().await;
+    // The actor's own root: its author follows on every reply.
+    let root = post(&db, community, channel, &actor, vec![]).await;
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        threads(&row(&db, community, channel, &actor).await).len(),
+        1
+    );
+    assert_eq!(
+        intent(
+            &db,
+            community,
+            &actor,
+            follow_intent(channel, Some(&root), false)
+        )
+        .await,
+        IntentOutcome::Applied
+    );
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert!(row(&db, community, channel, &actor)
+        .await
+        .threads
+        .is_empty());
+
+    // A mention follows again, from just before it.
+    let mentioning = reply(
+        &db,
+        community,
+        channel,
+        &root,
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert_eq!(threads(&summary), [(root.id.to_hex(), 1)]);
+    assert_eq!(summary.threads[0].latest_id, mentioning.id.to_hex());
+    assert_eq!(summary.threads[0].read_through_id, None);
+
+    // So does posting, which reads through the post.
+    intent(
+        &db,
+        community,
+        &actor,
+        follow_intent(channel, Some(&root), false),
+    )
+    .await;
+    let own = reply(&db, community, channel, &root, &actor, vec![]).await;
+    assert_eq!(
+        follow(&pool, community, &actor, &root).await,
+        Some(Some(own.id.to_hex()))
+    );
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        threads(&row(&db, community, channel, &actor).await).len(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_broadcast_reply_is_a_timeline_message_and_anchor() {
+    let (db, _pool, community, channel, actor, root) = fixture().await;
+    apply_mark(&db, community, channel, &actor, &root).await;
+    let broadcast = vec![
+        Tag::parse(["broadcast", "1"]).unwrap(),
+        Tag::public_key(actor.public_key()),
+    ];
+    let last = reply(&db, community, channel, &root, &Keys::generate(), broadcast).await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert_eq!((summary.unread, summary.mentions), (true, 1));
+    assert_eq!(summary.latest_id, Some(last.id.to_hex()));
+    assert_eq!(
+        apply_mark(&db, community, channel, &actor, &last).await,
+        IntentOutcome::Applied
+    );
+    assert!(!row(&db, community, channel, &actor).await.unread);
+
+    // A broadcast by the reader reads the timeline through it, as a post does.
+    post(&db, community, channel, &Keys::generate(), vec![]).await;
+    let broadcast = vec![Tag::parse(["broadcast", "1"]).unwrap()];
+    let own = reply(&db, community, channel, &root, &actor, broadcast).await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert!(!summary.unread);
+    assert_eq!(summary.read_through_id, Some(own.id.to_hex()));
+}
+
+async fn apply_mark(
+    db: &Db,
+    community: CommunityId,
+    channel: Uuid,
+    actor: &Keys,
+    message: &nostr::Event,
+) -> IntentOutcome {
+    let mark = ReadIntent::MarkThrough {
+        target: ReadTarget {
+            channel_id: channel,
+            root_id: None,
+        },
+        message_id: message.id.to_hex(),
+    };
+    intent(db, community, actor, mark).await
+}
+
+async fn threads_page(
+    db: &Db,
+    community: CommunityId,
+    actor: &Keys,
+    limit: usize,
+    after: Option<&str>,
+) -> ThreadsPage {
+    let cursor = after.map(|c| ThreadsCursor::parse(c).unwrap());
+    db.personal_read_threads(
+        community,
+        &actor.public_key(),
+        DEFAULT_RETENTION_SECONDS,
+        limit,
+        cursor.as_ref(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn the_threads_view_lists_follows_newest_arrival_first() {
+    let (db, pool, community, channel, actor, _) = fixture().await;
+    let mut roots = Vec::new();
+    for _ in 0..3 {
+        let root = post(&db, community, channel, &Keys::generate(), vec![]).await;
+        reply(&db, community, channel, &root, &actor, vec![]).await;
+        roots.push(root);
+    }
+    // The first thread has news, so it comes first; the rest are read.
+    reply(
+        &db,
+        community,
+        channel,
+        &roots[0],
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    // Neither an unfollowed thread nor one with no reply is listed.
+    let quiet = post(&db, community, channel, &Keys::generate(), mention(&actor)).await;
+    let left = post(&db, community, channel, &Keys::generate(), vec![]).await;
+    reply(&db, community, channel, &left, &actor, vec![]).await;
+    intent(
+        &db,
+        community,
+        &actor,
+        follow_intent(channel, Some(&left), false),
+    )
+    .await;
+    assert_eq!(follow(&pool, community, &actor, &quiet).await, Some(None));
+
+    let first = threads_page(&db, community, &actor, 2, None).await;
+    let rows: Vec<_> = first
+        .threads
+        .iter()
+        .map(|t| (t.thread.root_id.clone(), t.thread.unread, t.thread.mentions))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (roots[0].id.to_hex(), true, 1),
+            (roots[2].id.to_hex(), false, 0)
+        ]
+    );
+    assert!(first.threads.iter().all(|t| t.channel_id == channel));
+    let rest = threads_page(&db, community, &actor, 2, first.next_cursor.as_deref()).await;
+    let rest: Vec<_> = rest
+        .threads
+        .iter()
+        .map(|t| t.thread.root_id.clone())
+        .collect();
+    assert_eq!(rest, [roots[1].id.to_hex()]);
+
+    // Leaving the channel hides its threads.
+    sqlx::query("UPDATE channel_members SET removed_at=now() WHERE community_id=$1 AND pubkey=$2")
+        .bind(community.as_uuid())
+        .bind(actor.public_key().to_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(threads_page(&db, community, &actor, 2, None)
+        .await
+        .threads
+        .is_empty());
 }

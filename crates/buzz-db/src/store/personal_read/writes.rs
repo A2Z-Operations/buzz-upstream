@@ -88,6 +88,8 @@ struct Message {
     id: Vec<u8>,
     received_at: DateTime<Utc>,
     root: Option<Vec<u8>>,
+    /// A reply that is also on the channel timeline.
+    broadcast: bool,
 }
 
 /// A channel event and its canonical ancestry. `kinds` bounds the lookup: an
@@ -100,7 +102,7 @@ async fn message(
     kinds: Option<&[i32]>,
 ) -> Result<Option<Message>> {
     let row = sqlx::query(
-        "SELECT e.id, e.received_at, e.tags, tm.root_event_id
+        "SELECT e.id, e.received_at, e.tags, tm.root_event_id, COALESCE(tm.broadcast, false) AS broadcast
          FROM events e LEFT JOIN thread_metadata tm ON tm.community_id=e.community_id
              AND tm.event_created_at=e.created_at AND tm.event_id=e.id AND tm.channel_id=e.channel_id
          WHERE e.community_id=$1 AND e.channel_id=$2 AND e.id=$3
@@ -125,6 +127,7 @@ async fn message(
             id,
             received_at,
             root,
+            broadcast: row.try_get("broadcast")?,
         })
     })
     .transpose()
@@ -199,6 +202,38 @@ async fn frontier(
     Ok(())
 }
 
+/// Follow or unfollow a thread. A follow that changes state starts now, so
+/// earlier replies are read; an unfollowed row keeps ingest from following
+/// again, except as `record_message` allows.
+async fn follow(
+    conn: &mut PgConnection,
+    community: CommunityId,
+    actor: &[u8],
+    channel: Uuid,
+    root: &[u8],
+    unfollow: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO personal_read_frontiers
+         (community_id, actor, channel_id, root_id, through_timestamp, unfollowed)
+         VALUES ($1,$2,$3,$4,now(),$5)
+         ON CONFLICT (community_id, actor, channel_id, root_id) DO UPDATE
+         SET unfollowed=$5,
+            through_timestamp=GREATEST(personal_read_frontiers.through_timestamp, now()),
+            through_message_id=CASE WHEN now() > personal_read_frontiers.through_timestamp
+                THEN NULL ELSE personal_read_frontiers.through_message_id END
+         WHERE personal_read_frontiers.unfollowed <> $5",
+    )
+    .bind(community.as_uuid())
+    .bind(actor)
+    .bind(channel)
+    .bind(root)
+    .bind(unfollow)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn apply(
     conn: &mut PgConnection,
     community: CommunityId,
@@ -225,12 +260,29 @@ pub(super) async fn apply(
                 return Ok(IntentOutcome::Blocked);
             };
             let is_reply = msg.root.as_ref().is_some_and(|r| r != &msg.id);
-            if (root.is_empty() && is_reply)
+            if (root.is_empty() && is_reply && !msg.broadcast)
                 || (!root.is_empty() && msg.id != root && msg.root.as_ref() != Some(&root))
             {
                 return Ok(IntentOutcome::Blocked);
             }
             frontier(conn, community, actor, target, &root, &msg).await?;
+        }
+        ReadIntent::Follow { target } | ReadIntent::Unfollow { target } => {
+            if target.root_id.is_none() {
+                return Ok(IntentOutcome::Invalid);
+            }
+            let Some(root) = valid_target(conn, community, actor, target).await? else {
+                return Ok(IntentOutcome::Blocked);
+            };
+            follow(
+                conn,
+                community,
+                actor,
+                target.channel_id,
+                &root,
+                matches!(intent, ReadIntent::Unfollow { .. }),
+            )
+            .await?;
         }
     }
     Ok(IntentOutcome::Applied)

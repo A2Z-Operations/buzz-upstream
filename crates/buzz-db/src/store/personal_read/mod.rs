@@ -10,7 +10,7 @@ mod model;
 mod projection;
 mod writes;
 
-pub(crate) use follows::{record_message, Place};
+pub(crate) use follows::{place, record_message};
 pub use model::*;
 
 #[cfg(test)]

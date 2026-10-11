@@ -62,6 +62,20 @@ pub(super) async fn start_before_everything(
 }
 
 /// Store `event` as a canonical reply in `root`'s thread, through ingest.
+/// Copy rewritten event arrivals onto their replies' thread rows, as ingest
+/// stores them.
+pub(super) async fn sync_reply_arrivals(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE thread_metadata tm SET received_at=e.received_at FROM events e
+         WHERE e.community_id=tm.community_id AND e.created_at=tm.event_created_at
+             AND e.id=tm.event_id AND tm.received_at IS NOT NULL
+             AND tm.received_at<>e.received_at",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 pub(super) async fn insert_reply(
     db: &Db,
     community: CommunityId,
@@ -179,9 +193,9 @@ async fn add_history(db: &Db, community: CommunityId, channel: Uuid, count: usiz
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn personal_read_sidebar_marked_history_past_the_scan_cap_is_read_and_keeps_latest() {
+async fn personal_read_sidebar_marked_history_is_read_and_keeps_latest() {
     let (db, _pool, community, channel, actor, _) = fixture().await;
-    let last = add_history(&db, community, channel, MAX_TIMELINE_SCAN + 44).await;
+    let last = add_history(&db, community, channel, 300).await;
     let outcome = db
         .apply_personal_read_intent(
             community,
@@ -191,7 +205,6 @@ async fn personal_read_sidebar_marked_history_past_the_scan_cap_is_read_and_keep
         .await
         .unwrap();
     assert_eq!(outcome, IntentOutcome::Applied);
-    // The scan never reaches the oldest 45 messages; nothing is unread.
     let row = &sidebar(&db, community, &actor).await.channels[0];
     assert!(!row.unread);
     assert_eq!(row.mentions, 0);
@@ -203,7 +216,7 @@ async fn personal_read_sidebar_marked_history_past_the_scan_cap_is_read_and_keep
 #[ignore = "requires Postgres"]
 async fn personal_read_sidebar_author_window_excludes_expired_and_late_old_messages() {
     let (db, pool, community, channel, actor, _) = fixture().await;
-    let latest = add_history(&db, community, channel, MAX_TIMELINE_SCAN + 44).await;
+    let latest = add_history(&db, community, channel, 300).await;
     expire(&pool, community).await;
     let row = &sidebar(&db, community, &actor).await.channels[0];
     assert!(
@@ -734,13 +747,13 @@ async fn personal_read_counts_only_arrivals_after_the_account_starts() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn personal_read_unstarted_account_is_caught_up_past_the_scan_cap() {
+async fn personal_read_unstarted_account_is_caught_up() {
     let (db, pool, community, channel, actor, _) = fixture().await;
     unstart(&pool, community).await;
-    let last = add_history(&db, community, channel, MAX_TIMELINE_SCAN + 44).await;
+    let last = add_history(&db, community, channel, 300).await;
     let page = sidebar(&db, community, &actor).await;
     let row = &page.channels[0];
-    // The start floor covers every arrival, examined by the scan or not.
+    // The start floor covers every arrival.
     assert!(!row.unread);
     assert_eq!(row.mentions, 0);
     assert!(row.threads.is_empty());

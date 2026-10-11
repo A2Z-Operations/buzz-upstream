@@ -1,7 +1,7 @@
 //! Read progress follows relay arrival (`received_at`), never author time.
 //! Each case sets every arrival explicitly: back-to-back inserts share a clock.
 use super::{
-    postgres_tests::{fixture, insert_reply},
+    postgres_tests::{fixture, insert_reply, sync_reply_arrivals},
     *,
 };
 use crate::Db;
@@ -23,6 +23,7 @@ async fn arrive(pool: &PgPool, community: CommunityId, event: &nostr::Event, arr
     .unwrap()
     .rows_affected();
     assert_eq!(updated, 1, "arrival must land on exactly one stored event");
+    sync_reply_arrivals(pool).await;
 }
 
 /// A message authored at `authored` that arrives at `arrived`. It mentions the
@@ -254,10 +255,9 @@ async fn mark_thread_read_with_the_sidebar_anchor_clears_a_late_reply() {
     assert!(row.threads.is_empty());
 }
 
-/// The latest probe reads the newest `MAX_TIMELINE_SCAN` events by author
-/// time, of any kind. A late arrival with an older author time than the
-/// uncounted events after it must still be the sidebar anchor, or Mark as read
-/// with that anchor leaves it unread.
+/// A late arrival with an older author time than the uncounted events after
+/// it must still be the sidebar anchor, or Mark as read with that anchor
+/// leaves it unread.
 async fn reactions(
     pool: &PgPool,
     db: &Db,
@@ -310,37 +310,6 @@ async fn mark_as_read_clears_a_late_arrival_behind_reactions() {
     assert_eq!(counts(&db, community, &actor).await, (false, 0));
 }
 
-/// Past the budget the probe finds no anchor, and nothing counts: a badge
-/// with no latest to mark could never be cleared.
-#[tokio::test]
-#[ignore = "requires Postgres"]
-async fn a_message_behind_a_full_budget_of_reactions_is_not_a_badge_without_an_anchor() {
-    let (db, pool, community, channel, actor, first) = fixture().await;
-    let now = first.created_at.as_secs();
-    let demoted = sqlx::query("UPDATE events SET kind=7 WHERE community_id=$1 AND id=$2")
-        .bind(community.as_uuid())
-        .bind(first.id.as_bytes().as_slice())
-        .execute(&pool)
-        .await
-        .unwrap()
-        .rows_affected();
-    assert_eq!(demoted, 1);
-    post(&db, &pool, community, channel, &actor, now - 600, now - 10).await;
-    reactions(
-        &pool,
-        &db,
-        community,
-        channel,
-        MAX_TIMELINE_SCAN as u64,
-        now,
-    )
-    .await;
-
-    let row = sidebar(&db, community, &actor).await;
-    assert_eq!(row.latest_id, None);
-    assert_eq!((row.unread, row.mentions), (false, 0));
-}
-
 /// Store `event` as having arrived at exactly `seconds` plus `micros`. Built
 /// from integers, never a float, so microsecond order cannot hinge on rounding.
 async fn arrive_exact(
@@ -360,6 +329,7 @@ async fn arrive_exact(
         .unwrap()
         .rows_affected();
     assert_eq!(updated, 1, "arrival must land on exactly one stored event");
+    sync_reply_arrivals(pool).await;
     let stored: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT received_at FROM events WHERE community_id=$1 AND id=$2")
             .bind(community.as_uuid())

@@ -7,7 +7,8 @@ use axum::{
     response::Response,
 };
 use buzz_db::personal_read::{
-    ChannelReadSummary, ReadIntent, SidebarPage, MAX_CHANNELS, MAX_INTENTS,
+    ChannelReadSummary, ReadIntent, ThreadsCursor, ThreadsPage, MAX_CHANNELS, MAX_INTENTS,
+    MAX_THREADS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -74,27 +75,72 @@ pub(super) async fn sidebar(
             }
         }
         .map_err(|_| Error::unavailable())?;
-        auth::response(release(&state, &headers, &principal, page).await?)
+        let channels: Vec<_> = page.channels.iter().map(|c| c.channel_id).collect();
+        release(&state, &headers, &principal, &channels).await?;
+        auth::response(page)
+    })
+    .await
+    .map_err(|_| Error::unavailable())?
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ThreadsQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+pub(super) async fn threads(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    query: Result<Query<ThreadsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, Error> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let principal = auth::authorize(&state, &headers, &uri, "GET", None).await?;
+        let Query(query) = query.map_err(|_| Error::invalid())?;
+        let limit = query.limit.unwrap_or(MAX_THREADS);
+        let cursor = query
+            .cursor
+            .map(|c| ThreadsCursor::parse(&c).ok_or_else(Error::invalid))
+            .transpose()?;
+        if !(1..=MAX_THREADS).contains(&limit) {
+            return Err(Error::invalid());
+        }
+        let page: ThreadsPage = state
+            .db
+            .personal_read_threads(
+                principal.tenant.community(),
+                &principal.actor,
+                state.config.buzz_v1_retention_seconds,
+                limit,
+                cursor.as_ref(),
+            )
+            .await
+            .map_err(|_| Error::unavailable())?;
+        let channels: BTreeSet<_> = page.threads.iter().map(|t| t.channel_id).collect();
+        let channels: Vec<_> = channels.into_iter().collect();
+        release(&state, &headers, &principal, &channels).await?;
+        auth::response(page)
     })
     .await
     .map_err(|_| Error::unavailable())?
 }
 
 /// Release projected rows only after admission and the actor's membership of
-/// every row are rechecked outside the projection snapshot.
+/// every row's channel are rechecked outside the projection snapshot.
 async fn release(
     state: &AppState,
     headers: &HeaderMap,
     principal: &auth::Principal,
-    page: SidebarPage,
-) -> Result<SidebarPage, Error> {
+    channels: &[Uuid],
+) -> Result<(), Error> {
     auth::recheck(state, headers, principal).await?;
-    let channels: Vec<_> = page.channels.iter().map(|c| c.channel_id).collect();
     let memberships = state
         .db
         .membership_pairs(
             principal.tenant.community(),
-            &channels,
+            channels,
             &[principal.actor.to_bytes().to_vec()],
         )
         .await
@@ -102,7 +148,7 @@ async fn release(
     if memberships.len() != channels.len() {
         return Err(Error::unavailable());
     }
-    Ok(page)
+    Ok(())
 }
 
 /// Updated rows for the channels a batch applied to. A channel the actor has
@@ -126,7 +172,9 @@ async fn refreshed(
             )
             .await
             .map_err(|_| Error::unavailable())?;
-        rows.extend(release(state, headers, principal, page).await?.channels);
+        let ids: Vec<_> = page.channels.iter().map(|c| c.channel_id).collect();
+        release(state, headers, principal, &ids).await?;
+        rows.extend(page.channels);
     }
     Ok(rows)
 }
@@ -168,8 +216,7 @@ pub(super) async fn write(
         .await
         .unwrap_or_else(|_| json!({"status":"unknown","retryable":true}));
         if outcome["status"] == "applied" {
-            let ReadIntent::MarkThrough { target, .. } = &intent;
-            applied.insert(target.channel_id);
+            applied.insert(intent.target().channel_id);
         }
         outcomes.push(outcome);
     }
