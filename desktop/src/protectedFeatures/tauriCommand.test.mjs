@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
@@ -12,6 +18,19 @@ const desktopRoot = path.resolve(
 );
 const configDir = path.join(desktopRoot, "src-tauri");
 const wrapper = path.join(desktopRoot, "scripts/tauri-command.mjs");
+const toolDir = mkdtempSync(path.join(tmpdir(), "buzz-xcode-fixture-"));
+const pinnedXcode = readFileSync(
+  path.join(desktopRoot, "../.xcode-version"),
+  "utf8",
+).trim();
+writeFileSync(
+  path.join(toolDir, "xcodebuild"),
+  `#!/bin/sh
+printf 'Xcode %s\\nBuild version fixture\\n' "\${TEST_XCODE_VERSION}"
+`,
+  { mode: 0o755 },
+);
+after(() => rmSync(toolDir, { recursive: true, force: true }));
 const fakeCli = path.join(tmpdir(), `buzz-fake-tauri-${process.pid}.mjs`);
 
 writeFileSync(
@@ -40,7 +59,12 @@ writeFileSync(
 `,
 );
 
-function packageVariant(variant, result, runnerArguments = []) {
+function packageVariant(
+  variant,
+  result,
+  runnerArguments = [],
+  xcode = pinnedXcode,
+) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -49,6 +73,8 @@ function packageVariant(variant, result, runnerArguments = []) {
         cwd: desktopRoot,
         env: {
           ...process.env,
+          PATH: `${toolDir}${path.delimiter}${process.env.PATH}`,
+          TEST_XCODE_VERSION: xcode,
           BUZZ_TAURI_CLI_ENTRYPOINT: fakeCli,
           BUZZ_TEST_CONFIG_DIR: configDir,
           BUZZ_TEST_RESULT: result,
@@ -127,4 +153,13 @@ test("private frontendDist is never mistaken for a URL", async () => {
   assert.throws(() => new URL(invocation.configured));
   // The relative path still has to reach the directory the wrapper published.
   assert.equal(invocation.observed, "0");
+});
+
+test("macOS packaging rejects a different active Xcode before invoking Tauri", {
+  skip: process.platform !== "darwin",
+}, async () => {
+  await assert.rejects(
+    packageVariant("0", path.join(toolDir, "wrong-version.json"), [], "0.0.0"),
+    /wrapper exited 1/,
+  );
 });
