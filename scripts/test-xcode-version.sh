@@ -17,8 +17,7 @@ cat > "$fixture/bin/xcodebuild" <<'STUB'
 printf 'Xcode %s\nBuild version %s\n' "$TEST_XCODE" "${TEST_XCODE_BUILD:-27A266a}"
 STUB
 chmod +x "$fixture/bin/"*
-export PATH="$fixture/bin:$PATH"
-check() { "$fixture/scripts/check-xcode.sh" >/dev/null 2>&1; }
+check() { PATH="$fixture/bin:$PATH" "$fixture/scripts/check-xcode.sh" >/dev/null 2>&1; }
 export TEST_XCODE=27.0
 check
 export TEST_XCODE=27
@@ -33,7 +32,7 @@ if TEST_XCODE_BUILD=27A123b check; then echo 'Accepted prerelease build' >&2; ex
 # the compiler before starting cargo or any desktop/device work.
 {
   printf "desktop_dir := 'desktop'\nmesh := ''\nfresh := ''\n"
-  awk '/^desktop-standalone \*ARGS:/ { active=1; print "desktop-standalone *ARGS:"; next } active && /^$/ { exit } active { print }' "$root/Justfile"
+  awk -v mock_bin="$fixture/bin" '/^desktop-standalone \*ARGS:/ { active=1; print "desktop-standalone *ARGS:"; next } active && /^$/ { exit } active { print; if ($0 ~ /#!\/usr\/bin\/env bash/) print "    export PATH=\"" mock_bin ":$PATH\"" }' "$root/Justfile"
 } > "$fixture/Justfile"
 cat > "$fixture/bin/cargo" <<'STUB'
 #!/usr/bin/env bash
@@ -44,7 +43,7 @@ chmod +x "$fixture/bin/cargo"
 if TEST_XCODE=26.5 "$root/bin/just" --justfile "$fixture/Justfile" desktop-standalone >"$fixture/recipe.log" 2>&1; then
   echo 'Standalone recipe accepted wrong Xcode' >&2; exit 1
 fi
-grep -q 'Buzz requires Xcode' "$fixture/recipe.log"
+grep -q 'Buzz requires Xcode' "$fixture/recipe.log" || { cat "$fixture/recipe.log" >&2; exit 1; }
 if grep -q 'Native build started' "$fixture/recipe.log"; then cat "$fixture/recipe.log"; exit 1; fi
 printf 'latest\n' > "$fixture/.xcode-version"
 if check; then echo 'Accepted invalid pin' >&2; exit 1; fi
