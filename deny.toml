@@ -1,5 +1,10 @@
 [advisories]
 ignore = [
+    # unsafe-libyaml is unmaintained, with no patched release. Both our YAML
+    # parsers and kube-client 2.x require serde_yaml 0.9. Replacing only direct
+    # uses cannot remove it. Keep this maintenance-only exception scoped to
+    # this advisory; remove when serde_yaml and kube-client migrate off it.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained dependency of serde_yaml and kube-client; no patched release; parser migration required" },
     # instant 0.1.13 — unmaintained crate. Transitive dep: nostr → instant.
     # Will be resolved when nostr crate updates its dependencies.
     { id = "RUSTSEC-2024-0384", reason = "transitive dep via nostr; no upstream fix available" },
