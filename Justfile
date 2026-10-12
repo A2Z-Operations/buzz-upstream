@@ -1027,6 +1027,7 @@ mobile-build-android:
 mobile-dev:
     #!/usr/bin/env bash
     set -euo pipefail
+    export PATH="{{justfile_directory()}}/scripts/apple-tools:$PATH"
     ./scripts/check-xcode.sh
     if ! pgrep -x Simulator &>/dev/null; then
         open -a Simulator

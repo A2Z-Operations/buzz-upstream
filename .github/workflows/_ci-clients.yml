@@ -150,6 +150,8 @@ jobs:
         run: /bin/bash scripts/test-mobile-pagination.sh
       - name: Trust pinned Swift source-copy plugin
         run: python3 scripts/trust-ios-package-plugin.py --trust-file "$HOME/Library/org.swift.swiftpm/security/plugins.json"
+      - name: Use Xcode 27 lipo compatibility adapter for Flutter
+        run: echo "$GITHUB_WORKSPACE/scripts/apple-tools" >> "$GITHUB_PATH"
       - name: Build complete iOS simulator app
         run: cd mobile && flutter build ios --simulator --debug --no-pub --verbose
       - name: Test native pagination accessibility

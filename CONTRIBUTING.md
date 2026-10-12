@@ -622,3 +622,8 @@ The iOS Swift dependency uses `SharedSourcesPlugin` to copy its shared Swift sou
 Xcode users must approve this plugin when prompted. CI trusts only its reviewed
 commit fingerprint using `scripts/trust-ios-package-plugin.py`; package upgrades
 require reviewing the plugin before updating that fingerprint.
+
+Flutter 3.41 requires the repository’s `scripts/apple-tools` directory first on
+`PATH` for manual iOS builds with Xcode 27. Its `lipo` adapter verifies each
+architecture separately because Xcode 27 rejects Flutter’s combined verification
+command. `just mobile-dev` and CI configure this automatically.
