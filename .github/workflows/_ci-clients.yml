@@ -145,7 +145,7 @@ jobs:
       - name: Trust pinned Swift source-copy plugin
         run: python3 scripts/trust-ios-package-plugin.py --trust-file "$HOME/Library/org.swift.swiftpm/security/plugins.json"
       - name: Build complete iOS simulator app
-        run: cd mobile && flutter build ios --simulator --debug --no-pub
+        run: cd mobile && flutter build ios --simulator --debug --no-pub --verbose
       - name: Test native pagination accessibility
         run: |
           device=$(xcrun simctl create "Pagination accessibility" "iPhone 16")
