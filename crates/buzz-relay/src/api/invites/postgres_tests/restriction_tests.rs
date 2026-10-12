@@ -238,6 +238,23 @@ pub(super) mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn cutoff_rejects_only_v1_and_restriction_lookup_failure_never_admits() {
+        let Some(identity) = [
+            "NEXTEST_RUN_ID",
+            "NEXTEST_BINARY_ID",
+            "NEXTEST_TEST_NAME",
+            "NEXTEST_ATTEMPT_ID",
+        ]
+        .iter()
+        .map(|name| std::env::var(name).ok())
+        .collect::<Option<Vec<_>>>() else {
+            eprintln!("skipping destructive fixture outside postgres-isolation wrapper");
+            return;
+        };
+        let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_default();
+        assert!(
+            wrapper_owns_database(&url, &identity.join(":")),
+            "refusing destructive DDL on a shared database"
+        );
         let (state, host, community, issuer) = fixture().await;
         let code = mint_code(state.clone(), &host, &issuer, serde_json::json!({})).await;
         let key = derive_invite_key(&state.relay_keypair);
@@ -283,11 +300,38 @@ pub(super) mod postgres_tests {
             serde_json::json!({"code":code}).to_string(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!state
+        let status = response.status();
+        let membership = state
             .db
             .is_relay_member(community, &claimant.public_key().to_hex())
+            .await;
+        sqlx::query("ALTER TABLE unavailable_restrictions RENAME TO community_bans")
+            .execute(state.db.pool())
             .await
-            .unwrap());
+            .unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!membership.unwrap());
+    }
+
+    fn wrapper_owns_database(url: &str, identity: &str) -> bool {
+        let hash = hex::encode(Sha256::digest(identity.as_bytes()));
+        url.rsplit('/').next() == Some(format!("buzz_nt_{}", &hash[..24]).as_str())
+    }
+
+    #[test]
+    fn destructive_fixture_rejects_shared_database_urls() {
+        let identity = "run:binary:test:attempt";
+        let hash = hex::encode(Sha256::digest(identity.as_bytes()));
+        assert!(wrapper_owns_database(
+            &format!("postgres://localhost/buzz_nt_{}", &hash[..24]),
+            identity
+        ));
+        for url in [
+            "postgres://localhost/buzz",
+            "postgres://localhost/buzz_nt_other",
+            "",
+        ] {
+            assert!(!wrapper_owns_database(url, identity));
+        }
     }
 }
