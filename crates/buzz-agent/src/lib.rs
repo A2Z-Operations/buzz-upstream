@@ -649,6 +649,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
         loop_drive::TurnContext {
             mcp: &mcp,
             session_id: &goose_session_id,
+            wire_session_id: &p.session_id,
             wire_tx,
             cancel: &cancel,
             hook_extension: hook_extension.as_deref(),

@@ -109,7 +109,10 @@ enum Round {
 /// Everything a round needs that does not change between rounds.
 pub struct TurnContext<'a> {
     pub mcp: &'a Arc<McpRegistry>,
+    /// Goose-internal session id (turn state, history).
     pub session_id: &'a str,
+    /// ACP `sessionId` the client was given (`ses_…`); every wire update uses it.
+    pub wire_session_id: &'a str,
     pub wire_tx: &'a WireSender,
     pub cancel: &'a CancellationToken,
     pub hook_extension: Option<&'a str>,
@@ -533,8 +536,13 @@ async fn round(
         // desktop renders a spinner forever.
         let results = crate::tools::cancelled_results(&requests);
         for request in &requests {
-            crate::agent::emit_tool_call_update(ctx.wire_tx, ctx.session_id, &request.id, true)
-                .await;
+            crate::agent::emit_tool_call_update(
+                ctx.wire_tx,
+                ctx.wire_session_id,
+                &request.id,
+                true,
+            )
+            .await;
         }
         push_tool_results(state, results);
         return Ok(Round::Stopped(StopReason::Cancelled));
@@ -552,7 +560,7 @@ async fn round(
 
     let results = crate::tools::execute(
         ctx.mcp,
-        &state.session().id,
+        ctx.wire_session_id,
         ctx.wire_tx,
         ctx.cancel,
         ctx.permissions,
@@ -610,7 +618,7 @@ async fn infer(
     let mut stream = loop {
         tokio::select! {
             _ = keepalive.tick() => {
-                crate::agent::emit_keepalive(ctx.session_id, ctx.wire_tx).await;
+                crate::agent::emit_keepalive(ctx.wire_session_id, ctx.wire_tx).await;
             }
             _ = ctx.cancel.cancelled() => {
                 return Ok(None);
@@ -628,7 +636,7 @@ async fn infer(
         tokio::select! {
             // Keep the harness idle clock alive during provider silence.
             _ = keepalive.tick() => {
-                crate::agent::emit_keepalive(ctx.session_id, ctx.wire_tx).await;
+                crate::agent::emit_keepalive(ctx.wire_session_id, ctx.wire_tx).await;
             }
 
             // Cancelling the model call is safe to do abruptly: unlike tool
@@ -649,7 +657,7 @@ async fn infer(
 
                 let Some(chunk) = message else { continue };
                 for content in &chunk.content {
-                    crate::agent::emit_content(content, ctx.session_id, ctx.wire_tx).await;
+                    crate::agent::emit_content(content, ctx.wire_session_id, ctx.wire_tx).await;
                 }
                 accumulated = Some(match accumulated {
                     None => chunk,
