@@ -16,6 +16,10 @@ import 'nostr_models.dart';
 /// Does NOT handle reconnection — that is [RelaySessionNotifier]'s job.
 enum SocketState { disconnected, connecting, authenticating, connected }
 
+class _RelayDisconnectCancelled implements Exception {
+  const _RelayDisconnectCancelled();
+}
+
 class RelayAuthRejectedException implements Exception {
   final String message;
 
@@ -129,7 +133,7 @@ class RelaySocket {
     } catch (e) {
       _authTimeout?.cancel();
       await disconnect();
-      _onDisconnected(e);
+      if (e is! _RelayDisconnectCancelled) _onDisconnected(e);
     }
   }
 
@@ -140,7 +144,7 @@ class RelaySocket {
 
   /// Gracefully close the connection.
   Future<void> disconnect() async {
-    _failAuth(Exception('Relay disconnected during authentication'));
+    _failAuth(const _RelayDisconnectCancelled());
     _resetConnection();
     final channel = _channel;
     _channel = null;

@@ -56,6 +56,7 @@ void main() {
     RelaySocket.debugPingInterval = RelaySocket.pingInterval;
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final authReceived = Completer<void>();
+    final disconnectErrors = <Object?>[];
     WebSocket? peer;
     server.listen((request) async {
       final connection = await WebSocketTransformer.upgrade(request);
@@ -73,7 +74,7 @@ void main() {
       nsec: nostr.Keys.generate().nsec,
       onMessage: (_) {},
       onConnected: () => fail('The peer never acknowledges authentication'),
-      onDisconnected: (_) {},
+      onDisconnected: disconnectErrors.add,
     );
     final connecting = socket.connect();
     try {
@@ -82,6 +83,7 @@ void main() {
       await socket.disconnect();
       await connecting.timeout(const Duration(seconds: 1));
       expect(socket.state, SocketState.disconnected);
+      expect(disconnectErrors, isEmpty);
     } finally {
       socket.dispose();
       await peer?.close();
