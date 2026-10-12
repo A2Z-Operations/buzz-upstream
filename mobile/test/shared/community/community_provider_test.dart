@@ -367,6 +367,60 @@ void main() {
       }
     });
 
+    test('failed OFF retries do not queue generation-only snapshots', () async {
+      final finishExport = Completer<void>();
+      var offExports = 0;
+      final subscription = BuzzPushSubscription(
+        filter: BuzzPushFilter(kinds: const [9], pTags: ['a' * 64]),
+        notificationClass: 'default',
+      );
+      final community =
+          Community.create(
+            name: 'Test',
+            relayUrl: 'https://test.example.com',
+          ).copyWith(
+            pushNotificationsEnabled: true,
+            pushSubscriptionState: BuzzPushLeaseSubscriptionState.desired(
+              desired: [subscription],
+            ).withAccepted(subscriptions: [subscription], generation: 7),
+          );
+      deactivator = (community, {generation}) async {
+        throw StateError('offline');
+      };
+      container = createContainer(
+        snapshotWriter: (communities) async {
+          if (communities.isNotEmpty &&
+              !communities.single.pushNotificationsEnabled) {
+            offExports++;
+            await finishExport.future;
+          }
+        },
+      );
+      await container.read(communityListProvider.future);
+      final notifier = container.read(communityListProvider.notifier);
+      await notifier.addCommunity(community);
+      try {
+        await notifier.setPushNotificationsEnabled(community.id, false);
+        for (var attempt = 0; attempt < 5; attempt++) {
+          await expectLater(
+            notifier.retryPendingPushLeaseTombstone(
+              community.id,
+              advanceGeneration: true,
+            ),
+            throwsStateError,
+          );
+        }
+        final stored = (await communityStorage.loadAll()).single;
+        expect(stored.pushNotificationsEnabled, isFalse);
+        expect(stored.pushSubscriptionState.pendingTombstoneGeneration, 13);
+      } finally {
+        finishExport.complete();
+        // ON still waits for all earlier exports, making replay observable.
+        await notifier.setPushNotificationsEnabled(community.id, true);
+      }
+      expect(offExports, 1);
+    });
+
     test('opt-in still waits for presentation export', () async {
       final exportStarted = Completer<void>();
       final finishExport = Completer<void>();

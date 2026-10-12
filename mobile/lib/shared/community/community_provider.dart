@@ -553,7 +553,8 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
         await storage.save(updated);
         final updatedList = [...current]..[index] = updated;
         state = AsyncData(updatedList);
-        unawaited(syncCommunitySnapshot(ref, updatedList));
+        // Disabled communities are absent from the native snapshot. Retrying
+        // changes only the durable generation, so it needs no native export.
       }
       pendingCommunity = updated;
       pendingGeneration = pushState.pendingTombstoneGeneration;
