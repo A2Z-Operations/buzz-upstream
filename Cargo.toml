@@ -195,3 +195,9 @@ aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce36
 # resolves even though Buzz only enables PostgreSQL. Pin the merged upstream
 # compatibility fix until it is released: https://github.com/transact-rs/sqlx/pull/4402
 sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "94aafe3a68884d923b0798a767c8d7f6cfda89d2" }
+
+# Rust 1.95's Mach-O stripper can misalign proc-macro dylibs on macOS 27.
+# Keep build-time artifacts unstripped; shipped binaries retain their settings.
+# Remove after upgrading Rust past the fix in 1.98 (block/buzz#8074).
+[profile.release.build-override]
+strip = "none"

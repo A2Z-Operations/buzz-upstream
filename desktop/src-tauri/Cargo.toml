@@ -164,3 +164,9 @@ tokio = { version = "1", features = ["test-util"] }
 # The relay's media validation, so desktop-produced snapshots and voice notes
 # can prove their full client-sanitize → relay-accept contract end to end.
 buzz_media_pkg = { package = "buzz-media", path = "../../crates/buzz-media" }
+
+# Rust 1.95's Mach-O stripper can misalign proc-macro dylibs on macOS 27.
+# Keep build-time artifacts unstripped; shipped binaries retain their settings.
+# Remove after upgrading Rust past the fix in 1.98 (block/buzz#8074).
+[profile.release.build-override]
+strip = "none"
