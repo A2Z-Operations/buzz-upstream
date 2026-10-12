@@ -984,6 +984,7 @@ async fn steer_rejected_on_run_id_mismatch() {
         .await;
 
     let mut saw_reject = false;
+    let mut saw_prompt_complete = false;
     for _ in 0..40 {
         let v = h.recv().await;
         if v["id"] == json!(s_id) {
@@ -993,11 +994,15 @@ async fn steer_rejected_on_run_id_mismatch() {
             );
             saw_reject = true;
         } else if v["id"] == json!(p_id) {
-            // Turn finishes normally regardless of the rejected steer.
+            // The prompt and steer responses may arrive in either order.
+            saw_prompt_complete = true;
+        }
+        if saw_reject && saw_prompt_complete {
             break;
         }
     }
     assert!(saw_reject, "run-id mismatch was not rejected");
+    assert!(saw_prompt_complete, "prompt did not complete");
     h.shutdown().await;
 }
 
