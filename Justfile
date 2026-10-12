@@ -771,6 +771,7 @@ relay-release: bootstrap _ensure-migrations
 dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     export PATH="{{justfile_directory()}}/bin:$PATH"
     set -o allexport
     source .env
@@ -833,6 +834,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
 desktop-standalone *ARGS: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     export PATH="{{justfile_directory()}}/bin:$PATH"
     cargo build -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
@@ -865,6 +867,7 @@ desktop-standalone *ARGS: _ensure-sidecar-stubs
 staging *ARGS: bootstrap _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     export PATH="{{justfile_directory()}}/bin:$PATH"
     pnpm install  # unconditional: staging must always start with a clean dep tree
     cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
@@ -900,6 +903,7 @@ staging *ARGS: bootstrap _ensure-sidecar-stubs
 production *ARGS: bootstrap _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     export PATH="{{justfile_directory()}}/bin:$PATH"
     pnpm install  # unconditional: production must always start with a clean dep tree
     cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr

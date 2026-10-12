@@ -26,7 +26,7 @@ const pinnedXcode = readFileSync(
 writeFileSync(
   path.join(toolDir, "xcodebuild"),
   `#!/bin/sh
-printf 'Xcode %s\\nBuild version fixture\\n' "\${TEST_XCODE_VERSION}"
+printf 'Xcode %s\\nBuild version 27A266a\\n' "\${TEST_XCODE_VERSION}"
 `,
   { mode: 0o755 },
 );
