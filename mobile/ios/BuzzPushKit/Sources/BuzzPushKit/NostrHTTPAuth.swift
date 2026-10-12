@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
-import P256K
+// Keep the private crypto implementation out of app/extension module imports.
+@_implementationOnly import P256K
 
 public enum NostrHTTPAuthError: Error, Equatable {
     case invalidHex

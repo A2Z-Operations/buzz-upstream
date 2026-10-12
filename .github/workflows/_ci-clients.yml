@@ -140,6 +140,12 @@ jobs:
         run: swift build -c release --package-path mobile/ios/BuzzPushKit
       - name: Test
         run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Verify app and extension can import BuzzPushKit without private C modules
+        run: |
+          consumer=$(mktemp -d)
+          trap 'rm -rf "$consumer"' EXIT
+          printf 'import BuzzPushKit\n' > "$consumer/main.swift"
+          swiftc -typecheck -I "$(swift build --package-path mobile/ios/BuzzPushKit --show-bin-path)" "$consumer/main.swift"
       - name: Test native pagination geometry
         run: /bin/bash scripts/test-mobile-pagination.sh
       - name: Trust pinned Swift source-copy plugin
