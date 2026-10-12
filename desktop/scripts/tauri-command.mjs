@@ -31,6 +31,17 @@ function runTauri(args, options = {}) {
 }
 
 export function runTauriCommand(args) {
+  if (process.platform === "darwin" && ["build", "dev"].includes(args[0])) {
+    const check = spawnSync(
+      "bash",
+      [path.join(desktopRoot, "../scripts/check-xcode.sh")],
+      {
+        stdio: "inherit",
+      },
+    );
+    if (check.error) throw check.error;
+    if (check.status !== 0) return check.status ?? 1;
+  }
   if (args[0] !== "build") return runTauri(args);
 
   // Tauri runs beforeBuildCommand and then consumes frontendDist. Give the

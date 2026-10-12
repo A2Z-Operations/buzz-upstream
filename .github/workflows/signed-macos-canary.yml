@@ -13,7 +13,7 @@ jobs:
   build:
     name: Build signed macOS canary
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 60
     permissions:
       contents: read
@@ -32,6 +32,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Select pinned Xcode
+        run: |
+          export DEVELOPER_DIR="/Applications/Xcode_$(cat .xcode-version).app/Contents/Developer"
+          scripts/check-xcode.sh
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
       - name: Get pnpm store directory
@@ -133,7 +138,7 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ github.workspace }}/.cache/mesh-llama
-          key: mesh-llama-${{ runner.os }}-metal-${{ steps.mesh_rev.outputs.rev }}
+          key: mesh-llama-${{ runner.os }}-metal-${{ hashFiles('.xcode-version') }}-${{ steps.mesh_rev.outputs.rev }}
 
       - name: Build mesh llama native libraries
         if: steps.llama_cache.outputs.cache-hit != 'true'
@@ -158,7 +163,7 @@ jobs:
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ github.workspace }}/.cache/mesh-llama
-          key: mesh-llama-${{ runner.os }}-metal-${{ steps.mesh_rev.outputs.rev }}
+          key: mesh-llama-${{ runner.os }}-metal-${{ hashFiles('.xcode-version') }}-${{ steps.mesh_rev.outputs.rev }}
 
       - name: Build unsigned Tauri app
         run: cd desktop && pnpm tauri build --verbose --no-sign --features mesh-llm --config src-tauri/tauri.canary.conf.json

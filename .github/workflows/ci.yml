@@ -71,6 +71,8 @@ jobs:
               - '.github/workflows/_ci-desktop.yml'
               - 'scripts/ci-apt-retry.sh'
               - 'Justfile'
+              - '.xcode-version'
+              - 'scripts/check-xcode.sh'
               - 'scripts/generate-macos-icon.py'
               - 'scripts/macos-icon.sh'
               - 'bin/uv'
@@ -86,6 +88,8 @@ jobs:
               - 'pnpm-lock.yaml'
             mobile:
               - 'mobile/**'
+              - '.xcode-version'
+              - 'scripts/check-xcode.sh'
               - 'scripts/mobile-release.sh'
               - 'scripts/mobile-worktree-overrides.sh'
               - 'scripts/mobile-worktree-clean.sh'
@@ -108,7 +112,9 @@ jobs:
           scripts/test-postgres-test-discovery.sh
           scripts/test-postgres-test-wrapper.sh
       - name: Release workflow source contract
-        run: scripts/test-release-ref-contract.sh
+        run: |
+          scripts/test-release-ref-contract.sh
+          scripts/test-xcode-version.sh
       - name: Relay image eligibility contract
         run: scripts/test-relay-image-eligibility-workflow.sh
       - name: Desktop release candidate contract

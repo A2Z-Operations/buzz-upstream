@@ -12,7 +12,7 @@ jobs:
   macos:
     name: Prove macOS ${{ matrix.target }} cache visibility
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -28,6 +28,11 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - name: Select pinned Xcode
+        run: |
+          export DEVELOPER_DIR="/Applications/Xcode_$(cat .xcode-version).app/Contents/Developer"
+          scripts/check-xcode.sh
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Patch proof dependency graph
         run: |

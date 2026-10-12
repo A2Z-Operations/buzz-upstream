@@ -24,6 +24,7 @@ cat > "$fixture/scripts/mobile-worktree-overrides.sh" <<'STUB'
 exit 0
 STUB
 chmod +x "$fixture/bin/flutter" "$fixture/bin/pgrep" "$fixture/scripts/mobile-worktree-overrides.sh"
+cp "$fixture/scripts/mobile-worktree-overrides.sh" "$fixture/scripts/check-xcode.sh"
 export PATH="$fixture/bin:$PATH"
 export CALL_LOG="$fixture/arguments"
 unset BUZZ_PUSH_GATEWAY_URL

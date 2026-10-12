@@ -102,6 +102,29 @@ Hermit pins Rust, `just`, Node, pnpm, and other tools to the versions in
 upfront. If you don't use Hermit, ensure your toolchain meets the minimum
 versions in the table above.
 
+#### macOS: Xcode
+
+Apple builds use the exact version in [`.xcode-version`](.xcode-version),
+currently Xcode 27.0.0. Install that version and set `DEVELOPER_DIR` to its
+`Xcode.app/Contents/Developer` directory for your shell. For example:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode_27.app/Contents/Developer
+scripts/check-xcode.sh
+```
+
+Local Tauri build/dev commands and native `just` recipes reject a different
+active version. Direct Cargo, Swift, Flutter, or Xcode invocations should run
+`scripts/check-xcode.sh` first in the same environment. Nothing installs Xcode
+or changes the system-wide `xcode-select` setting automatically. Xcode 27
+requires macOS 26.6 or later.
+
+GitHub Apple jobs use the `xcode-27` runner image and select the file's exact
+version before compiling. That runner image is currently a GitHub public
+preview, even though the selected Xcode 27.0 compiler is stable. When changing
+the pin, verify runner availability and coordinate the internal release
+pipeline's scheduling pin in `squareup/buzz-releases`.
+
 #### Linux: Tauri system libraries
 
 Hermit pins language toolchains, not system libraries. On Linux, the desktop

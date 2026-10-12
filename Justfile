@@ -220,25 +220,30 @@ _ensure-migrations: _ensure-services
 # the default graph covers the `#[cfg(not(feature = "mesh-llm"))]` arms and
 # the feature-enabled graph covers the mesh code.
 desktop-tauri-clippy: _ensure-sidecar-stubs
+    ./scripts/check-xcode.sh
     cargo clippy --manifest-path {{desktop_tauri_manifest}} --workspace --all-targets -- -D warnings
     cargo clippy --manifest-path {{desktop_tauri_manifest}} --workspace --all-targets --features mesh-llm -- -D warnings
 
 # Check the desktop Tauri Rust crate compiles
 desktop-tauri-check: _ensure-sidecar-stubs
+    ./scripts/check-xcode.sh
     cargo check --manifest-path {{desktop_tauri_manifest}}
 
 # Run desktop Tauri Rust unit tests
 desktop-tauri-test: _ensure-sidecar-stubs
+    ./scripts/check-xcode.sh
     cd desktop/src-tauri && cargo test --workspace
 
 # Run the desktop Tauri lib tests with the mesh-llm feature graph
 desktop-tauri-test-mesh: _ensure-sidecar-stubs
+    ./scripts/check-xcode.sh
     cargo test --manifest-path {{desktop_tauri_manifest}} --features mesh-llm --lib
 
 # Run the native terminal latency gate explicitly on a known-idle host.
 # This is intentionally excluded from shared CI: scheduler contention makes a
 # wall-clock assertion flaky, and the release profile is the shipped shape.
 desktop-terminal-performance-test:
+    ./scripts/check-xcode.sh
     cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
 
 # Verify compiled-flag behavior in each compile state.
@@ -255,6 +260,7 @@ desktop-terminal-performance-test:
 desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     cd desktop/src-tauri
     unset BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY BUZZ_BUILD_DEMO_SLUG
     unset BUZZ_TEST_EXPECTED_AUTO_CONNECT_DEFAULT_RELAY BUZZ_TEST_EXPECTED_AGENT_ACCESS_OWNER_ONLY BUZZ_TEST_EXPECTED_DEMO_SLUG
@@ -314,6 +320,7 @@ desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
 desktop-release-build target="aarch64-apple-darwin":
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     TARGET={{target}}
     mkdir -p desktop/src-tauri/binaries
     touch "desktop/src-tauri/binaries/buzz-acp-$TARGET"
@@ -331,6 +338,7 @@ desktop-release-build target="aarch64-apple-darwin":
 desktop-demo-build demo_name target="aarch64-apple-darwin":
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     TARGET={{target}}
     [[ "$(uname -s)" == "Darwin" && "$TARGET" == *-apple-darwin ]] || { echo "Demo DMGs require a macOS Apple target" >&2; exit 2; }
     CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/buzz-demo-config.XXXXXX")"
@@ -1015,6 +1023,7 @@ mobile-build-android:
 mobile-dev:
     #!/usr/bin/env bash
     set -euo pipefail
+    ./scripts/check-xcode.sh
     if ! pgrep -x Simulator &>/dev/null; then
         open -a Simulator
         sleep 3

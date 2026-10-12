@@ -13,7 +13,7 @@ jobs:
   build:
     name: Build macOS Intel canary
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 60
     env:
       TARGET: x86_64-apple-darwin
@@ -31,6 +31,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Select pinned Xcode
+        run: |
+          export DEVELOPER_DIR="/Applications/Xcode_$(cat .xcode-version).app/Contents/Developer"
+          scripts/check-xcode.sh
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
       - name: Add Rust target
