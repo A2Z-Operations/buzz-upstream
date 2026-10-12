@@ -125,6 +125,11 @@ preview, even though the selected Xcode 27.0 compiler is stable. When changing
 the pin, verify runner availability and coordinate the internal release
 pipeline's scheduling pin in `squareup/buzz-releases`.
 
+Release tags are immutable. This GitHub release workflow reads the pin from
+the tagged source and requires a tag that contains it; it does not retrofit
+older tags. Internal release jobs explicitly support older tags without a
+pin using their release-repository pin, and reject a conflicting source pin.
+
 #### Linux: Tauri system libraries
 
 Hermit pins language toolchains, not system libraries. On Linux, the desktop
