@@ -142,6 +142,8 @@ jobs:
         run: swift test --package-path mobile/ios/BuzzPushKit
       - name: Test native pagination geometry
         run: /bin/bash scripts/test-mobile-pagination.sh
+      - name: Trust pinned Swift source-copy plugin
+        run: python3 scripts/trust-ios-package-plugin.py --trust-file "$HOME/Library/org.swift.swiftpm/security/plugins.json"
       - name: Build complete iOS simulator app
         run: cd mobile && flutter build ios --simulator --debug --no-pub
       - name: Test native pagination accessibility

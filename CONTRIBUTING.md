@@ -617,3 +617,8 @@ their sign-off. When in doubt, check with your legal team.
 
 *Thank you for contributing to Buzz. Every bug report, documentation fix,
 and code contribution makes the project better for everyone. 🐝*
+
+The iOS Swift dependency uses `SharedSourcesPlugin` to copy its shared Swift sources.
+Xcode users must approve this plugin when prompted. CI trusts only its reviewed
+commit fingerprint using `scripts/trust-ios-package-plugin.py`; package upgrades
+require reviewing the plugin before updating that fingerprint.
