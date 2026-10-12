@@ -59,6 +59,8 @@ pub enum ClaimOutcome {
     Invalid,
     /// The issuer's invitation was permanently revoked.
     Revoked,
+    /// The issuer or its owner is currently banned or timed out.
+    IssuerRestricted,
     /// The claimant or its verified owner is banned or timed out.
     Restricted,
 }
@@ -370,8 +372,11 @@ pub async fn claim_relay_invite_with_owner(
 
     let revoked_at: Option<DateTime<Utc>> = invite.try_get("revoked_at")?;
     let issuer: String = invite.try_get("created_by")?;
-    if revoked_at.is_some() || principal_restricted(&mut tx, community, &issuer).await? {
+    if revoked_at.is_some() {
         return Ok(ClaimOutcome::Revoked.into());
+    }
+    if principal_restricted(&mut tx, community, &issuer).await? {
+        return Ok(ClaimOutcome::IssuerRestricted.into());
     }
 
     let uses_remaining = || max_uses.map(|mu| mu - use_count);

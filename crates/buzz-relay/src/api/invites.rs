@@ -508,7 +508,8 @@ pub async fn claim_invite(
             buzz_db::relay_invite::ClaimOutcome::Exhausted => {
                 Err(api_error(StatusCode::FORBIDDEN, "invite_exhausted"))
             }
-            buzz_db::relay_invite::ClaimOutcome::Revoked => {
+            buzz_db::relay_invite::ClaimOutcome::Revoked
+            | buzz_db::relay_invite::ClaimOutcome::IssuerRestricted => {
                 Err(api_error(StatusCode::FORBIDDEN, "invite_invalid"))
             }
             buzz_db::relay_invite::ClaimOutcome::Restricted => {

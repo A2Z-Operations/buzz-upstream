@@ -151,6 +151,8 @@ the same machine.
 New invitations are durable v2 bearers. A community ban permanently revokes
 outstanding v2 invitations issued by that principal or its recorded agents.
 Unban does not restore them; an unrestricted issuer can mint new invitations.
+An issuer or verified owner timeout also blocks claims on existing invitations
+while it lasts, without durable revocation. Claims resume after timeout expiry.
 Claim credentials are verified without user writes. Successful claims commit
 verified ownership with membership, policy evidence, and v2 consumption.
 Rejected claims create no users or owner links.
