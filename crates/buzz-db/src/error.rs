@@ -41,6 +41,10 @@ pub enum DbError {
     #[error("invitation principal is restricted")]
     InviteRestricted,
 
+    /// A verified invitation owner conflicts with the recorded owner.
+    #[error("invitation owner does not match the recorded owner")]
+    InviteOwnerMismatch,
+
     /// JSON serialization or deserialization failed.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),

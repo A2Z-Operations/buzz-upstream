@@ -151,6 +151,9 @@ the same machine.
 New invitations are durable v2 bearers. A community ban permanently revokes
 outstanding v2 invitations issued by that principal or its recorded agents.
 Unban does not restore them; an unrestricted issuer can mint new invitations.
+Claim credentials are verified without user writes. Successful claims commit
+verified ownership with membership, policy evidence, and v2 consumption.
+Rejected claims create no users or owner links.
 Claim and mint restriction reads use the writer inside a transaction serialized
 with community restriction and agent-owner writes. Admission committed first
 precedes the ban; a ban committed first prevents subsequent admission. Restriction

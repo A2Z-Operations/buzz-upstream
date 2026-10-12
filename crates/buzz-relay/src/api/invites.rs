@@ -35,6 +35,8 @@ use crate::invite_token;
 use crate::state::AppState;
 
 use super::{api_error, bridge, internal_error};
+mod claim_auth;
+use claim_auth::{authenticate, map_claim_error};
 
 /// Fixed-window size for the per-pubkey claim rate limiter.
 pub(crate) const CLAIM_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -226,64 +228,6 @@ pub async fn accept_policy(
     Ok(Json(serde_json::json!({ "receipt": receipt })))
 }
 
-/// Shared prelude: bind the tenant from the Host header and verify the NIP-98
-/// signature + replay for `path`.
-async fn authenticate(
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    path: &str,
-    body: &[u8],
-) -> Result<(buzz_core::TenantContext, nostr::PublicKey), (StatusCode, Json<Value>)> {
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
-
-    let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
-    let bridge::VerifiedBridgeAuth {
-        pubkey,
-        event_id_bytes,
-        signed_created_at,
-    } = bridge::verify_nip98_exempt_invite_claim(headers, "POST", &url, Some(body))?;
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
-
-    materialize_invite_owner(state, &tenant, &pubkey, headers, signed_created_at).await?;
-    Ok((tenant, pubkey))
-}
-
-async fn materialize_invite_owner(
-    state: &AppState,
-    tenant: &buzz_core::TenantContext,
-    pubkey: &nostr::PublicKey,
-    headers: &HeaderMap,
-    signed_created_at: Option<u64>,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    // The claim remains membership-exempt. Only cryptographically verified
-    // owner provenance is persisted, so the transactional restriction lookup
-    // also covers an agent onboarding for the first time.
-    if let Some(owner) = super::relay_members::extract_nip_oa_owner(
-        pubkey.as_bytes(),
-        super::relay_members::extract_auth_tag_header(headers),
-        signed_created_at,
-    ) {
-        if !super::relay_members::materialize_nip_oa_owner(state, tenant, pubkey, &owner).await {
-            return Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "restriction lookup unavailable",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn map_mint_error(error: buzz_db::DbError) -> (StatusCode, Json<Value>) {
     match error {
         buzz_db::DbError::InviteRestricted => api_error(StatusCode::FORBIDDEN, "invite_restricted"),
@@ -369,10 +313,18 @@ async fn mint_invite_checked(
         return e.into_response();
     }
 
-    if let Err(error) =
-        materialize_invite_owner(&state, &tenant, &pubkey, &headers, signed_created_at).await
-    {
-        return error.into_response();
+    if let Some(owner) = super::relay_members::extract_nip_oa_owner(
+        pubkey.as_bytes(),
+        super::relay_members::extract_auth_tag_header(&headers),
+        signed_created_at,
+    ) {
+        if !super::relay_members::materialize_nip_oa_owner(&state, &tenant, &pubkey, &owner).await {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "restriction lookup unavailable",
+            )
+            .into_response();
+        }
     }
 
     match mint_invite_inner(&state, body, tenant, pubkey).await {
@@ -462,7 +414,8 @@ pub async fn claim_invite(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites/claim", &body).await?;
+    let (tenant, pubkey, verified_owner) =
+        authenticate(&state, &headers, "/api/invites/claim", &body).await?;
 
     if claim_rate_limited(&state, tenant.community(), &pubkey) {
         return Err(api_error(
@@ -475,6 +428,7 @@ pub async fn claim_invite(
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid claim JSON: {e}")))?;
 
     let claimer_hex = pubkey.to_hex();
+    let owner_hex = verified_owner.map(|owner| owner.to_hex());
     let key = invite_token::derive_invite_key(&state.relay_keypair);
 
     // --- v2 database-backed path ---
@@ -499,7 +453,7 @@ pub async fn claim_invite(
         let token_hash = hash_v2_code(&request.code);
         let outcome = state
             .db
-            .claim_relay_invite(
+            .claim_relay_invite_with_owner(
                 tenant.community(),
                 &token_hash,
                 &claimer_hex,
@@ -508,11 +462,16 @@ pub async fn claim_invite(
                     .join_policy
                     .as_ref()
                     .map(|policy| policy.version.as_str()),
+                owner_hex.as_deref(),
             )
             .await
-            .map_err(|e| internal_error(&format!("v2 invite claim: {e}")))?;
-
-        return match outcome {
+            .map_err(map_claim_error)?;
+        metrics::counter!("buzz_users_created_total", "community" => tenant.host().to_owned())
+            .increment(outcome.users_created);
+        if outcome.owner_link_created {
+            state.disconnect_unowned_agent_clusterwide(&tenant, pubkey.as_bytes());
+        }
+        return match outcome.outcome {
             buzz_db::relay_invite::ClaimOutcome::Joined { .. } => {
                 tracing::info!(
                     community = %tenant.community(),
@@ -584,9 +543,9 @@ pub async fn claim_invite(
             .map_err(|_| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
     }
 
-    let was_inserted = state
+    let claim = state
         .db
-        .claim_relay_membership(
+        .claim_relay_membership_with_owner(
             tenant.community(),
             &claimer_hex,
             &payload.r,
@@ -595,14 +554,16 @@ pub async fn claim_invite(
                 .join_policy
                 .as_ref()
                 .map(|policy| policy.version.as_str()),
+            owner_hex.as_deref(),
         )
         .await
-        .map_err(|e| match e {
-            buzz_db::DbError::InviteRestricted => {
-                api_error(StatusCode::FORBIDDEN, "invite_restricted")
-            }
-            e => internal_error(&format!("invite claim insert: {e}")),
-        })?;
+        .map_err(map_claim_error)?;
+    metrics::counter!("buzz_users_created_total", "community" => tenant.host().to_owned())
+        .increment(claim.users_created);
+    if claim.owner_link_created {
+        state.disconnect_unowned_agent_clusterwide(&tenant, pubkey.as_bytes());
+    }
+    let was_inserted = claim.inserted;
 
     if was_inserted {
         tracing::info!(
@@ -654,6 +615,7 @@ fn claim_key_rate_limited(
 
 #[cfg(test)]
 mod postgres_tests {
+    mod owner_admission_tests;
     mod restriction_tests;
     use std::sync::Arc;
     use std::time::Duration;

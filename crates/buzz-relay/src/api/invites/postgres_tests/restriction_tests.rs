@@ -1,7 +1,8 @@
-mod postgres_tests {
+pub(super) mod postgres_tests {
     use super::super::*;
 
-    async fn fixture() -> (Arc<AppState>, String, buzz_core::CommunityId, Keys) {
+    pub(in crate::api::invites::postgres_tests) async fn fixture(
+    ) -> (Arc<AppState>, String, buzz_core::CommunityId, Keys) {
         let host = format!("restricted-invite-{}.example", Uuid::new_v4().simple());
         let state = invite_test_state(&host)
             .await
@@ -21,7 +22,7 @@ mod postgres_tests {
         (state, host, community, owner)
     }
 
-    async fn post_with_owner_tag(
+    pub(in crate::api::invites::postgres_tests) async fn post_with_owner_tag(
         state: Arc<AppState>,
         host: &str,
         path: &str,
@@ -136,6 +137,42 @@ mod postgres_tests {
         assert!(!state
             .db
             .is_relay_member(community, &agent.public_key().to_hex())
+            .await
+            .unwrap());
+        for key in [&agent, &owner] {
+            assert!(state
+                .db
+                .get_user(community, key.public_key().as_bytes())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        state
+            .db
+            .unban_community_member(
+                community,
+                owner.public_key().as_bytes(),
+                issuer.public_key().as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = post_with_owner_tag(
+            state.clone(),
+            &host,
+            "/api/invites/claim",
+            &agent,
+            serde_json::json!({"code":code}).to_string(),
+            &tag,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .db
+            .is_agent_owner(
+                community,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes()
+            )
             .await
             .unwrap());
         let other_agent = Keys::generate();
