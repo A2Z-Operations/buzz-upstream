@@ -88,6 +88,8 @@ jobs:
               - 'pnpm-lock.yaml'
             mobile:
               - 'mobile/**'
+              - 'scripts/apple-tools/**'
+              - 'scripts/trust-ios-package-plugin.py'
               - '.xcode-version'
               - 'scripts/check-xcode.sh'
               - 'scripts/mobile-release.sh'

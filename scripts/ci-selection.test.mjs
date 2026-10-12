@@ -300,6 +300,8 @@ for (const [name, paths, expected] of scenarios) {
 }
 
 for (const [name, paths, expected] of [
+  ["Apple lipo adapter", ["scripts/apple-tools/lipo"], ["mobile"]],
+  ["Apple plugin trust helper", ["scripts/trust-ios-package-plugin.py"], ["mobile"]],
   [
     "docs-only",
     ["CONTEXT.md", "docs/mobile-push-suppression.md", "VISION_MOBILE.md"],
