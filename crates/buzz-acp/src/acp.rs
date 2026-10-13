@@ -1694,22 +1694,17 @@ impl AcpClient {
                                         };
                                         match outcome {
                                             Some(STEER_OUTCOME_STARTED_NEW_TURN) => {
-                                                // Delivered, but into a NEW
-                                                // turn: the one this read loop
-                                                // is awaiting had already
-                                                // finished. Renewing the hard
-                                                // deadline here would extend
-                                                // the clock on a settled turn,
-                                                // so leave it alone and let the
-                                                // prompt response land on its
-                                                // original budget.
-                                                tracing::info!(
-                                                    "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
-                                                     awaited turn had ended — hard deadline not renewed"
-                                                );
-                                                crate::pool::SteerAck::Success {
-                                                    session_id: session_id.to_owned(),
-                                                }
+                                                // This response starts a detached turn with no
+                                                // prompt request whose completion we can await.
+                                                // Stop it before releasing the payload for retry.
+                                                // Recovery is at-least-once: work may have begun.
+                                                self.shutdown().await;
+                                                let _ = ack_tx.send(crate::pool::SteerAck::Err(
+                                                    crate::pool::SteerError::Transport(
+                                                        "detached steering turn has no completion handle".into(),
+                                                    ),
+                                                ));
+                                                return Err(AcpError::AgentExited);
                                             }
                                             Some(_) => {
                                                 let renew_now = Instant::now();
@@ -1755,6 +1750,22 @@ impl AcpClient {
                                 }
                             }
                             if *id == serde_json::json!(expected_id) {
+                                if matches!(
+                                    pending_steer.as_ref(),
+                                    Some((_, SteerTransport::AcpExtension, _))
+                                ) {
+                                    // The old prompt can finish before the extension's response.
+                                    // Until its outcome is known a detached turn may be running.
+                                    self.shutdown().await;
+                                    if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                        let _ = ack_tx.send(crate::pool::SteerAck::Err(
+                                            crate::pool::SteerError::Transport(
+                                                "prompt ended before steering outcome".into(),
+                                            ),
+                                        ));
+                                    }
+                                    return Err(AcpError::AgentExited);
+                                }
                                 if let Some(error) = msg.get("error") {
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx
@@ -4584,61 +4595,52 @@ sleep 1"#,
         );
     }
 
-    /// Test 6: **red/green for the no-renewal rule.** `startedNewTurn` means
-    /// the turn Buzz was steering had already ended and the adapter began a
-    /// fresh, detached one. It acks `Success` (the message WAS delivered, so
-    /// the event must not be redelivered) but must NOT renew the hard
-    /// deadline — that clock belongs to a turn which is already settled.
-    ///
-    /// Same timeline as the `injected` test, so the only difference is the
-    /// outcome string: original hard deadline at t≈1s, steer response at
-    /// t≈0.5s, prompt response at t≈1.5s. With renewal the prompt response
-    /// would land and this returns `Ok`; without renewal the original
-    /// deadline fires first and we get `HardTimeout`.
+    /// A detached steering turn has no completion handle. In either response
+    /// order the process must exit before the follow-up becomes retryable.
     #[tokio::test]
-    async fn acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline() {
-        let script = "sleep 0.5; \
-             echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"startedNewTurn\"}}'; \
-             sleep 1; \
-             echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
-        let mut client = spawn_script(script).await;
-        set_steering_supported(&mut client);
-
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
-        client.install_steer_rx(steer_rx);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
-        let send_task = tokio::spawn(async move {
+    async fn acp_detached_steer_stops_worker_before_releasing_follow_up() {
+        for original_first in [false, true] {
+            let steer = r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"startedNewTurn"}}"#;
+            let original = r#"{"jsonrpc":"2.0","id":999,"result":{"done":true}}"#;
+            let (first, second) = if original_first {
+                (original, steer)
+            } else {
+                (steer, original)
+            };
+            let mut client = spawn_script(&format!(
+                "read request; echo '{first}'; echo '{second}'; cat >/dev/null"
+            ))
+            .await;
+            set_steering_supported(&mut client);
+            let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(1);
+            client.install_steer_rx(steer_rx);
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             steer_tx
                 .send(crate::pool::SteerRequest {
-                    prompt_blocks: vec!["steer body".into()],
+                    prompt_blocks: vec!["follow-up".into()],
                     ack_tx,
                 })
                 .await
-                .expect("steer_tx send should succeed");
-        });
-
-        let idle = std::time::Duration::from_secs(10);
-        let max_dur = std::time::Duration::from_secs(3);
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
-            .await;
-        send_task.await.expect("send_task should complete");
-
-        // The original deadline must still fire — renewal here would extend
-        // the clock on a turn the adapter has already finished.
-        assert!(
-            matches!(result, Err(AcpError::HardTimeout { .. })),
-            "startedNewTurn must NOT renew the hard deadline, so the original \
-             one must still fire; got {result:?}"
-        );
-        // Delivery still succeeded, so the withheld event must be dropped
-        // rather than released — hence Success, not an Err.
-        let ack = ack_rx.await.expect("ack must be received");
-        assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
-            "startedNewTurn is a delivery success, got {ack:?}"
-        );
+                .unwrap();
+            let result = client
+                .read_until_response_with_idle_timeout(
+                    "session",
+                    999,
+                    std::time::Duration::from_secs(5),
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            assert!(matches!(result, Err(AcpError::AgentExited)), "{result:?}");
+            assert!(
+                client.child.try_wait().unwrap().is_some(),
+                "worker must be reaped before retry"
+            );
+            assert!(matches!(
+                ack_rx.await.unwrap(),
+                crate::pool::SteerAck::Err(_)
+            ));
+        }
     }
 
     /// Test 4 (companion to the existing

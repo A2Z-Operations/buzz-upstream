@@ -13,6 +13,9 @@
 //!   still queue normally.
 //! - **Queue** — all events accumulate; batched on the next flush cycle.
 
+mod native_steer;
+use native_steer::WithheldSteer;
+
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -357,8 +360,8 @@ pub struct EventQueue {
     /// `received_at` fairness, same discipline as `requeue_preserve_timestamps`
     /// at line 453). Bulk recovery on in-flight deadline expiry is performed
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
-    /// the events were never delivered to the agent).
-    withheld_native_steer: HashMap<SessionScope, Vec<QueuedEvent>>,
+    /// the events did not complete in the agent).
+    withheld_native_steer: HashMap<SessionScope, Vec<WithheldSteer>>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -1012,7 +1015,7 @@ impl EventQueue {
             if s.channel_id() != channel_id {
                 return true;
             }
-            events.iter().for_each(|e| collect(&e.event));
+            events.iter().for_each(|e| collect(&e.queued.event));
             false
         });
         // Also purge side-tables for every scope of this channel.
@@ -1107,158 +1110,6 @@ impl EventQueue {
     /// Whether any scope currently has a turn in flight.
     pub fn has_in_flight(&self) -> bool {
         !self.in_flight_scopes.is_empty()
-    }
-
-    // ── Goose-native steer withhold (side table) ──────────────────────────
-    //
-    // While a goose-native `_goose/unstable/session/steer` write is in flight
-    // for a specific queued event, that event is moved out of `queues` into
-    // `withheld_native_steer` so `flush_next` / `has_flushable_work` / the
-    // contiguous drain at line 285 cannot see it — closing the race window
-    // between `mark_complete` (which clears `in_flight_channels`) and the
-    // ack arriving on the main loop. On `Success` the event is consumed
-    // (`remove_event`); on `Err` / `PromptCompletedNeutral` it is released
-    // back to the queue front (`release_native_steer`), preserving its
-    // original `received_at` for FIFO fairness.
-
-    /// Move a queued event out of `queues[channel_id]` into the side table
-    /// to withhold it from `flush_next` while a goose-native steer is in
-    /// flight.
-    ///
-    /// Returns `true` if the event was found and withheld, `false` if the
-    /// event id was not present in `queues[channel_id]` (race-safe no-op:
-    /// the event may have already been drained, removed, or never queued).
-    ///
-    /// Must be called synchronously from the mode-gate fork immediately
-    /// after `pool.send_steer` returns `Ok(())` and before any watcher task
-    /// is spawned, so the withhold is established before `mark_complete` /
-    /// any subsequent `flush_next` tick can run.
-    pub fn mark_native_steer_pending<K: IntoScope>(&mut self, scope: K, event_id: &str) -> bool {
-        let scope = scope.into_scope();
-        let Some(q) = self.queues.get_mut(&scope) else {
-            return false;
-        };
-        let Some(pos) = q.iter().position(|qe| qe.event.id.to_hex() == event_id) else {
-            return false;
-        };
-        let qe = q
-            .remove(pos)
-            .expect("position came from iter so remove must succeed");
-        if q.is_empty() {
-            self.queues.remove(&scope);
-        }
-        self.withheld_native_steer
-            .entry(scope)
-            .or_default()
-            .push(qe);
-        true
-    }
-
-    /// Release a single withheld event back to the front of
-    /// `queues[channel_id]`, preserving its original `received_at`.
-    ///
-    /// Called on `SteerAck::Err(_)` and `SteerAck::PromptCompletedNeutral`
-    /// (delivery unknown after prompt completion; restoring queued event
-    /// for normal dispatch). Idempotent: a no-op if the event was already
-    /// removed or never withheld.
-    ///
-    /// Push-to-front matches the discipline of `requeue_preserve_timestamps`
-    /// at line 453, preserving fairness across channels.
-    pub fn release_native_steer<K: IntoScope>(&mut self, scope: K, event_id: &str) {
-        let scope = scope.into_scope();
-        let Some(entries) = self.withheld_native_steer.get_mut(&scope) else {
-            return;
-        };
-        let Some(pos) = entries
-            .iter()
-            .position(|qe| qe.event.id.to_hex() == event_id)
-        else {
-            return;
-        };
-        let qe = entries.remove(pos);
-        if entries.is_empty() {
-            self.withheld_native_steer.remove(&scope);
-        }
-        let channel_id = scope.channel_id();
-        // Push to FRONT so original `received_at` keeps the event at the head
-        // of the scope's queue. Per-scope cap is enforced below in case
-        // a flood of events arrived during the ack window.
-        let queue = self.queues.entry(scope.clone()).or_default();
-        queue.push_front(qe);
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "release_native_steer overflow — dropped newest event to enforce cap"
-            );
-        }
-        self.enforce_channel_cap(channel_id);
-    }
-
-    /// Drop a specific event by id from both the side table and the main
-    /// queue.
-    ///
-    /// Called on `SteerAck::Success` — the agent received the steer, so the
-    /// event has been "delivered" via the non-cancelling path and must not
-    /// be redelivered via normal dispatch. Idempotent across both stores.
-    pub fn remove_event<K: IntoScope>(&mut self, scope: K, event_id: &str) {
-        let scope = scope.into_scope();
-        if let Some(entries) = self.withheld_native_steer.get_mut(&scope) {
-            entries.retain(|qe| qe.event.id.to_hex() != event_id);
-            if entries.is_empty() {
-                self.withheld_native_steer.remove(&scope);
-            }
-        }
-        if let Some(q) = self.queues.get_mut(&scope) {
-            q.retain(|qe| qe.event.id.to_hex() != event_id);
-            if q.is_empty() {
-                self.queues.remove(&scope);
-            }
-        }
-    }
-
-    /// Bulk-release every withheld event for `channel_id` back to the queue
-    /// front, preserving relative FIFO order.
-    ///
-    /// Called from the `in_flight_deadline` expiry blocks in
-    /// `flush_next` and `has_flushable_work` — if a steer ack never arrives
-    /// (read loop hung, watcher never posted), the withheld events would
-    /// otherwise be permanently orphaned. Recover, do not log-and-drop: the
-    /// events were never delivered to the agent, so normal dispatch must
-    /// have a chance to deliver them.
-    ///
-    /// Iterates the stored entries in reverse so per-entry `push_front`
-    /// composes to original-FIFO order at the queue front (same discipline
-    /// as `requeue_preserve_timestamps` at line 453).
-    fn recover_withheld_for_expired_scope(&mut self, scope: &SessionScope) {
-        let Some(entries) = self.withheld_native_steer.remove(scope) else {
-            return;
-        };
-        let n = entries.len();
-        let channel_id = scope.channel_id();
-        let queue = self.queues.entry(scope.clone()).or_default();
-        for qe in entries.into_iter().rev() {
-            queue.push_front(qe);
-        }
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "withheld-steer recovery overflow — dropped newest event to enforce cap"
-            );
-        }
-        self.enforce_channel_cap(channel_id);
-        tracing::warn!(
-            channel_id = %channel_id,
-            scope = %scope.telemetry_label(),
-            recovered = n,
-            "in-flight expiry recovered withheld steer event(s) — \
-             steer ack never arrived; normal dispatch will deliver"
-        );
     }
 
     /// Compact expired metadata entries to prevent unbounded map growth.
@@ -6928,8 +6779,10 @@ mod tests {
         let queued_target = "77".repeat(32);
         let withheld_target = "88".repeat(32);
         q.push(queued_edit(ch, &queued_target, None));
-        q.withheld_native_steer
-            .insert(conv(ch), vec![queued_edit(ch, &withheld_target, None)]);
+        let withheld = queued_edit(ch, &withheld_target, None);
+        let event_id = withheld.event.id.to_hex();
+        q.push(withheld);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
 
         let drained: HashSet<String> = q.drain_channel(ch).into_iter().collect();
         assert_eq!(drained, HashSet::from([queued_target, withheld_target]));
