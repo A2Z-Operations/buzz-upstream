@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) struct WithheldSteer {
     pub(super) queued: QueuedEvent,
+    turn_id: String,
     acknowledged: bool,
     completed: Option<bool>,
 }
@@ -16,6 +17,17 @@ impl EventQueue {
             .map(|(_, events)| events.len())
             .sum::<usize>()
             < MAX_PENDING_PER_CHANNEL
+    }
+
+    /// Whether this acknowledgement still owns the retained delivery attempt.
+    pub fn owns_native_steer(&self, scope: &SessionScope, event_id: &str, turn_id: &str) -> bool {
+        self.withheld_native_steer
+            .get(scope)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.turn_id == turn_id && entry.queued.event.id.to_hex() == event_id
+                })
+            })
     }
 
     /// Record acceptance without discarding the payload until its turn settles.
@@ -46,14 +58,14 @@ impl EventQueue {
 
     /// Settle only this turn's follow-ups. The ack and result may arrive in
     /// either order; entries already settled by an earlier turn stay unchanged.
-    pub fn finish_native_steers(&mut self, scope: &SessionScope, completed: bool) {
+    pub fn finish_native_steers(&mut self, scope: &SessionScope, turn_id: &str, completed: bool) {
         let Some(entries) = self.withheld_native_steer.get_mut(scope) else {
             return;
         };
         let ready: Vec<_> = entries
             .iter_mut()
             .filter_map(|entry| {
-                if entry.completed.is_some() {
+                if entry.turn_id != turn_id || entry.completed.is_some() {
                     return None;
                 }
                 entry.completed = Some(completed);
@@ -79,10 +91,15 @@ impl EventQueue {
     /// the event may have already been drained, removed, or never queued).
     ///
     /// Must be called synchronously from the mode-gate fork immediately
-    /// after `pool.send_steer` returns `Ok(())` and before any watcher task
+    /// after `pool.send_steer` returns `Ok(turn_id)` and before any watcher task
     /// is spawned, so the withhold is established before `mark_complete` /
     /// any subsequent `flush_next` tick can run.
-    pub fn mark_native_steer_pending<K: IntoScope>(&mut self, scope: K, event_id: &str) -> bool {
+    pub fn mark_native_steer_pending<K: IntoScope>(
+        &mut self,
+        scope: K,
+        event_id: &str,
+        turn_id: &str,
+    ) -> bool {
         let scope = scope.into_scope();
         let Some(q) = self.queues.get_mut(&scope) else {
             return false;
@@ -101,6 +118,7 @@ impl EventQueue {
             .or_default()
             .push(WithheldSteer {
                 queued: qe,
+                turn_id: turn_id.to_owned(),
                 acknowledged: false,
                 completed: None,
             });

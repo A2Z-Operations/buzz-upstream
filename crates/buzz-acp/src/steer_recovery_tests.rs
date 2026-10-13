@@ -40,7 +40,7 @@ async fn settle(ack_first: bool, success: bool) {
     let event = follow_up(&scope);
     let event_id = event.event.id.to_hex();
     queue.push(event);
-    assert!(queue.mark_native_steer_pending(&scope, &event_id));
+    assert!(queue.mark_native_steer_pending(&scope, &event_id, "turn"));
     if ack_first {
         assert!(queue.acknowledge_native_steer(&scope, &event_id));
     }
@@ -132,7 +132,7 @@ async fn acknowledged_native_follow_up_survives_prompt_task_panic() {
     let event = follow_up(&scope);
     let id = event.event.id.to_hex();
     queue.push(event);
-    assert!(queue.mark_native_steer_pending(&scope, &id));
+    assert!(queue.mark_native_steer_pending(&scope, &id, "turn"));
     assert!(queue.acknowledge_native_steer(&scope, &id));
     let failure = pool.join_set.join_next().await.unwrap().unwrap_err();
     let (tx, _rx) = mpsc::channel(1);
@@ -167,9 +167,9 @@ fn a_later_turn_does_not_overwrite_a_failed_turn_waiting_for_its_ack() {
     let event = follow_up(&scope);
     let id = event.event.id.to_hex();
     queue.push(event);
-    assert!(queue.mark_native_steer_pending(&scope, &id));
-    queue.finish_native_steers(&scope, false);
-    queue.finish_native_steers(&scope, true);
+    assert!(queue.mark_native_steer_pending(&scope, &id, "turn"));
+    queue.finish_native_steers(&scope, "turn", false);
+    queue.finish_native_steers(&scope, "later-turn", true);
     assert!(!queue.acknowledge_native_steer(&scope, &id));
     assert_eq!(queue.flush_next().unwrap().events[0].event.id.to_hex(), id);
 }
@@ -187,7 +187,7 @@ async fn original_completion_before_steer_ack_retries_only_the_follow_up() {
     let follow_up = follow_up(&scope);
     let follow_up_id = follow_up.event.id.to_hex();
     queue.push(follow_up);
-    assert!(queue.mark_native_steer_pending(&scope, &follow_up_id));
+    assert!(queue.mark_native_steer_pending(&scope, &follow_up_id, "original"));
 
     // Complete the original request only after the steer is on the wire,
     // then report a detached follow-up. The original work is definitively done.
@@ -321,4 +321,183 @@ cat >/dev/null"#;
     tasks.shutdown().await;
     shutdown_agent_pool(&mut pool).await;
     server.abort();
+}
+
+/// Drive both wire orderings through real subprocess replacement three times,
+/// then prove actual failures still open the same slot's circuit.
+#[tokio::test]
+async fn planned_steer_retirements_preserve_availability_and_genuine_crashes_count() {
+    for original_first in [true, false] {
+        let original = r#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}"#;
+        let steer = r#"{"jsonrpc":"2.0","id":2,"result":{"outcome":"startedNewTurn"}}"#;
+        let (first, second) = if original_first {
+            (original, steer)
+        } else {
+            (steer, original)
+        };
+        let script = format!("read initialize\necho '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"_meta\":{{\"steering\":{{\"supported\":true}}}}}}}}'\nread prompt\nread steer\necho '{first}'\necho '{second}'\ncat >/dev/null");
+        let mut config = test_config();
+        config.agent_command = "/bin/sh".into();
+        config.agent_args = vec!["-c".into(), script];
+        let mut agent = dummy_agent(0).await;
+        agent.acp.shutdown().await;
+        agent.acp = spawn_and_init(
+            &config.agent_command,
+            &config.agent_args,
+            &[],
+            false,
+            0,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let mut history = [SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        for round in 0..6 {
+            let planned = round < 3;
+            let scope = scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            let turn_id = format!("turn-{round}");
+            let mut agent = pool
+                .try_claim(None)
+                .expect("replacement must remain available");
+            bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(scope.channel_id()),
+                    scope: Some(scope.clone()),
+                    turn_id: turn_id.clone(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let mut queue = EventQueue::new(DedupMode::Queue);
+            let event = follow_up(&scope);
+            let event_id = event.event.id.to_hex();
+            queue.push(event);
+            assert!(queue.mark_native_steer_pending(&scope, &event_id, &turn_id));
+            let outcome = if planned {
+                let (steer_tx, steer_rx) = mpsc::channel(1);
+                agent.acp.install_steer_rx(steer_rx);
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                steer_tx
+                    .send(pool::SteerRequest {
+                        prompt_blocks: vec!["follow-up".into()],
+                        ack_tx,
+                    })
+                    .await
+                    .unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    agent.acp.session_prompt_with_idle_timeout(
+                        "session",
+                        "original",
+                        Duration::from_secs(3),
+                        Duration::from_secs(3),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(agent.acp.retired_for_untracked_steer());
+                assert!(agent.acp.is_shutdown());
+                assert!(matches!(
+                    ack_rx.await.unwrap(),
+                    pool::SteerAck::PromptCompletedNeutral | pool::SteerAck::Err(_)
+                ));
+                queue.release_native_steer(&scope, &event_id);
+                if original_first {
+                    PromptOutcome::Ok(result.expect("known original success preserved"))
+                } else {
+                    assert!(matches!(result, Err(acp::AcpError::AgentExited)));
+                    PromptOutcome::AgentExited
+                }
+            } else {
+                // A failure path can also have already shut down the client.
+                // Only the explicitly planned retirement flag exempts a crash.
+                agent.acp.shutdown().await;
+                assert!(!agent.acp.retired_for_untracked_steer());
+                PromptOutcome::AgentExited
+            };
+            let action = handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                PromptResult {
+                    agent,
+                    source: PromptSource::Channel(scope.clone()),
+                    turn_id,
+                    outcome,
+                    batch: None,
+                },
+                &mut false,
+                &HashSet::new(),
+                &mut history,
+                &tx,
+                &mut tasks,
+                None,
+                None,
+                &mut tokio::time::Instant::now(),
+            );
+            if planned {
+                assert!(
+                    history[0].crash_times.is_empty(),
+                    "planned retirement must not charge crash history"
+                );
+                assert!(history[0].open_until.is_none());
+                assert_eq!(
+                    queue.flush_next().unwrap().events[0].event.id.to_hex(),
+                    event_id
+                );
+            } else {
+                assert_eq!(history[0].crash_times.len(), round - 2);
+            }
+            if round == 5 {
+                assert!(matches!(action, LoopAction::Exit));
+                assert!(
+                    history[0].open_until.is_some(),
+                    "three real failures must still open the circuit"
+                );
+            } else {
+                assert!(matches!(action, LoopAction::Continue));
+                assert!(history[0].respawn_in_flight);
+                let replacement = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (acp, protocol_version, agent_name) =
+                    replacement.result.expect("replacement handshake succeeds");
+                history[0].respawn_in_flight = false;
+                pool.return_agent(OwnedAgent {
+                    index: 0,
+                    acp,
+                    protocol_version,
+                    agent_name,
+                    state: Default::default(),
+                    model_capabilities: None,
+                    desired_model: None,
+                    model_overridden: false,
+                    desired_model_request_id: None,
+                    desired_model_pending_ack: false,
+                    startup_effort: None,
+                    goose_system_prompt_supported: None,
+                });
+                assert!(pool.any_idle());
+            }
+        }
+        tasks.shutdown().await;
+        shutdown_agent_pool(&mut pool).await;
+    }
 }

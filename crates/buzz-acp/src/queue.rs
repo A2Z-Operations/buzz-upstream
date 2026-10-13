@@ -6116,8 +6116,8 @@ mod tests {
     //
     // Side-table semantics: `mark_native_steer_pending` moves an event out of
     // `queues` into `withheld_native_steer`, making it invisible to
-    // `flush_next` / `has_flushable_work` / contiguous drain. `Success` ack
-    // drops it via `remove_event`; `Err` / `PromptCompletedNeutral` ack
+    // `flush_next` / `has_flushable_work` / contiguous drain. Successful ack
+    // and matching turn completion drop it; `Err` / `PromptCompletedNeutral` ack
     // restores it to the queue front via `release_native_steer`. The
     // `in_flight_deadline` expiry bulk-recovers withheld events so they
     // are never permanently orphaned.
@@ -6135,7 +6135,7 @@ mod tests {
         let event_id = qe.event.id.to_hex();
         q.push(qe);
 
-        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert!(q.mark_native_steer_pending(ch, &event_id, "turn"));
 
         assert!(
             q.flush_next().is_none(),
@@ -6175,7 +6175,7 @@ mod tests {
         q.push(e3);
 
         // Steer in flight for e3 — withhold it from normal dispatch.
-        assert!(q.mark_native_steer_pending(ch, &e3_id));
+        assert!(q.mark_native_steer_pending(ch, &e3_id, "turn"));
 
         // Earlier events flush as a normal batch; e3 is invisible.
         let batch = q
@@ -6220,7 +6220,7 @@ mod tests {
         q.in_flight_scopes.insert(conv(ch));
         q.in_flight_deadlines.insert(conv(ch), Instant::now());
         q.in_flight_batch_sizes.insert(conv(ch), 1);
-        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert!(q.mark_native_steer_pending(ch, &event_id, "turn"));
 
         // Force the in-flight deadline to be in the past, simulating the
         // steer ack never arriving and the read loop hanging long enough
@@ -6275,9 +6275,9 @@ mod tests {
         // tests. What matters here is that the bulk-recovery path
         // (reverse iter + push_front) composes to original FIFO at the
         // queue front.
-        assert!(q.mark_native_steer_pending(ch, &e1_id));
-        assert!(q.mark_native_steer_pending(ch, &e2_id));
-        assert!(q.mark_native_steer_pending(ch, &e3_id));
+        assert!(q.mark_native_steer_pending(ch, &e1_id, "turn"));
+        assert!(q.mark_native_steer_pending(ch, &e2_id, "turn"));
+        assert!(q.mark_native_steer_pending(ch, &e3_id, "turn"));
         assert_eq!(pending_count(&q), 0);
         assert_eq!(
             q.withheld_native_steer.get(&conv(ch)).map(|v| v.len()),
@@ -6782,7 +6782,7 @@ mod tests {
         let withheld = queued_edit(ch, &withheld_target, None);
         let event_id = withheld.event.id.to_hex();
         q.push(withheld);
-        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert!(q.mark_native_steer_pending(ch, &event_id, "turn"));
 
         let drained: HashSet<String> = q.drain_channel(ch).into_iter().collect();
         assert_eq!(drained, HashSet::from([queued_target, withheld_target]));
@@ -7268,3 +7268,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod steer_ownership_tests;

@@ -150,6 +150,7 @@ pub struct AcpClient {
     child: Child,
     /// Retirement is independent of the terminal result of its last prompt.
     shutdown: bool,
+    retired_for_untracked_steer: bool,
     /// Sole stdin writer; None after an interrupted/failed frame closes it.
     stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -432,6 +433,11 @@ impl AcpClient {
         self.shutdown
     }
 
+    /// Whether a steering race intentionally retired this worker for replacement.
+    pub fn retired_for_untracked_steer(&self) -> bool {
+        self.retired_for_untracked_steer
+    }
+
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
@@ -627,6 +633,7 @@ impl AcpClient {
         Ok(Self {
             child,
             shutdown: false,
+            retired_for_untracked_steer: false,
             stdin: Some(stdin),
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -1708,6 +1715,7 @@ impl AcpClient {
                                                 // prompt request whose completion we can await.
                                                 // Stop it before releasing the payload for retry.
                                                 // Recovery is at-least-once: work may have begun.
+                                                self.retired_for_untracked_steer = true;
                                                 self.shutdown().await;
                                                 let _ = ack_tx.send(crate::pool::SteerAck::Err(
                                                     crate::pool::SteerError::Transport(
@@ -1766,6 +1774,7 @@ impl AcpClient {
                                 ) {
                                     // The old prompt can finish before the extension's response.
                                     // Until its outcome is known a detached turn may be running.
+                                    self.retired_for_untracked_steer = true;
                                     self.shutdown().await;
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx

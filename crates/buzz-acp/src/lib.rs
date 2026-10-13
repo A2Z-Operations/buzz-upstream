@@ -2374,6 +2374,7 @@ struct SteerAckEvent {
     /// and deadline extension target this, not the whole channel.
     scope: scope::SessionScope,
     event_id: String,
+    turn_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
     /// under the current read-loop drains, but if it ever does the main
@@ -4007,7 +4008,9 @@ async fn run_harness(
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
                 if let Some(scope) = result.source.scope() {
-                    typing_channels.remove(scope);
+                    if !pool.has_newer_scope_owner(scope, result.agent.index) {
+                        typing_channels.remove(scope);
+                    }
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -4080,78 +4083,8 @@ async fn run_harness(
                     typing_channels.insert(scope, thread_tags);
                 }
             }
-            Some(PoolEvent::SteerAck(SteerAckEvent {
-                channel_id,
-                scope,
-                event_id,
-                ack,
-            })) => {
-                // Acceptance and prompt completion arrive independently. Keep
-                // the payload until both succeed; release it on either failure.
-                // Unsupported steering also requests the cancel-and-merge path.
-                let (release_withheld, accepted_native_steer, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success { .. }) => (false, true, false),
-                    // -32601 = method_not_found: agent does not implement the
-                    // steer extension. Fire cancel+merge so the message still
-                    // reaches the agent.
-                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code, .. }))
-                        if *code == -32601 =>
-                    {
-                        (true, false, true)
-                    }
-                    // AgentError: write landed, agent rejected it at the
-                    // application level (e.g. wrong run id). Release for
-                    // normal dispatch; no fallback signal (the turn is still
-                    // running or just ended — either way there is nothing to
-                    // cancel).
-                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
-                        (true, false, false)
-                    }
-                    // Transport / ExpectedRunIdMissing / OutcomeRejected: the
-                    // steer did not land. Release and fire the cancel+merge
-                    // fallback so the message still reaches the agent.
-                    Ok(pool::SteerAck::Err(_)) => (true, false, true),
-                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
-                    Err(_recv_err) => (true, false, false),
-                };
-                tracing::info!(
-                    channel = %channel_id,
-                    event_id = %event_id,
-                    ?ack,
-                    release_withheld,
-                    accepted_native_steer,
-                    signal_fallback,
-                    "non-cancelling steer ack received"
-                );
-                if let Ok(pool::SteerAck::Success { session_id }) = &ack {
-                    queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
-                    if queue.acknowledge_native_steer(&scope, &event_id)
-                        && !pool.record_successful_steer(
-                            &scope,
-                            event_id.clone(),
-                            session_id.clone(),
-                        )
-                    {
-                        tracing::warn!(
-                            channel = %channel_id,
-                            event_id = %event_id,
-                            "successful steer lost its in-flight delivery ledger"
-                        );
-                    }
-                }
-                if release_withheld {
-                    queue.release_native_steer(&scope, &event_id);
-                }
-                if signal_fallback {
-                    // Universal cancel+merge fallback. Note: the
-                    // queued event has already been released to the
-                    // front of `queues[scope]`, so the cancel will pick
-                    // it up as part of the merged batch and re-prompt the
-                    // agent. Scope-exact so the fallback cancels the
-                    // steered event's OWN thread, not a sibling thread
-                    // in the same channel.
-                    signal_in_flight_task_for_scope(&mut pool, &scope, ControlSignal::Steer);
-                }
+            Some(PoolEvent::SteerAck(event)) => {
+                handle_steer_ack(&mut pool, &mut queue, event, config.max_turn_duration_secs);
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
                 // channel stays `in_flight_channels` and `flush_next`
@@ -4458,10 +4391,11 @@ fn signal_in_flight_task_for_scope(
     scope: &scope::SessionScope,
     mode: ControlSignal,
 ) -> bool {
+    let turn_id = pool.current_scope_turn(scope).map(str::to_owned);
     let entry = pool
         .task_map_mut()
         .values_mut()
-        .find(|m| m.scope.as_ref() == Some(scope));
+        .find(|m| m.scope.as_ref() == Some(scope) && Some(&m.turn_id) == turn_id.as_ref());
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
@@ -4476,6 +4410,84 @@ fn signal_in_flight_task_for_scope(
         }
     }
     false
+}
+
+fn handle_steer_ack(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    event: SteerAckEvent,
+    max_turn_duration_secs: u64,
+) {
+    let SteerAckEvent {
+        channel_id,
+        scope,
+        event_id,
+        turn_id,
+        ack,
+    } = event;
+    if !queue.owns_native_steer(&scope, &event_id, &turn_id) {
+        return;
+    }
+    // Acceptance and prompt completion arrive independently. Keep
+    // the payload until both succeed; release it on either failure.
+    // Unsupported steering also requests the cancel-and-merge path.
+    let (release_withheld, accepted_native_steer, signal_fallback) = match &ack {
+        Ok(pool::SteerAck::Success { .. }) => (false, true, false),
+        // -32601 = method_not_found: agent does not implement the
+        // steer extension. Fire cancel+merge so the message still
+        // reaches the agent.
+        Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code, .. })) if *code == -32601 => {
+            (true, false, true)
+        }
+        // AgentError: write landed, agent rejected it at the
+        // application level (e.g. wrong run id). Release for
+        // normal dispatch; no fallback signal (the turn is still
+        // running or just ended — either way there is nothing to
+        // cancel).
+        Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => (true, false, false),
+        // Transport / ExpectedRunIdMissing / OutcomeRejected: the
+        // steer did not land. Release and fire the cancel+merge
+        // fallback so the message still reaches the agent.
+        Ok(pool::SteerAck::Err(_)) => (true, false, true),
+        Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
+        Err(_recv_err) => (true, false, false),
+    };
+    tracing::info!(
+        channel = %channel_id,
+        event_id = %event_id,
+        ?ack,
+        release_withheld,
+        accepted_native_steer,
+        signal_fallback,
+        "non-cancelling steer ack received"
+    );
+    if let Ok(pool::SteerAck::Success { session_id }) = &ack {
+        if pool.is_current_scope_turn(&scope, &turn_id) {
+            queue.extend_in_flight_deadline(&scope, max_turn_duration_secs);
+        }
+        if queue.acknowledge_native_steer(&scope, &event_id)
+            && !pool.record_successful_steer(&scope, &turn_id, event_id.clone(), session_id.clone())
+        {
+            tracing::warn!(
+                channel = %channel_id,
+                event_id = %event_id,
+                "successful steer lost its in-flight delivery ledger"
+            );
+        }
+    }
+    if release_withheld {
+        queue.release_native_steer(&scope, &event_id);
+    }
+    if signal_fallback && pool.is_current_scope_turn(&scope, &turn_id) {
+        // Universal cancel+merge fallback. Note: the
+        // queued event has already been released to the
+        // front of `queues[scope]`, so the cancel will pick
+        // it up as part of the merged batch and re-prompt the
+        // agent. Scope-exact so the fallback cancels the
+        // steered event's OWN thread, not a sibling thread
+        // in the same channel.
+        signal_in_flight_task_for_scope(pool, &scope, ControlSignal::Steer);
+    }
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -4540,13 +4552,13 @@ fn try_native_steer(
     };
 
     match pool.send_steer(&scope, request) {
-        Ok(()) => {
+        Ok(turn_id) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
             // re-deliver the event via normal dispatch. See
             // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(&scope, &event_id_hex);
+            let withheld = queue.mark_native_steer_pending(&scope, &event_id_hex, &turn_id);
             if !withheld {
                 // Race: the event was already drained out of the queue
                 // before we got here (e.g. a concurrent flush picked it
@@ -4571,6 +4583,7 @@ fn try_native_steer(
                     channel_id,
                     scope: scope_for_watcher,
                     event_id: event_id_for_watcher,
+                    turn_id,
                     ack,
                 });
             });
@@ -5223,7 +5236,7 @@ fn handle_prompt_result(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) && result.batch.is_none());
-        queue.finish_native_steers(scope, completed);
+        queue.finish_native_steers(scope, &result.turn_id, completed);
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
         // receive fresh standing context and history.
@@ -5383,7 +5396,11 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
+        PromptSource::Channel(scope) => {
+            if !pool.has_newer_scope_owner(scope, agent_index) {
+                queue.mark_complete(scope.clone());
+            }
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -5443,7 +5460,11 @@ fn handle_prompt_result(
         // A late steer may force worker retirement after its original prompt
         // has already completed. Replace the worker without retrying that work
         // or reporting the successful turn as an error.
-        PromptOutcome::Ok(_) if result.agent.acp.is_shutdown() => {
+        PromptOutcome::Ok(_) | PromptOutcome::AgentExited
+            if result.agent.acp.retired_for_untracked_steer()
+                || (matches!(result.outcome, PromptOutcome::Ok(_))
+                    && result.agent.acp.is_shutdown()) =>
+        {
             let slot_history = &mut crash_history[agent_index];
             if !spawn_respawn_task(
                 result.agent,
@@ -5661,7 +5682,7 @@ fn recover_panicked_agent(
     };
     let i = meta.agent_index;
     if let Some(scope) = &meta.scope {
-        queue.finish_native_steers(scope, false);
+        queue.finish_native_steers(scope, &meta.turn_id, false);
     }
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
@@ -5691,8 +5712,10 @@ fn recover_panicked_agent(
             Some(scope) => {
                 // Clear the panicked turn's exact scope so a sibling thread in
                 // the same channel keeps its typing indicator.
-                typing_channels.remove(scope);
-                queue.mark_complete(scope.clone());
+                if !pool.has_newer_scope_owner(scope, i) {
+                    typing_channels.remove(scope);
+                    queue.mark_complete(scope.clone());
+                }
             }
             None => {
                 typing_channels.retain(|scope, _| scope.channel_id() != ch);
@@ -5975,19 +5998,24 @@ fn spawn_respawn_task(
 ) -> bool {
     let index = old_agent.index;
 
-    // Circuit breaker: record crash, decide whether to respawn.
-    let delay = match slot.record_crash() {
-        CrashVerdict::CircuitOpen => {
-            tracing::error!(agent = index, "circuit open — not respawning");
-            return false;
-        }
-        CrashVerdict::HalfOpenProbe => {
-            tracing::info!(agent = index, "circuit half-open — probe respawn");
-            Duration::ZERO
-        }
-        CrashVerdict::Respawn(d) => {
-            tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
-            d
+    // Planned steering retirement replaces a healthy worker without charging
+    // its crash budget. Generic shutdown after failure still counts as a crash.
+    let delay = if old_agent.acp.retired_for_untracked_steer() {
+        Duration::ZERO
+    } else {
+        match slot.record_crash() {
+            CrashVerdict::CircuitOpen => {
+                tracing::error!(agent = index, "circuit open — not respawning");
+                return false;
+            }
+            CrashVerdict::HalfOpenProbe => {
+                tracing::info!(agent = index, "circuit half-open — probe respawn");
+                Duration::ZERO
+            }
+            CrashVerdict::Respawn(d) => {
+                tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
+                d
+            }
         }
     };
 
@@ -11593,6 +11621,7 @@ mod error_outcome_emission_tests {
 
         assert!(pool.record_successful_steer(
             &scope::SessionScope::Conversation { channel_id },
+            "t",
             steer_event_id.into(),
             "live-session".into(),
         ));
@@ -11620,6 +11649,7 @@ mod error_outcome_emission_tests {
 
         assert!(!pool.record_successful_steer(
             &scope::SessionScope::Conversation { channel_id },
+            "t",
             "stale-event".into(),
             "old-session".into(),
         ));
