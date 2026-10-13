@@ -199,7 +199,7 @@ fn journal_crash_child() {
     let steer = event(channel, "follow-up");
     let id = steer.event.id.to_hex();
     queue.push(steer);
-    queue.mark_native_steer_pending(channel.into_scope(), &id);
+    queue.mark_native_steer_pending(channel.into_scope(), &id, "journal-child");
     queue.acknowledge_native_steer(&channel.into_scope(), &id);
     std::fs::write(path.with_extension("ready"), b"ready").unwrap();
     loop {
@@ -348,9 +348,17 @@ async fn graceful_shutdown_settles_original_and_follow_up_in_either_ack_order() 
         let follow_up = event(channel, "follow-up");
         let id = follow_up.event.id.to_hex();
         queue.push(follow_up);
-        queue.mark_native_steer_pending(channel.into_scope(), &id);
+        queue.mark_native_steer_pending(channel.into_scope(), &id, "shutdown-test");
         if ack_first {
-            queue.acknowledge_native_steer(&channel.into_scope(), &id);
+            drain_shutdown_ack(
+                &mut queue,
+                &channel.into_scope(),
+                &id,
+                "shutdown-test",
+                crate::pool::SteerAck::Success {
+                    session_id: "session".into(),
+                },
+            );
         }
         let mut result = PromptResult {
             agent: crate::error_outcome_emission_tests::dummy_agent(0).await,
@@ -361,7 +369,15 @@ async fn graceful_shutdown_settles_original_and_follow_up_in_either_ack_order() 
         };
         queue.settle_shutdown_result(&result);
         if !ack_first {
-            queue.acknowledge_native_steer(&channel.into_scope(), &id);
+            drain_shutdown_ack(
+                &mut queue,
+                &channel.into_scope(),
+                &id,
+                "shutdown-test",
+                crate::pool::SteerAck::Success {
+                    session_id: "session".into(),
+                },
+            );
         }
         result.agent.acp.shutdown().await;
         drop(queue);
@@ -465,4 +481,96 @@ async fn old_restored_request_requires_current_author_and_subscription_admission
         replacement.flush_next().unwrap().events[0].event.content,
         "old accepted"
     );
+}
+
+fn drain_shutdown_ack(
+    queue: &mut EventQueue,
+    scope: &SessionScope,
+    event_id: &str,
+    turn_id: &str,
+    ack: crate::pool::SteerAck,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    sender
+        .send(crate::SteerAckEvent {
+            channel_id: scope.channel_id(),
+            scope: scope.clone(),
+            event_id: event_id.into(),
+            turn_id: turn_id.into(),
+            ack: Ok(ack),
+        })
+        .unwrap();
+    crate::settle_shutdown_steer_acks(queue, &mut receiver);
+}
+
+#[tokio::test]
+async fn stale_shutdown_ack_cannot_commit_or_release_a_replacement_follow_up() {
+    use crate::pool::{PromptOutcome, PromptResult, PromptSource, SteerAck, SteerError};
+    for ack in [
+        SteerAck::Success {
+            session_id: "old-session".into(),
+        },
+        SteerAck::Err(SteerError::Transport("old transport failed".into())),
+        SteerAck::PromptCompletedNeutral,
+    ] {
+        let dir = private_directory();
+        let path = dir.path().join("journal.json");
+        let channel = Uuid::new_v4();
+        let scope = channel.into_scope();
+        let mut queue = open(&path);
+        queue.push(event(channel, "original"));
+        queue.flush_next().unwrap();
+        let follow_up = event(channel, "replacement follow-up");
+        let id = follow_up.event.id.to_hex();
+        queue.push(follow_up);
+        assert!(queue.mark_native_steer_pending(&scope, &id, "replacement"));
+        drain_shutdown_ack(&mut queue, &scope, &id, "old", ack);
+        assert!(queue.owns_native_steer(&scope, &id, "replacement"));
+        let mut result = PromptResult {
+            agent: crate::error_outcome_emission_tests::dummy_agent(0).await,
+            source: PromptSource::Channel(scope),
+            turn_id: "replacement".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+        queue.settle_shutdown_result(&result);
+        result.agent.acp.shutdown().await;
+        drop(queue);
+        let mut recovered = open(&path);
+        restore(&mut recovered, &HashSet::from([channel]));
+        let batch = recovered
+            .flush_next()
+            .expect("old ACK cannot settle a new delivery");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id.to_hex(), id);
+    }
+}
+
+#[test]
+fn journal_pressure_preserves_retained_and_queued_accepted_work() {
+    let dir = private_directory();
+    let path = dir.path().join("journal.json");
+    let channel = Uuid::new_v4();
+    let scope = channel.into_scope();
+    let mut queue = open(&path);
+    for index in 0..MAX_PENDING_PER_CHANNEL {
+        let accepted = event(channel, &format!("accepted-{index}"));
+        let id = accepted.event.id.to_hex();
+        assert!(queue.push(accepted));
+        if index % 2 == 0 {
+            assert!(queue.mark_native_steer_pending(&scope, &id, "active"));
+            assert!(queue.acknowledge_native_steer(&scope, &id));
+        }
+    }
+    assert_eq!(queue.channel_event_total(channel), MAX_PENDING_PER_CHANNEL);
+    assert!(!queue.push(event(channel, "over capacity")));
+    assert!(queue.check_persistence().is_err());
+    assert_eq!(queue.channel_event_total(channel), MAX_PENDING_PER_CHANNEL);
+    drop(queue);
+    let recovered = open(&path);
+    let restored = recovered.restore_events(&HashSet::from([channel]));
+    assert_eq!(restored.len(), MAX_PENDING_PER_CHANNEL);
+    assert!(restored
+        .iter()
+        .all(|item| item.event.content.starts_with("accepted-")));
 }

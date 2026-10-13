@@ -4325,6 +4325,9 @@ fn settle_shutdown_steer_acks(
     receiver: &mut mpsc::UnboundedReceiver<SteerAckEvent>,
 ) {
     while let Ok(event) = receiver.try_recv() {
+        if !queue.owns_native_steer(&event.scope, &event.event_id, &event.turn_id) {
+            continue;
+        }
         match event.ack {
             Ok(pool::SteerAck::Success { .. }) => {
                 queue.acknowledge_native_steer(&event.scope, &event.event_id);

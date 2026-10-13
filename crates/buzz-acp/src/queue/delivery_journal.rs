@@ -361,7 +361,7 @@ impl EventQueue {
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) && result.batch.is_none());
         if completed {
-            self.finish_native_steers(scope, true);
+            self.finish_native_steers(scope, &result.turn_id, true);
             self.mark_complete(scope);
         }
         tracing::info!(turn_id = %result.turn_id, completed, "delivery journal shutdown settlement");
