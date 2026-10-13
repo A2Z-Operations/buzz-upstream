@@ -895,13 +895,22 @@ impl NormalListenerIngress {
     /// failure notices all share one routing authority. The lookup is bounded
     /// and only runs for kind:40003 events that already matched a rule (by
     /// default: edits that newly mention this agent).
-    async fn resolve_edit_routing(mut self, rest_client: &relay::RestClient) -> Self {
-        self.edit = edit_routing::resolve_edit(
-            &self.buzz_event.event,
-            self.buzz_event.channel_id,
-            rest_client,
-        )
-        .await;
+    async fn resolve_edit_routing(
+        mut self,
+        rest_client: &relay::RestClient,
+        queue: &EventQueue,
+    ) -> Self {
+        self.edit = match queue.restored_edit(&self.buzz_event.event) {
+            Some(edit) => Some(edit),
+            None => {
+                edit_routing::resolve_edit(
+                    &self.buzz_event.event,
+                    self.buzz_event.channel_id,
+                    rest_client,
+                )
+                .await
+            }
+        };
         self
     }
 
@@ -3806,7 +3815,7 @@ async fn run_harness(
                                 tracing::debug!("authorized event matched no rule — dropping");
                                 continue;
                             };
-                            let ingress = ingress.resolve_edit_routing(&ctx.rest_client).await;
+                            let ingress = ingress.resolve_edit_routing(&ctx.rest_client, &queue).await;
                             // Derive the session scope once, at admission, from
                             // the operator policy, DM status, and NIP-10 thread
                             // tags. Under the default `channel` policy this is

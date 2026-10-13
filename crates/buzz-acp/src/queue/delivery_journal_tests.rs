@@ -389,7 +389,7 @@ async fn graceful_shutdown_settles_original_and_follow_up_in_either_ack_order() 
 }
 
 #[tokio::test]
-async fn old_restored_request_requires_current_author_and_subscription_admission() {
+async fn old_restored_edit_keeps_its_route_and_requires_current_admission() {
     use crate::{
         authorize_normal_listener_event, AuthorizedNormalListenerEvent, InboundAuthorGate,
         OwnerCache,
@@ -397,17 +397,41 @@ async fn old_restored_request_requires_current_author_and_subscription_admission
     let dir = private_directory();
     let path = dir.path().join("journal.json");
     let channel = Uuid::new_v4();
+    let root = "11".repeat(32);
+    let parent = "22".repeat(32);
+    let original = EventBuilder::new(Kind::Custom(9), "original threaded reply")
+        .tags([
+            Tag::parse(["h", &channel.to_string()]).unwrap(),
+            Tag::parse(["e", &root, "", "root"]).unwrap(),
+            Tag::parse(["e", &parent, "", "reply"]).unwrap(),
+        ])
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
     let mut queued = event(channel, "old accepted");
-    queued.event = EventBuilder::new(Kind::Custom(9), "old accepted")
-        .tags([Tag::parse(["h", &channel.to_string()]).unwrap()])
+    queued.event = EventBuilder::new(Kind::Custom(40003), "old accepted")
+        .tags([
+            Tag::parse(["h", &channel.to_string()]).unwrap(),
+            Tag::parse(["e", &original.id.to_hex()]).unwrap(),
+        ])
         .custom_created_at(nostr::Timestamp::from(
             nostr::Timestamp::now().as_secs() - 3600,
         ))
         .sign_with_keys(&Keys::generate())
         .unwrap();
+    queued.edit = crate::edit_routing::resolve_edit_with(&queued.event, channel, |_| async {
+        Ok(serde_json::json!([original]))
+    })
+    .await;
+    let resolved = queued.edit.clone().expect("original verified at admission");
+    let policy = crate::scope::SessionPolicy::Thread;
+    queued.scope =
+        SessionScope::derive_routed(policy, channel, false, &queued.event, queued.edit.as_ref());
+    let expected_scope = queued.scope.clone();
     let author = queued.event.pubkey.to_hex();
     let mut queue = open(&path);
     queue.push(queued);
+    let accepted = queue.flush_next().unwrap();
+    let expected_route = accepted.events[0].reply_route();
     drop(queue);
     let mut replacement = open(&path);
     let restored = replacement
@@ -423,6 +447,12 @@ async fn old_restored_request_requires_current_author_and_subscription_admission
         keys: Keys::generate(),
         auth_tag_json: None,
     };
+    assert!(
+        crate::edit_routing::resolve_edit(&restored.event, channel, &rest)
+            .await
+            .is_none(),
+        "original is unavailable after restart"
+    );
     let channel_info = crate::pool::ChannelInfoResolver::new(
         HashMap::from([(
             channel,
@@ -465,21 +495,35 @@ async fn old_restored_request_requires_current_author_and_subscription_admission
     )
     .await
     .unwrap();
-    let rule =
-        serde_json::from_value(serde_json::json!({"name":"fixture","channels":"all","kinds":[9]}))
-            .unwrap();
+    let rule = serde_json::from_value(
+        serde_json::json!({"name":"fixture","channels":"all","kinds":[40003]}),
+    )
+    .unwrap();
     let ingress = AuthorizedNormalListenerEvent(authorized)
         .match_subscription(&[rule], &agent)
         .await
         .unwrap();
+    let ingress = ingress.resolve_edit_routing(&rest, &replacement).await;
+    assert_eq!(
+        ingress.session_scope(crate::scope::SessionPolicy::Channel, false),
+        channel.into_scope(),
+        "recovery still derives scope from the current operator policy"
+    );
+    let restored_scope = ingress.session_scope(policy, false);
+    assert_eq!(restored_scope, expected_scope);
+    assert_eq!(restored_scope.root_event_id(), Some(root.as_str()));
     assert!(
         ingress
-            .push(&mut replacement, channel.into_scope(), false)
+            .push(&mut replacement, restored_scope, false)
             .accepted
     );
+    let recovered = replacement.flush_next().unwrap();
+    assert_eq!(recovered.events[0].event.content, "old accepted");
+    assert_eq!(recovered.events[0].edit, Some(resolved));
+    assert_eq!(recovered.events[0].reply_route(), expected_route);
     assert_eq!(
-        replacement.flush_next().unwrap().events[0].event.content,
-        "old accepted"
+        recovered.events[0].routing_thread_tags().parent_event_id,
+        Some(parent)
     );
 }
 
@@ -573,4 +617,58 @@ fn journal_pressure_preserves_retained_and_queued_accepted_work() {
     assert!(restored
         .iter()
         .all(|item| item.event.content.starts_with("accepted-")));
+}
+
+#[test]
+fn journal_validates_edit_routing_and_accepts_older_records() {
+    let dir = private_directory();
+    let path = dir.path().join("journal.json");
+    let channel = Uuid::new_v4();
+    let target = "11".repeat(32);
+    let root = "22".repeat(32);
+    let mut queued = event(channel, "edit");
+    queued.event =
+        crate::edit_routing::test_support::edit_event(&target, &[["h", &channel.to_string()]]);
+    queued.edit = Some(ResolvedEdit {
+        target_event_id: target.clone(),
+        target_thread_tags: ThreadTags {
+            root_event_id: Some(root.clone()),
+            parent_event_id: Some(root),
+            mentioned_pubkeys: vec![],
+        },
+    });
+    let id = queued.event.id.to_hex();
+    let mut queue = open(&path);
+    queue.push(queued);
+    drop(queue);
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (pointer, value) in [
+        ("/target_event_id", serde_json::json!("33".repeat(32))),
+        (
+            "/target_thread_tags/root_event_id",
+            serde_json::json!("not-an-event-id"),
+        ),
+        (
+            "/target_thread_tags/parent_event_id",
+            serde_json::Value::Null,
+        ),
+    ] {
+        let mut invalid = snapshot.clone();
+        *invalid["pending"][&id]["edit"]
+            .pointer_mut(pointer)
+            .unwrap() = value;
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            DeliveryJournal::open(&path, AGENT, RELAY).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut legacy = snapshot;
+    legacy["pending"][&id]
+        .as_object_mut()
+        .unwrap()
+        .remove("edit");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(DeliveryJournal::open(&path, AGENT, RELAY).is_ok());
 }

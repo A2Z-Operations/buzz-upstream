@@ -1224,7 +1224,7 @@ impl Default for EventQueue {
 }
 
 /// Parsed thread relationship from NIP-10 `e` tags.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadTags {
     /// Root event ID (hex). Present for all thread replies.
     pub root_event_id: Option<String>,
@@ -1235,7 +1235,7 @@ pub struct ThreadTags {
 }
 
 /// Original-message routing recovered for a kind:40003 edit event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedEdit {
     /// Id of the edited original message, taken from the edit's `e` tag and
     /// verified against the fetched original's id and signature.

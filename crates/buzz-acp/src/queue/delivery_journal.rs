@@ -19,6 +19,10 @@ pub(super) struct StoredEvent {
     pub(super) channel_id: Uuid,
     admission_order: u64,
     event: Event,
+    // Cache only original-message routing, never admission authority or scope.
+    // Absent in older v1 snapshots; those retain the bounded lookup fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edit: Option<ResolvedEdit>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -128,6 +132,23 @@ impl DeliveryJournal {
                     }),
                     "delivery journal channel does not match signed event"
                 );
+                if let Some(edit) = &stored.edit {
+                    ensure!(
+                        edit_target_id(&stored.event).as_deref()
+                            == Some(edit.target_event_id.as_str()),
+                        "delivery journal edit target does not match signed event"
+                    );
+                    let tags = &edit.target_thread_tags;
+                    ensure!(
+                        tags.root_event_id.is_some() == tags.parent_event_id.is_some()
+                            && tags
+                                .root_event_id
+                                .iter()
+                                .chain(&tags.parent_event_id)
+                                .all(|id| nostr::EventId::from_hex(id).is_ok()),
+                        "delivery journal edit has invalid thread routing"
+                    );
+                }
             }
             snapshot
         };
@@ -241,6 +262,17 @@ impl EventQueue {
         })
     }
 
+    /// Preserve admission-time edit routing after current authorization and
+    /// subscription checks. Older records without routing still use lookup.
+    pub(crate) fn restored_edit(&self, event: &Event) -> Option<ResolvedEdit> {
+        self.journal
+            .as_ref()?
+            .restoring
+            .get(&event.id.to_hex())?
+            .edit
+            .clone()
+    }
+
     pub(super) fn journal_at_capacity(&self, event: &QueuedEvent) -> bool {
         self.journal.as_ref().is_some_and(|journal| {
             !journal.restoring.contains_key(&event.event.id.to_hex())
@@ -303,9 +335,9 @@ impl EventQueue {
             .map(|event| event.admission_order)
             .max()
             .unwrap_or(0);
-        let mut insert = |channel_id, event: &Event| {
+        let mut insert = |channel_id, event: &Event, edit: Option<&ResolvedEdit>| {
             let id = event.id.to_hex();
-            let stored = journal
+            let mut stored = journal
                 .snapshot
                 .pending
                 .get(&id)
@@ -316,28 +348,36 @@ impl EventQueue {
                         channel_id,
                         admission_order: next_order,
                         event: event.clone(),
+                        edit: None,
                     }
                 });
+            if stored.edit.is_none() {
+                stored.edit = edit.cloned();
+            }
             pending.insert(id, stored);
         };
         for (scope, events) in &self.queues {
             for event in events {
-                insert(scope.channel_id(), &event.event);
+                insert(scope.channel_id(), &event.event, event.edit.as_ref());
             }
         }
         for (scope, events) in &self.cancelled_batches {
             for event in events {
-                insert(scope.channel_id(), &event.event);
+                insert(scope.channel_id(), &event.event, event.edit.as_ref());
             }
         }
         for (scope, events) in &self.withheld_native_steer {
             for event in events {
-                insert(scope.channel_id(), &event.queued.event);
+                insert(
+                    scope.channel_id(),
+                    &event.queued.event,
+                    event.queued.edit.as_ref(),
+                );
             }
         }
         for events in journal.in_flight.values() {
             for event in events {
-                insert(event.channel_id, &event.event);
+                insert(event.channel_id, &event.event, event.edit.as_ref());
             }
         }
         if let Some(journal) = &mut self.journal {
