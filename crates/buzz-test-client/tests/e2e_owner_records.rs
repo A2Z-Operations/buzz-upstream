@@ -511,6 +511,34 @@ async fn test_owner_record_deletion_requires_k_tag() {
     }
 }
 
+/// A deletion naming a private address as its second `a` tag is refused by
+/// the one-target rule before any privacy check runs, for `30180` and for an
+/// existing private kind (`30300`).
+#[tokio::test]
+#[ignore]
+async fn test_deletion_with_private_second_coordinate_is_refused() {
+    let client = aod::http_client();
+    let owner = Keys::generate();
+    let pubkey = owner.public_key().to_hex();
+    let public = aod::tag(&["a", &format!("30023:{pubkey}:public")]);
+    for private in [
+        coordinate(&owner, &agent_d()),
+        format!("30300:{pubkey}:reminder"),
+    ] {
+        let tags = vec![public.clone(), aod::tag(&["a", &private])];
+        let (accepted, msg) =
+            aod::submit(&client, &owner, &aod::build_deletion(&owner, tags)).await;
+        assert!(
+            !accepted,
+            "two-coordinate deletion naming {private} must be refused"
+        );
+        assert!(
+            msg.starts_with("invalid: deletion events must reference exactly one target"),
+            "unexpected refusal for {private}: {msg}"
+        );
+    }
+}
+
 /// A coordinate deletion removes the record for its owner and is visible to
 /// the owner and nobody else on WS REQ, `ids`, WS COUNT, HTTP `/query` and
 /// HTTP `/count`. A `k`-tagged deletion of a coordinate that never held a

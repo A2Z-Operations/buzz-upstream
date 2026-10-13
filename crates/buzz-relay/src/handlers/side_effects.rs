@@ -435,13 +435,7 @@ pub async fn validate_standard_deletion_event(
     let actor_bytes = effective_message_author(event, &state.relay_keypair.public_key());
     let target_ids = extract_target_event_ids(event);
 
-    // Every coordinate names its target's kind, so the `k` rule applies to
-    // each `a` tag, including ones the handler below does not act on: an
-    // untagged deletion naming an author-only coordinate would be stored
-    // publicly and reveal that address.
-    for target_kind in a_tag_target_kinds(event) {
-        check_deletion_privacy_k_tag(event, target_kind)?;
-    }
+    check_coordinate_privacy_k_tags(event)?;
 
     if !has_e_tag(event) {
         // a-tag deletion: verify author owns the addressable event
@@ -490,6 +484,19 @@ pub async fn validate_standard_deletion_event(
         check_deletion_privacy_k_tag(event, event_kind_u32(&target_event.event))?;
     }
 
+    Ok(())
+}
+
+/// Every coordinate names its target's kind, so the `k` rule applies to each
+/// `a` tag, including ones the deletion handler does not act on: an untagged
+/// deletion naming an author-only coordinate would be stored publicly and
+/// reveal that address. Ingest's one-target rule makes a second coordinate
+/// unreachable today; checking all of them is defense in depth should
+/// multi-target deletion ever be allowed.
+fn check_coordinate_privacy_k_tags(event: &Event) -> anyhow::Result<()> {
+    for target_kind in a_tag_target_kinds(event) {
+        check_deletion_privacy_k_tag(event, target_kind)?;
+    }
     Ok(())
 }
 
@@ -3901,6 +3908,25 @@ pub async fn publish_nipia_unarchived(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinate_privacy_check_covers_a_private_second_coordinate() {
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let event = EventBuilder::new(Kind::from(5u16), "")
+            .tags([
+                Tag::parse(["a", &format!("30023:{owner}:public")]).expect("tag"),
+                Tag::parse(["a", &format!("30180:{owner}:agent:{owner}")]).expect("tag"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let err = check_coordinate_privacy_k_tags(&event).expect_err("private second coordinate");
+        assert!(
+            err.to_string()
+                .contains("deletion of an author-only kind 30180 event requires"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn nip43_progress_logs_every_interval_inside_the_startup_sweep_only() {
