@@ -6,57 +6,11 @@ LANGUAGE sql AS $$
     SELECT pg_advisory_xact_lock(hashtextextended('invite-admission:' || community::text, 0));
 $$;
 
-CREATE FUNCTION lock_invite_restrictions() RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM invite_admission_lock(NEW.community_id);
-    RETURN NEW;
-END
-$$;
-
--- Revocation is durable: neither unban nor expiry restores an issued bearer.
-CREATE FUNCTION revoke_banned_issuer_invites() RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF NEW.banned AND (NEW.ban_expires_at IS NULL OR NEW.ban_expires_at > clock_timestamp()) THEN
-        UPDATE relay_invites SET revoked_at = clock_timestamp()
-        WHERE community_id = NEW.community_id AND revoked_at IS NULL
-          AND (created_by = encode(NEW.pubkey, 'hex') OR created_by IN (
-              SELECT encode(pubkey, 'hex') FROM users
-              WHERE community_id = NEW.community_id AND agent_owner_pubkey = NEW.pubkey
-          ));
-    END IF;
-    RETURN NEW;
-END
-$$;
-
--- Learning a verified owner must not revive invites issued by its restricted agent.
-CREATE FUNCTION revoke_restricted_agent_invites() RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF NEW.agent_owner_pubkey IS NOT NULL AND EXISTS (
-        SELECT 1 FROM community_bans WHERE community_id = NEW.community_id
-          AND pubkey = NEW.agent_owner_pubkey AND banned
-          AND (ban_expires_at IS NULL OR ban_expires_at > clock_timestamp())
-    ) THEN
-        UPDATE relay_invites SET revoked_at = clock_timestamp()
-        WHERE community_id = NEW.community_id AND created_by = encode(NEW.pubkey, 'hex')
-          AND revoked_at IS NULL;
-    END IF;
-    RETURN NEW;
-END
-$$;
-
-CREATE TRIGGER invite_restriction_lock BEFORE INSERT OR UPDATE ON community_bans
-FOR EACH ROW EXECUTE FUNCTION lock_invite_restrictions();
-CREATE TRIGGER invite_issuer_revocation AFTER INSERT OR UPDATE ON community_bans
-FOR EACH ROW EXECUTE FUNCTION revoke_banned_issuer_invites();
-
-CREATE TRIGGER invite_owner_lock BEFORE INSERT OR UPDATE OF agent_owner_pubkey ON users
-FOR EACH ROW EXECUTE FUNCTION lock_invite_restrictions();
-CREATE TRIGGER invite_owner_revocation AFTER INSERT OR UPDATE OF agent_owner_pubkey ON users
-FOR EACH ROW EXECUTE FUNCTION revoke_restricted_agent_invites();
-
+-- Live revocation is application-owned: supported restriction and owner writers
+-- take invite_admission_lock before row locks and revoke in the same commit.
+-- Rollout gate: drain all old writer pods before lifting bans or reopening
+-- invitation admission, then rerun backfill_invite_revocations() under the
+-- schema-destruction maintenance lock to repair bans committed during rollout.
 -- Include active bans and recorded prior bans, so lifting a ban before this
 -- migration cannot restore an invite issued before that ban. Scope every owner
 -- and audit lookup to the invitation's community.

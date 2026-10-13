@@ -81,7 +81,12 @@ pub(super) async fn persist_claim_owner(
         .rows_affected();
     }
     let link_created = sqlx::query("UPDATE users SET agent_owner_pubkey=$3 WHERE community_id=$1 AND pubkey=$2 AND agent_owner_pubkey IS NULL")
-        .bind(community.as_uuid()).bind(claimant_bytes).bind(owner_bytes).execute(&mut **tx).await?.rows_affected() > 0;
+        .bind(community.as_uuid()).bind(&claimant_bytes).bind(&owner_bytes).execute(&mut **tx).await?.rows_affected() > 0;
+    // Defensive parity with other owner writers; admission already rejects banned owners.
+    if link_created {
+        super::revoke_restricted_agent_invites(tx, community, &claimant_bytes, &owner_bytes)
+            .await?;
+    }
     Ok(OwnerPersistence {
         link_created,
         users_created,

@@ -76,7 +76,7 @@ async fn assert_repaired_and_fenced(pool: &PgPool, communities: &[Uuid]) {
     );
     let triggers: i64=sqlx::query_scalar("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('invite_restriction_lock','invite_issuer_revocation','invite_owner_lock','invite_owner_revocation','community_write_fence_relay_invites')")
         .fetch_one(pool).await.unwrap();
-    assert_eq!(triggers, 5);
+    assert_eq!(triggers, 1, "only the community deletion fence remains");
 }
 
 #[tokio::test]
@@ -99,15 +99,10 @@ async fn migration_schema_desired_upgrade_reconciles_the_same_populated_history(
         .unwrap();
     for sql in [
         include_str!("../../../../../schema/functions/invite_admission_lock.sql"),
-        include_str!("../../../../../schema/functions/lock_invite_restrictions.sql"),
-        include_str!("../../../../../schema/functions/revoke_banned_issuer_invites.sql"),
-        include_str!("../../../../../schema/functions/revoke_restricted_agent_invites.sql"),
         include_str!("../../../../../schema/functions/backfill_invite_revocations.sql"),
     ] {
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
     }
-    sqlx::raw_sql("CREATE TRIGGER invite_restriction_lock BEFORE INSERT OR UPDATE ON community_bans FOR EACH ROW EXECUTE FUNCTION lock_invite_restrictions(); CREATE TRIGGER invite_issuer_revocation AFTER INSERT OR UPDATE ON community_bans FOR EACH ROW EXECUTE FUNCTION revoke_banned_issuer_invites(); CREATE TRIGGER invite_owner_lock BEFORE INSERT OR UPDATE OF agent_owner_pubkey ON users FOR EACH ROW EXECUTE FUNCTION lock_invite_restrictions(); CREATE TRIGGER invite_owner_revocation AFTER INSERT OR UPDATE OF agent_owner_pubkey ON users FOR EACH ROW EXECUTE FUNCTION revoke_restricted_agent_invites();")
-        .execute(&pool).await.unwrap();
     let still_unrepaired: i64 =
         sqlx::query_scalar("SELECT count(*) FROM relay_invites WHERE revoked_at IS NULL")
             .fetch_one(&pool)

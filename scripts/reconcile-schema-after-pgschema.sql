@@ -251,8 +251,8 @@ BEGIN
     END IF;
     IF (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal
         AND tgname IN ('invite_restriction_lock', 'invite_issuer_revocation',
-                       'invite_owner_lock', 'invite_owner_revocation')) <> 4 THEN
-        RAISE EXCEPTION 'invitation revocation triggers missing from live catalog';
+                       'invite_owner_lock', 'invite_owner_revocation')) <> 0 THEN
+        RAISE EXCEPTION 'invitation revocation must use supported application writers, not triggers';
     END IF;
 END
 $$;

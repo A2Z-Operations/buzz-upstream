@@ -29,7 +29,9 @@ use crate::error::Result;
 use crate::{CommunityId, Db};
 
 mod claim_owner;
+mod revocation;
 pub use claim_owner::{claim_relay_membership_with_owner, MembershipClaimResult};
+pub(crate) use revocation::{revoke_banned_issuer_invites, revoke_restricted_agent_invites};
 
 /// Outcome of a v2 invite claim. Expected invalid/expired/exhausted states are
 /// typed variants so the relay layer can map them to distinct HTTP responses
@@ -1090,3 +1092,6 @@ mod upgrade_postgres_tests;
 
 #[cfg(test)]
 mod owner_admission_postgres_tests;
+
+#[cfg(test)]
+mod writer_protocol_postgres_tests;

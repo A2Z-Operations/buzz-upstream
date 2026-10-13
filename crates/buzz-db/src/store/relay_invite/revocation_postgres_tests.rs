@@ -2,7 +2,7 @@ use super::*;
 use crate::moderation::{ban_member, unban_member};
 use uuid::Uuid;
 
-async fn fixture() -> (PgPool, CommunityId, String, String) {
+pub(super) async fn fixture() -> (PgPool, CommunityId, String, String) {
     let pool = PgPool::connect(&crate::test_support::database_url())
         .await
         .unwrap();
@@ -186,15 +186,10 @@ async fn issuer_agent_revocation_survives_owner_unban() {
     );
 }
 
-async fn queued_claim(
-    pool: &PgPool,
-    community: CommunityId,
-    code: &str,
-    claimant: String,
-) -> tokio::task::JoinHandle<Result<ClaimOutcome>> {
+pub(super) async fn named_pool() -> (PgPool, String) {
     let name = format!("invite-race-{}", Uuid::new_v4());
     let connection_name = name.clone();
-    let claim_pool = sqlx::postgres::PgPoolOptions::new()
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .after_connect(move |conn, _| {
             let name = connection_name.clone();
@@ -209,19 +204,49 @@ async fn queued_claim(
         .connect(&crate::test_support::database_url())
         .await
         .unwrap();
+    (pool, name)
+}
+
+pub(super) async fn wait_for_lock<T>(
+    pool: &PgPool,
+    name: &str,
+    kind: &str,
+    task: &tokio::task::JoinHandle<T>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+                 WHERE a.application_name=$1 AND l.locktype=$2 AND NOT l.granted)",
+            )
+            .bind(name)
+            .bind(kind)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            assert!(!task.is_finished(), "writer bypassed expected {kind} lock");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer must observably wait on the expected lock");
+}
+
+async fn queued_claim(
+    pool: &PgPool,
+    community: CommunityId,
+    code: &str,
+    claimant: String,
+) -> tokio::task::JoinHandle<Result<ClaimOutcome>> {
+    let (claim_pool, name) = named_pool().await;
     let hash = hash_v2_code(code);
     let claim = tokio::spawn(async move {
         claim_relay_invite(&claim_pool, community, &hash, &claimant, None).await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5),async {
-        loop {
-            let waiting: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name=$1 AND l.locktype='advisory' AND NOT l.granted)")
-                .bind(&name).fetch_one(pool).await.unwrap();
-            if waiting {break;}
-            assert!(!claim.is_finished(),"claim bypassed the production admission lock");
-            tokio::task::yield_now().await;
-        }
-    }).await.expect("claim must observably wait on the admission lock");
+    wait_for_lock(pool, &name, "advisory", &claim).await;
     claim
 }
 
@@ -233,12 +258,40 @@ async fn claimant_ban_and_timeout_commit_before_queued_claim_without_consuming_a
         let invite = mint_relay_invite(&pool, community, &issuer, 3600, Some(1))
             .await
             .unwrap();
-        let mut restriction = pool.begin().await.unwrap();
-        sqlx::query("INSERT INTO community_bans(community_id,pubkey,banned,muted_until,actor_pubkey) VALUES($1,$2,$3,CASE WHEN $3 THEN NULL ELSE clock_timestamp()+interval '1 hour' END,$4)")
-            .bind(community.as_uuid()).bind(vec![2u8;32]).bind(!timeout).bind(vec![3u8;32])
-            .execute(&mut *restriction).await.unwrap();
+        // Hold the existing restriction row so the production writer stops only
+        // after acquiring admission. The claim must queue behind that writer.
+        ban_member(&pool, community, &[2; 32], &[3; 32], None, None)
+            .await
+            .unwrap();
+        unban_member(&pool, community, &[2; 32], &[3; 32])
+            .await
+            .unwrap();
+        let mut row_lock = pool.begin().await.unwrap();
+        sqlx::query("SELECT pubkey FROM community_bans WHERE community_id=$1 FOR UPDATE")
+            .bind(community.as_uuid())
+            .fetch_one(&mut *row_lock)
+            .await
+            .unwrap();
+        let (writer_pool, name) = named_pool().await;
+        let restriction = tokio::spawn(async move {
+            if timeout {
+                crate::moderation::timeout_member(
+                    &writer_pool,
+                    community,
+                    &[2; 32],
+                    &[3; 32],
+                    Utc::now() + chrono::Duration::hours(1),
+                    None,
+                )
+                .await
+            } else {
+                ban_member(&writer_pool, community, &[2; 32], &[3; 32], None, None).await
+            }
+        });
+        wait_for_lock(&pool, &name, "transactionid", &restriction).await;
         let claim = queued_claim(&pool, community, &invite.code, claimant.clone()).await;
-        restriction.commit().await.unwrap();
+        row_lock.commit().await.unwrap();
+        restriction.await.unwrap().unwrap();
         assert_eq!(claim.await.unwrap().unwrap(), ClaimOutcome::Restricted);
         let uses: i32 = sqlx::query_scalar(
             "SELECT use_count FROM relay_invites WHERE community_id=$1 AND id=$2",
@@ -274,16 +327,21 @@ async fn owner_materialization_commits_before_queued_agent_claim() {
     ban_member(&pool, community, &[4; 32], &[3; 32], None, None)
         .await
         .unwrap();
-    let mut owner = pool.begin().await.unwrap();
-    sqlx::query("UPDATE users SET agent_owner_pubkey=$3 WHERE community_id=$1 AND pubkey=$2")
+    let mut row_lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT pubkey FROM users WHERE community_id=$1 AND pubkey=$2 FOR UPDATE")
         .bind(community.as_uuid())
         .bind(vec![2u8; 32])
-        .bind(vec![4u8; 32])
-        .execute(&mut *owner)
+        .fetch_one(&mut *row_lock)
         .await
         .unwrap();
+    let (writer_pool, name) = named_pool().await;
+    let owner = tokio::spawn(async move {
+        crate::user::set_agent_owner(&writer_pool, community, &[2; 32], &[4; 32]).await
+    });
+    wait_for_lock(&pool, &name, "transactionid", &owner).await;
     let claim = queued_claim(&pool, community, &invite.code, agent).await;
-    owner.commit().await.unwrap();
+    row_lock.commit().await.unwrap();
+    assert!(owner.await.unwrap().unwrap());
     assert_eq!(claim.await.unwrap().unwrap(), ClaimOutcome::Restricted);
 }
 

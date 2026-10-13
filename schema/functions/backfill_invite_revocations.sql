@@ -1,3 +1,8 @@
+-- Live revocation is application-owned: supported restriction and owner writers
+-- take invite_admission_lock before row locks and revoke in the same commit.
+-- Rollout gate: drain all old writer pods before lifting bans or reopening
+-- invitation admission, then rerun backfill_invite_revocations() under the
+-- schema-destruction maintenance lock to repair bans committed during rollout.
 -- Include active bans and recorded prior bans, so lifting a ban before this
 -- migration cannot restore an invite issued before that ban. Scope every owner
 -- and audit lookup to the invitation's community.
