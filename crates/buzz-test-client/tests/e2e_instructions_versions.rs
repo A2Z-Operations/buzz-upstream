@@ -33,21 +33,12 @@ use serde_json::{json, Value};
 #[path = "support/author_only_deletion.rs"]
 mod aod;
 
+const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const INSTRUCTIONS_VERSION_KIND: u16 = 44300;
 const MAX_CONTENT_BYTES: usize = 218_548;
 const CIPHERTEXT: &str = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-fn relay_url() -> String {
-    std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string())
-}
-
-fn relay_http_url() -> String {
-    relay_url()
-        .replace("wss://", "https://")
-        .replace("ws://", "http://")
-        .trim_end_matches('/')
-        .to_string()
-}
+use aod::{relay_http_url, relay_url};
 
 fn sub_id(name: &str) -> String {
     format!("e2e-instr-{name}-{}", uuid::Uuid::new_v4())
@@ -739,7 +730,8 @@ async fn test_instructions_version_deletion_reads_are_author_only() {
 }
 
 /// Subscribed while the version still exists, the owner receives its
-/// deletion live and another reader does not.
+/// deletion live and another reader does not. A public deletion by the same
+/// owner is the positive control: both subscribers must receive it.
 #[tokio::test]
 #[ignore]
 async fn test_instructions_version_deletion_live_fanout_is_author_only() {
@@ -774,23 +766,34 @@ async fn test_instructions_version_deletion_live_fanout_is_author_only() {
         ],
     );
     aod::submit_ok(&client, &owner, &deletion).await;
+    let note = EventBuilder::text_note("public note")
+        .sign_with_keys(&owner)
+        .unwrap();
+    aod::submit_ok(&client, &owner, &note).await;
+    let public = aod::build_deletion(
+        &owner,
+        vec![aod::tag(&["e", &note.id.to_hex()]), aod::tag(&["k", "1"])],
+    );
+    aod::submit_ok(&client, &owner, &public).await;
 
     for (i, (mut ws, sid)) in subscribers.into_iter().enumerate() {
-        let delivered = aod::live_event_ids(&mut ws, &sid)
-            .await
-            .contains(&deletion.id);
+        let delivered = aod::live_event_ids(&mut ws, &sid).await;
+        assert!(
+            delivered.contains(&public.id),
+            "public deletion must reach subscriber {i} (0 = owner)"
+        );
         assert_eq!(
-            delivered,
+            delivered.contains(&deletion.id),
             i == 0,
-            "live delivery to subscriber {i} (0 = owner)"
+            "private deletion delivery to subscriber {i} (0 = owner)"
         );
         ws.disconnect().await.expect("disconnect");
     }
 }
 
-/// A deletion of a version must carry `["k","44300"]`: one without it, or
-/// with another kind, is rejected whether the version is live or already
-/// deleted.
+/// A deletion of a version must carry `["k","44300"]`. While the version is
+/// live, a missing, wrong or noncanonical `k` is rejected; once it is
+/// deleted, a deletion without `k` is still rejected.
 #[tokio::test]
 #[ignore]
 async fn test_instructions_version_deletion_requires_k_tag() {

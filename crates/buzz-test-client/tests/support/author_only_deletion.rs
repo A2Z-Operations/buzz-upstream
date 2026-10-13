@@ -1,5 +1,7 @@
 //! Shared helpers for NIP-09 deletion e2e tests of author-only kinds. Each
-//! test binary covering a kind in `AUTHOR_ONLY_KINDS` includes this module.
+//! test binary covering a kind in `AUTHOR_ONLY_KINDS` includes this module
+//! and defines `DEFAULT_RELAY_URL`, so the helpers and the including suite
+//! always talk to the same relay.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -10,7 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 pub fn relay_url() -> String {
-    std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3001".to_string())
+    std::env::var("RELAY_URL").unwrap_or_else(|_| super::DEFAULT_RELAY_URL.to_string())
 }
 
 pub fn relay_http_url() -> String {

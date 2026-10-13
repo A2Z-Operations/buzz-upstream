@@ -34,7 +34,9 @@ use serde_json::Value;
 mod support;
 use support::*;
 
+const DEFAULT_RELAY_URL: &str = "ws://localhost:3001";
 const KIND_EVENT_REMINDER: u16 = 30300;
+const KIND_INSTRUCTIONS_VERSION: u16 = 44300;
 
 fn build_reminder(keys: &Keys) -> nostr::Event {
     EventBuilder::new(
@@ -66,6 +68,30 @@ async fn store_deleted_reminder(client: &Client, author: &Keys) -> (nostr::Event
     let reminder_reads = http_query_ids(client, author, &Filter::new().id(reminder.id)).await;
     assert!(reminder_reads.is_empty(), "the reminder must be deleted");
     (reminder, deletion)
+}
+
+/// Store and delete an instructions version (kind:44300) with a `k`-tagged
+/// deletion carrying `author`'s search term as its reason.
+async fn store_deleted_instructions_version(client: &Client, author: &Keys) -> nostr::Event {
+    let subject = Keys::generate().public_key().to_hex();
+    let version = EventBuilder::new(
+        Kind::Custom(KIND_INSTRUCTIONS_VERSION),
+        "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    .tags(vec![tag(&["p", &subject])])
+    .sign_with_keys(author)
+    .unwrap();
+    submit_ok(client, author, &version).await;
+    let deletion = build_deletion_with_reason(
+        author,
+        vec![
+            tag(&["e", &version.id.to_hex()]),
+            tag(&["k", &KIND_INSTRUCTIONS_VERSION.to_string()]),
+        ],
+        &search_term(author),
+    );
+    submit_ok(client, author, &deletion).await;
+    deletion
 }
 
 /// A search term unique to `author`'s deletion reason.
@@ -104,6 +130,7 @@ async fn author_only_deletion_search_reaches_only_author() {
     let client = http_client();
     let author = Keys::generate();
     let (_, private) = store_deleted_reminder(&client, &author).await;
+    let instructions = store_deleted_instructions_version(&client, &author).await;
     // Public control: an ordinary deletion carrying the same reason word.
     let note = EventBuilder::text_note("public note")
         .sign_with_keys(&author)
@@ -119,14 +146,18 @@ async fn author_only_deletion_search_reaches_only_author() {
     let search = Filter::new()
         .kind(Kind::EventDeletion)
         .search(search_term(&author));
-    let (private, public) = (private.id.to_hex(), public.id.to_hex());
+    let (private, instructions, public) = (
+        private.id.to_hex(),
+        instructions.id.to_hex(),
+        public.id.to_hex(),
+    );
     let strict = search_indexes_deletions();
     let mut mismatches = Vec::new();
     for (reader, name, allowed) in [
         (
             &author,
             "author",
-            BTreeSet::from([private.clone(), public.clone()]),
+            BTreeSet::from([private.clone(), instructions.clone(), public.clone()]),
         ),
         (&Keys::generate(), "other", BTreeSet::from([public.clone()])),
     ] {
