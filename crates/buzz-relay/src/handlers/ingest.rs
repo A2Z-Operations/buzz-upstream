@@ -27,9 +27,9 @@ use buzz_core::kind::{
     KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
     KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
     KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
-    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
-    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
-    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_OWNER_RECORD, KIND_PERSONA,
+    KIND_PIN_LIST, KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK,
+    KIND_PROFILE, KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
     KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
     KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
     KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
@@ -505,7 +505,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_CONTACT_LIST | KIND_READ_STATE | KIND_USER_STATUS | KIND_AGENT_ENGRAM
         | KIND_EVENT_REMINDER | KIND_PERSONA | KIND_TEAM | KIND_MANAGED_AGENT
         | KIND_PRIVATE_MANAGED_AGENT | KIND_TEAM_CATALOG | KIND_INSTRUCTIONS_VERSION
-        | super::push_lease::KIND_PUSH_LEASE => {
+        | KIND_OWNER_RECORD | super::push_lease::KIND_PUSH_LEASE => {
             Ok(Scope::UsersWrite)
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
@@ -726,6 +726,8 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AP: instructions versions (44300) belong to no channel; ingest
             // rejects an `h` tag outright rather than ignoring it.
             | KIND_INSTRUCTIONS_VERSION
+            // NIP-AP: owner records (30180) likewise; ingest rejects an `h` tag.
+            | KIND_OWNER_RECORD
             // NIP-34: git events use `a` tags (repo reference), not `h` tags (channel scope).
             // Parameterized replaceable kinds are keyed by (pubkey, kind, d_tag).
             | KIND_GIT_REPO_ANNOUNCEMENT
@@ -1568,6 +1570,14 @@ fn validate_shared_tag(event: &Event, label: &str) -> Result<(), String> {
 ///
 /// `label` names the kind in error messages (e.g. `"persona event"`).
 fn single_bounded_d_tag<'a>(event: &'a Event, label: &str) -> Result<&'a str, String> {
+    let d = single_d_tag(event, label)?;
+    validate_team_id_value(d, label, "d")?;
+    Ok(d)
+}
+
+/// The value of the event's only `d` tag, counting tags by first element so a
+/// valueless `["d"]` counts toward the total and yields `""`.
+fn single_d_tag<'a>(event: &'a Event, label: &str) -> Result<&'a str, String> {
     let d_tags: Vec<Option<&str>> = event
         .tags
         .iter()
@@ -1583,9 +1593,7 @@ fn single_bounded_d_tag<'a>(event: &'a Event, label: &str) -> Result<&'a str, St
             d_tags.len()
         ));
     }
-    let d = d_tags[0].unwrap_or_default();
-    validate_team_id_value(d, label, "d")?;
-    Ok(d)
+    Ok(d_tags[0].unwrap_or_default())
 }
 
 /// The team id grammar (NIP-AP "Team identity"): non-empty, at most 64
@@ -1680,11 +1688,7 @@ fn validate_instructions_version_envelope(event: &Event) -> Result<(), String> {
         ));
     };
     if name == "p" {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_lowercase_hex_pubkey(value) {
             return Err(format!(
                 "{LABEL} `p` tag must be a 64-char lowercase hex pubkey"
             ));
@@ -1692,13 +1696,7 @@ fn validate_instructions_version_envelope(event: &Event) -> Result<(), String> {
     } else {
         validate_team_id_value(value, LABEL, "t")?;
     }
-    if event
-        .tags
-        .iter()
-        .any(|tag| tag.as_slice().first().map(|name| name.as_str()) == Some("h"))
-    {
-        return Err(format!("{LABEL} must not carry an `h` tag"));
-    }
+    reject_h_tag(event, LABEL)?;
     if event.content.is_empty() {
         return Err(format!("{LABEL} content must not be empty"));
     }
@@ -1709,6 +1707,48 @@ fn validate_instructions_version_envelope(event: &Event) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn is_lowercase_hex_pubkey(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn reject_h_tag(event: &Event, label: &str) -> Result<(), String> {
+    if event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(|name| name.as_str()) == Some("h"))
+    {
+        return Err(format!("{label} must not carry an `h` tag"));
+    }
+    Ok(())
+}
+
+/// Validate the envelope of a kind:30180 owner record.
+///
+/// Exactly one `d` tag, counted by first element, whose value is
+/// `agent:<64-char lowercase hex>` or `team:<team id>`, compared byte for
+/// byte; and no `h` tag. Content is opaque here; clients validate it.
+fn validate_owner_record_envelope(event: &Event) -> Result<(), String> {
+    const LABEL: &str = "owner record";
+    let d = single_d_tag(event, LABEL)?;
+    if let Some(agent) = d.strip_prefix("agent:") {
+        if !is_lowercase_hex_pubkey(agent) {
+            return Err(format!(
+                "{LABEL} `d` agent must be a 64-char lowercase hex pubkey"
+            ));
+        }
+    } else if let Some(team) = d.strip_prefix("team:") {
+        validate_team_id_value(team, LABEL, "d")?;
+    } else {
+        return Err(format!(
+            "{LABEL} `d` tag must start with `agent:` or `team:`"
+        ));
+    }
+    reject_h_tag(event, LABEL)
 }
 
 /// Maximum number of member `a` tags on a kind:30621 project.
@@ -3113,6 +3153,11 @@ async fn ingest_event_inner(
 
     if kind_u32 == KIND_INSTRUCTIONS_VERSION {
         validate_instructions_version_envelope(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
+    if kind_u32 == KIND_OWNER_RECORD {
+        validate_owner_record_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
@@ -5248,6 +5293,97 @@ mod postgres_tests {
             err.contains("[\"shared\",\"true\"]"),
             "expected exact-shape error, got: {err}"
         );
+    }
+
+    // ─── owner-record (30180) envelope tests ─────────────────────────────────
+
+    #[test]
+    fn owner_record_envelope_accepts_agent_and_team_records() {
+        let agent = format!("agent:{}", "ab".repeat(32));
+        for tags in [
+            vec![vec!["d", agent.as_str()]],
+            vec![vec!["d", "team:builtin-team:Welcome"]],
+            vec![vec!["d", agent.as_str()], vec!["alt", "agent owner record"]],
+        ] {
+            let tags: Vec<&[&str]> = tags.iter().map(Vec::as_slice).collect();
+            let ev = make_event_with_tags(KIND_OWNER_RECORD, "{}", &tags);
+            assert!(
+                validate_owner_record_envelope(&ev).is_ok(),
+                "{tags:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_record_envelope_rejects_malformed_d_and_h() {
+        let hex = "ab".repeat(32);
+        let agent = format!("agent:{hex}");
+        let cases: Vec<(&str, Vec<Vec<String>>)> = vec![
+            ("no d", vec![]),
+            ("valueless d", vec![vec!["d".into()]]),
+            (
+                "valueless d plus valid d",
+                vec![vec!["d".into()], vec!["d".into(), agent.clone()]],
+            ),
+            (
+                "two d",
+                vec![
+                    vec!["d".into(), agent.clone()],
+                    vec!["d".into(), "team:t".into()],
+                ],
+            ),
+            ("no prefix", vec![vec!["d".into(), hex.clone()]]),
+            (
+                "uppercase prefix",
+                vec![vec!["d".into(), format!("Agent:{hex}")]],
+            ),
+            (
+                "uppercase hex",
+                vec![vec!["d".into(), format!("agent:{}", hex.to_uppercase())]],
+            ),
+            (
+                "short hex",
+                vec![vec!["d".into(), format!("agent:{}", &hex[..63])]],
+            ),
+            ("long hex", vec![vec!["d".into(), format!("agent:{hex}a")]]),
+            ("leading space", vec![vec!["d".into(), format!(" {agent}")]]),
+            ("empty team", vec![vec!["d".into(), "team:".into()]]),
+            ("whitespace team", vec![vec!["d".into(), "team:a b".into()]]),
+            (
+                "long team",
+                vec![vec!["d".into(), format!("team:{}", "t".repeat(65))]],
+            ),
+            (
+                "h tag",
+                vec![
+                    vec!["d".into(), agent.clone()],
+                    vec!["h".into(), "c".into()],
+                ],
+            ),
+        ];
+        for (name, tags) in cases {
+            let tags: Vec<Vec<&str>> = tags
+                .iter()
+                .map(|t| t.iter().map(String::as_str).collect())
+                .collect();
+            let tags: Vec<&[&str]> = tags.iter().map(Vec::as_slice).collect();
+            let ev = make_event_with_tags(KIND_OWNER_RECORD, "{}", &tags);
+            assert!(
+                validate_owner_record_envelope(&ev).is_err(),
+                "{name}: must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_record_is_global_users_write() {
+        let ev = make_event_with_tags(KIND_OWNER_RECORD, "{}", &[]);
+        assert!(matches!(
+            required_scope_for_kind(KIND_OWNER_RECORD, &ev),
+            Ok(Scope::UsersWrite)
+        ));
+        assert!(is_global_only_kind(KIND_OWNER_RECORD));
+        assert!(!requires_h_channel_scope(KIND_OWNER_RECORD));
     }
 
     // ─── team-catalog (30178) envelope tests ─────────────────────────────────

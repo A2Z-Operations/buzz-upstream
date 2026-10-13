@@ -255,12 +255,13 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     // Search is a current-state surface; old artifact snapshots cannot match.
     qb.push(" AND (events.kind <> 45010 OR EXISTS (SELECT 1 FROM artifact_heads ah WHERE ah.community_id=events.community_id AND ah.event_id=events.id AND NOT ah.deleted))");
 
-    // NIP-AP instructions versions are never searchable, not even by their
-    // author. A query-time fence rather than a `search_tsv` skip-set entry, so
-    // adding the kind does not rewrite the events heap.
+    // NIP-AP instructions versions and owner records are never searchable,
+    // not even by their author. A query-time fence rather than a `search_tsv`
+    // skip-set entry, so adding a kind does not rewrite the events heap.
     qb.push(format!(
-        " AND events.kind <> {}",
-        buzz_core::kind::KIND_INSTRUCTIONS_VERSION
+        " AND events.kind NOT IN ({}, {})",
+        buzz_core::kind::KIND_INSTRUCTIONS_VERSION,
+        buzz_core::kind::KIND_OWNER_RECORD
     ));
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The

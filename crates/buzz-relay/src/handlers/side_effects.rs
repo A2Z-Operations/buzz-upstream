@@ -435,6 +435,14 @@ pub async fn validate_standard_deletion_event(
     let actor_bytes = effective_message_author(event, &state.relay_keypair.public_key());
     let target_ids = extract_target_event_ids(event);
 
+    // Every coordinate names its target's kind, so the `k` rule applies to
+    // each `a` tag, including ones the handler below does not act on: an
+    // untagged deletion naming an author-only coordinate would be stored
+    // publicly and reveal that address.
+    for target_kind in a_tag_target_kinds(event) {
+        check_deletion_privacy_k_tag(event, target_kind)?;
+    }
+
     if !has_e_tag(event) {
         // a-tag deletion: verify author owns the addressable event
         let a_tag = event
@@ -446,9 +454,6 @@ pub async fn validate_standard_deletion_event(
         let parts: Vec<&str> = a_tag.splitn(3, ':').collect();
         if parts.len() < 2 {
             return Err(anyhow::anyhow!("invalid a-tag format"));
-        }
-        if let Ok(target_kind) = parts[0].parse() {
-            check_deletion_privacy_k_tag(event, target_kind)?;
         }
         let target_pubkey_bytes =
             hex::decode(parts[1]).map_err(|_| anyhow::anyhow!("invalid pubkey in a-tag"))?;
@@ -486,6 +491,14 @@ pub async fn validate_standard_deletion_event(
     }
 
     Ok(())
+}
+
+/// Kinds named by the event's `a` tag coordinates (`<kind>:<pubkey>:<d>`).
+fn a_tag_target_kinds(event: &Event) -> impl Iterator<Item = u32> + '_ {
+    event.tags.iter().filter_map(|tag| match tag.as_slice() {
+        [name, value, ..] if name == "a" => value.split(':').next()?.parse().ok(),
+        _ => None,
+    })
 }
 
 /// A deletion's read privacy follows its `k` tag (see

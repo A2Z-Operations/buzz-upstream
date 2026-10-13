@@ -37,6 +37,7 @@ use support::*;
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3001";
 const KIND_EVENT_REMINDER: u16 = 30300;
 const KIND_INSTRUCTIONS_VERSION: u16 = 44300;
+const KIND_OWNER_RECORD: u16 = 30180;
 
 fn build_reminder(keys: &Keys) -> nostr::Event {
     EventBuilder::new(
@@ -94,6 +95,28 @@ async fn store_deleted_instructions_version(client: &Client, author: &Keys) -> n
     deletion
 }
 
+/// Store and delete an owner record (kind:30180) by coordinate, with a
+/// `k`-tagged deletion carrying `author`'s search term as its reason.
+async fn store_deleted_owner_record(client: &Client, author: &Keys) -> nostr::Event {
+    let d = format!("team:{}", uuid::Uuid::new_v4());
+    let record = EventBuilder::new(Kind::Custom(KIND_OWNER_RECORD), "{}")
+        .tags(vec![tag(&["d", &d])])
+        .sign_with_keys(author)
+        .unwrap();
+    submit_ok(client, author, &record).await;
+    let coordinate = format!("{KIND_OWNER_RECORD}:{}:{d}", author.public_key().to_hex());
+    let deletion = build_deletion_with_reason(
+        author,
+        vec![
+            tag(&["a", &coordinate]),
+            tag(&["k", &KIND_OWNER_RECORD.to_string()]),
+        ],
+        &search_term(author),
+    );
+    submit_ok(client, author, &deletion).await;
+    deletion
+}
+
 /// A search term unique to `author`'s deletion reason.
 fn search_term(author: &Keys) -> String {
     format!("aodreason{}", &author.public_key().to_hex()[..16])
@@ -131,6 +154,7 @@ async fn author_only_deletion_search_reaches_only_author() {
     let author = Keys::generate();
     let (_, private) = store_deleted_reminder(&client, &author).await;
     let instructions = store_deleted_instructions_version(&client, &author).await;
+    let owner_record = store_deleted_owner_record(&client, &author).await;
     // Public control: an ordinary deletion carrying the same reason word.
     let note = EventBuilder::text_note("public note")
         .sign_with_keys(&author)
@@ -146,9 +170,10 @@ async fn author_only_deletion_search_reaches_only_author() {
     let search = Filter::new()
         .kind(Kind::EventDeletion)
         .search(search_term(&author));
-    let (private, instructions, public) = (
+    let (private, instructions, owner_record, public) = (
         private.id.to_hex(),
         instructions.id.to_hex(),
+        owner_record.id.to_hex(),
         public.id.to_hex(),
     );
     let strict = search_indexes_deletions();
@@ -157,7 +182,12 @@ async fn author_only_deletion_search_reaches_only_author() {
         (
             &author,
             "author",
-            BTreeSet::from([private.clone(), instructions.clone(), public.clone()]),
+            BTreeSet::from([
+                private.clone(),
+                instructions.clone(),
+                owner_record.clone(),
+                public.clone(),
+            ]),
         ),
         (&Keys::generate(), "other", BTreeSet::from([public.clone()])),
     ] {

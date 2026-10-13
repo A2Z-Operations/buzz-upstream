@@ -1257,7 +1257,8 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
 ///
 /// Exclusion comes from two layers: the `search_tsv` skip-set in the schema
 /// (most author-only kinds) and query-time fences in `buzz-search` (kind:44300
-/// instructions versions, which the desired-state `search_tsv` does index).
+/// instructions versions and kind:30180 owner records, which the desired-state
+/// `search_tsv` does index).
 /// `AUTHOR_ONLY_KINDS` is a Rust const, so a new author-only kind added
 /// without either layer would spend FTS budget on private hits before the
 /// relay post-filter rejects them. Insert one row per author-only kind and
