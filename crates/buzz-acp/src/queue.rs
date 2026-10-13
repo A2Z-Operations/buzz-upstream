@@ -464,36 +464,65 @@ impl EventQueue {
         true
     }
 
-    /// Total queued events across every scope belonging to `channel_id`.
+    /// Total pending events across both queued and retained native follow-ups.
     fn channel_event_total(&self, channel_id: Uuid) -> usize {
         self.queues
             .iter()
-            .filter(|(s, _)| s.channel_id() == channel_id)
-            .map(|(_, q)| q.len())
-            .sum()
+            .filter(|(scope, _)| scope.channel_id() == channel_id)
+            .map(|(_, events)| events.len())
+            .sum::<usize>()
+            + self
+                .withheld_native_steer
+                .iter()
+                .filter(|(scope, _)| scope.channel_id() == channel_id)
+                .map(|(_, events)| events.len())
+                .sum::<usize>()
     }
 
-    /// Drop the globally-oldest queued event(s) across a channel's scopes until
-    /// its aggregate depth is within [`MAX_PENDING_PER_CHANNEL`]. Preserves
-    /// cross-scope FIFO fairness by always evicting the oldest head event.
+    /// Apply the existing oldest-event overflow policy across both stores.
+    /// Moving a follow-up into retention must not grant a second queue budget.
     fn enforce_channel_cap(&mut self, channel_id: Uuid) {
         while self.channel_event_total(channel_id) > MAX_PENDING_PER_CHANNEL {
-            // Find the channel's scope whose head event is oldest.
-            let victim = self
+            let queued = self
                 .queues
                 .iter()
-                .filter(|(s, q)| s.channel_id() == channel_id && !q.is_empty())
-                .min_by_key(|(_, q)| q.front().unwrap().received_at)
-                .map(|(s, _)| s.clone());
-            let Some(scope) = victim else { break };
-            if let Some(q) = self.queues.get_mut(&scope) {
-                q.pop_front();
-                if q.is_empty() {
+                .filter(|(scope, _)| scope.channel_id() == channel_id)
+                .filter_map(|(scope, events)| {
+                    events
+                        .front()
+                        .map(|event| (scope.clone(), None, event.received_at))
+                });
+            let retained = self
+                .withheld_native_steer
+                .iter()
+                .filter(|(scope, _)| scope.channel_id() == channel_id)
+                .flat_map(|(scope, entries)| {
+                    entries.iter().enumerate().map(|(index, entry)| {
+                        (scope.clone(), Some(index), entry.queued.received_at)
+                    })
+                });
+            let Some((scope, retained_index, _)) = queued
+                .chain(retained)
+                .min_by_key(|(_, _, received_at)| *received_at)
+            else {
+                break;
+            };
+            if let Some(index) = retained_index {
+                if let Some(entries) = self.withheld_native_steer.get_mut(&scope) {
+                    entries.remove(index);
+                    if entries.is_empty() {
+                        self.withheld_native_steer.remove(&scope);
+                    }
+                }
+            } else if let Some(events) = self.queues.get_mut(&scope) {
+                events.pop_front();
+                if events.is_empty() {
                     self.queues.remove(&scope);
                 }
             }
             tracing::warn!(
                 channel_id = %channel_id,
+                retained = retained_index.is_some(),
                 limit = MAX_PENDING_PER_CHANNEL,
                 "aggregate per-channel queue cap reached — dropped oldest event"
             );
@@ -7271,3 +7300,6 @@ mod tests {
 
 #[cfg(test)]
 mod steer_ownership_tests;
+
+#[cfg(test)]
+mod retained_cap_tests;

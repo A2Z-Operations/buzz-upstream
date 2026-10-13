@@ -9,14 +9,15 @@ pub(super) struct WithheldSteer {
 }
 
 impl EventQueue {
-    /// Bound retained follow-ups; at capacity the caller uses cancel-and-merge.
-    pub fn can_native_steer(&self, scope: &SessionScope) -> bool {
-        self.withheld_native_steer
-            .iter()
-            .filter(|(key, _)| key.channel_id() == scope.channel_id())
-            .map(|(_, events)| events.len())
-            .sum::<usize>()
-            < MAX_PENDING_PER_CHANNEL
+    /// Steering transfers an admitted event within the shared channel budget.
+    /// A capacity eviction must not send an event that is no longer retained.
+    pub fn can_native_steer(&self, scope: &SessionScope, event_id: &str) -> bool {
+        self.channel_event_total(scope.channel_id()) <= MAX_PENDING_PER_CHANNEL
+            && self.queues.get(scope).is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event.event.id.to_hex() == event_id)
+            })
     }
 
     /// Whether this acknowledgement still owns the retained delivery attempt.

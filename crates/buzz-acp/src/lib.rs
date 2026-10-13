@@ -4521,7 +4521,7 @@ fn try_native_steer(
     be: queue::BatchEvent,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
-    if !queue.can_native_steer(&scope) {
+    if !queue.can_native_steer(&scope, &be.event.id.to_hex()) {
         return false;
     }
     let channel_id = scope.channel_id();
