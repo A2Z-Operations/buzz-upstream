@@ -8,7 +8,10 @@
 //!   and the HTTP bridge query, with the owner as the positive control;
 //! - exclusion from full-text search, for the author too;
 //! - per-subject `limit: 1` current-version reads and composite
-//!   `(until, before_id)` history paging across tied timestamps.
+//!   `(until, before_id)` history paging across tied timestamps;
+//! - NIP-09 deletions of a version: the `k` tag is required, the deletion is
+//!   as private as the version on every read surface and live, and the
+//!   version is gone afterwards.
 //!
 //! The relay does not decrypt; content here is an opaque placeholder.
 //!
@@ -26,6 +29,9 @@ use std::time::Duration;
 use buzz_test_client::{BuzzTestClient, RelayMessage};
 use nostr::{Alphabet, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag, Timestamp};
 use serde_json::{json, Value};
+
+#[path = "support/author_only_deletion.rs"]
+mod aod;
 
 const INSTRUCTIONS_VERSION_KIND: u16 = 44300;
 const MAX_CONTENT_BYTES: usize = 218_548;
@@ -684,4 +690,132 @@ async fn test_instructions_version_unsearchable_for_author() {
         ids(&hits)
     );
     ws.disconnect().await.expect("disconnect");
+}
+
+/// Publish a version as `owner`, then delete it with a `k`-tagged kind:5.
+/// Returns the version and the accepted deletion.
+async fn store_deleted_version(owner: &Keys) -> (nostr::Event, nostr::Event) {
+    let client = aod::http_client();
+    let version = agent_version(owner, &new_agent(), now());
+    aod::submit_ok(&client, owner, &version).await;
+    let deletion = aod::build_deletion(
+        owner,
+        vec![
+            aod::tag(&["e", &version.id.to_hex()]),
+            aod::tag(&["k", &INSTRUCTIONS_VERSION_KIND.to_string()]),
+        ],
+    );
+    aod::submit_ok(&client, owner, &deletion).await;
+    (version, deletion)
+}
+
+/// A deletion of a version reaches its owner and nobody else over WS REQ,
+/// `ids` lookup, WS COUNT, HTTP `/query` and HTTP `/count`, and the version
+/// itself is gone for the owner afterwards.
+#[tokio::test]
+#[ignore]
+async fn test_instructions_version_deletion_reads_are_author_only() {
+    let owner = Keys::generate();
+    let (version, deletion) = store_deleted_version(&owner).await;
+    aod::assert_deletion_visibility(&owner, &owner, deletion.id, true).await;
+    aod::assert_deletion_visibility(&Keys::generate(), &owner, deletion.id, false).await;
+
+    let by_id = Filter::new().id(version.id);
+    assert!(
+        aod::http_query_ids(&aod::http_client(), &owner, &by_id)
+            .await
+            .is_empty(),
+        "the deleted version must be gone over HTTP for its owner"
+    );
+    let mut ws = BuzzTestClient::connect(&relay_url(), &owner)
+        .await
+        .expect("connect");
+    assert!(
+        aod::ws_query_ids(&mut ws, &by_id).await.is_empty(),
+        "the deleted version must be gone over WS for its owner"
+    );
+    assert_eq!(aod::ws_count(&mut ws, &by_id).await, 0);
+    ws.disconnect().await.expect("disconnect");
+}
+
+/// Subscribed while the version still exists, the owner receives its
+/// deletion live and another reader does not.
+#[tokio::test]
+#[ignore]
+async fn test_instructions_version_deletion_live_fanout_is_author_only() {
+    let client = aod::http_client();
+    let owner = Keys::generate();
+    let version = agent_version(&owner, &new_agent(), now());
+    aod::submit_ok(&client, &owner, &version).await;
+
+    let live = Filter::new()
+        .kind(Kind::EventDeletion)
+        .author(owner.public_key());
+    let mut subscribers = Vec::new();
+    for keys in [owner.clone(), Keys::generate()] {
+        let mut ws = BuzzTestClient::connect(&relay_url(), &keys)
+            .await
+            .expect("connect");
+        let sid = sub_id("deletion-live");
+        ws.subscribe(&sid, vec![live.clone()]).await.expect("REQ");
+        assert!(ws
+            .collect_until_eose(&sid, Duration::from_secs(5))
+            .await
+            .expect("EOSE")
+            .is_empty());
+        subscribers.push((ws, sid));
+    }
+
+    let deletion = aod::build_deletion(
+        &owner,
+        vec![
+            aod::tag(&["e", &version.id.to_hex()]),
+            aod::tag(&["k", &INSTRUCTIONS_VERSION_KIND.to_string()]),
+        ],
+    );
+    aod::submit_ok(&client, &owner, &deletion).await;
+
+    for (i, (mut ws, sid)) in subscribers.into_iter().enumerate() {
+        let delivered = aod::live_event_ids(&mut ws, &sid)
+            .await
+            .contains(&deletion.id);
+        assert_eq!(
+            delivered,
+            i == 0,
+            "live delivery to subscriber {i} (0 = owner)"
+        );
+        ws.disconnect().await.expect("disconnect");
+    }
+}
+
+/// A deletion of a version must carry `["k","44300"]`: one without it, or
+/// with another kind, is rejected whether the version is live or already
+/// deleted.
+#[tokio::test]
+#[ignore]
+async fn test_instructions_version_deletion_requires_k_tag() {
+    let client = aod::http_client();
+    let owner = Keys::generate();
+    let version = agent_version(&owner, &new_agent(), now());
+    aod::submit_ok(&client, &owner, &version).await;
+    let target = aod::tag(&["e", &version.id.to_hex()]);
+    let k = INSTRUCTIONS_VERSION_KIND.to_string();
+
+    for tags in [
+        vec![target.clone()],
+        vec![target.clone(), aod::tag(&["k", "1"])],
+        vec![target.clone(), aod::tag(&["k", &format!("0{k}")])],
+    ] {
+        let (accepted, msg) =
+            aod::submit(&client, &owner, &aod::build_deletion(&owner, tags.clone())).await;
+        assert!(!accepted, "deletion {tags:?} must be rejected (got: {msg})");
+    }
+
+    let (deleted, _) = store_deleted_version(&owner).await;
+    let untagged = aod::build_deletion(&owner, vec![aod::tag(&["e", &deleted.id.to_hex()])]);
+    let (accepted, msg) = aod::submit(&client, &owner, &untagged).await;
+    assert!(
+        !accepted,
+        "an untagged deletion of a deleted version must be rejected (got: {msg})"
+    );
 }
