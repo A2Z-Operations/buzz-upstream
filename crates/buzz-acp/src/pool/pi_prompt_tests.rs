@@ -91,6 +91,7 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
             .contains("Pi fixture"));
         let standing = crate::queue::StandingContext {
             base_prompt: ctx.base_prompt.as_deref(),
+            agent_identity: None,
             system_prompt: ctx.system_prompt.as_deref(),
             team_instructions: ctx.team_instructions.as_deref(),
             agent_core: Some(core),

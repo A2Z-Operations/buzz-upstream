@@ -897,9 +897,10 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
-    /// Sanitized agent name used to compose `_meta.sessionTitle` on session/new.
+    /// Sanitized agent name used to compose `_meta.sessionTitle` on session/new
+    /// and to render the prompt-visible runtime identity section.
     /// Channel sessions add the channel name; thread sessions also add the root
-    /// ID prefix. Never part of the prompt.
+    /// ID prefix only for `_meta.sessionTitle`, never for prompt identity.
     pub session_title: Option<String>,
     pub team_instructions: Option<String>,
     pub heartbeat_prompt: Option<String>,
@@ -1591,6 +1592,7 @@ async fn create_session_and_apply_model(
     // its own `<core-memory>` boundary, and canvas carries its own
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
+    let agent_identity = agent_identity_for_context(&ctx);
     let combined_system_prompt = with_canvas(
         with_huddle_instructions(
             with_core(
@@ -1598,6 +1600,7 @@ async fn create_session_and_apply_model(
                     framed_system_prompt(
                         &ctx.cwd,
                         ctx.base_prompt.as_deref(),
+                        Some(agent_identity.as_str()),
                         ctx.system_prompt.as_deref(),
                     ),
                     ctx.team_instructions.as_deref(),
@@ -1885,6 +1888,7 @@ pub(crate) async fn run_isolated_prompt(
     )
     .await?;
     *active_session = Some(session_id.clone());
+    let agent_identity = agent_identity_for_context(&ctx);
     let prompt = prepend_standing_for_legacy(
         if agent.has_system_prompt_support() {
             2
@@ -1893,6 +1897,7 @@ pub(crate) async fn run_isolated_prompt(
         },
         &crate::queue::StandingContext {
             base_prompt: ctx.base_prompt.as_deref(),
+            agent_identity: Some(agent_identity.as_str()),
             system_prompt: ctx.system_prompt.as_deref(),
             team_instructions: ctx.team_instructions.as_deref(),
             agent_core: core.as_deref(),
@@ -2248,6 +2253,13 @@ pub(crate) fn prepend_standing_for_legacy(
     format!("{}\n\n{body}", sections.join("\n\n"))
 }
 
+fn agent_identity_for_context(ctx: &PromptContext) -> String {
+    crate::queue::agent_identity_section(
+        ctx.session_title.as_deref(),
+        &ctx.agent_keys.public_key().to_hex(),
+    )
+}
+
 /// Frame the `session/new` `systemPrompt` so each present prompt carries its own
 /// paired tag, keeping the base/workspace/persona boundaries recoverable downstream.
 ///
@@ -2259,26 +2271,24 @@ pub(crate) fn prepend_standing_for_legacy(
 fn framed_system_prompt(
     cwd: &str,
     base_prompt: Option<&str>,
+    agent_identity: Option<&str>,
     system_prompt: Option<&str>,
 ) -> Option<String> {
-    match (base_prompt, system_prompt) {
-        (Some(bp), Some(sp)) => Some(format!(
-            "{}\n\n{}\n\n{}",
-            crate::queue::base_section(bp),
-            workspace_section(cwd),
-            crate::prompt_framing::semantic_section("agent-instructions", sp),
-        )),
-        (Some(bp), None) => Some(format!(
-            "{}\n\n{}",
-            crate::queue::base_section(bp),
-            workspace_section(cwd)
-        )),
-        (None, Some(sp)) => Some(crate::prompt_framing::semantic_section(
+    let mut sections = Vec::new();
+    if let Some(bp) = base_prompt {
+        sections.push(crate::queue::base_section(bp));
+        sections.push(workspace_section(cwd));
+    }
+    if let Some(identity) = agent_identity {
+        sections.push(identity.to_string());
+    }
+    if let Some(sp) = system_prompt {
+        sections.push(crate::prompt_framing::semantic_section(
             "agent-instructions",
             sp,
-        )),
-        (None, None) => None,
+        ));
     }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 fn workspace_section(cwd: &str) -> String {
@@ -2826,8 +2836,10 @@ pub async fn run_prompt_task(
     // `is_new_session` comes from the session registry, which is cleared
     // whenever a session is invalidated — so the replacement session re-delivers
     // rather than leaving the agent unbriefed.
+    let agent_identity = agent_identity_for_context(&ctx);
     let standing = crate::queue::StandingContext {
         base_prompt: ctx.base_prompt.as_deref(),
+        agent_identity: Some(agent_identity.as_str()),
         system_prompt: ctx.system_prompt.as_deref(),
         team_instructions: ctx.team_instructions.as_deref(),
         agent_core: agent_core.as_deref(),
@@ -3129,6 +3141,7 @@ pub async fn run_prompt_task(
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
+                agent_identity: standing.agent_identity,
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
                 channel_info: channel_info.as_ref(),
@@ -5842,6 +5855,9 @@ pub(crate) mod tests {
     fn full_standing() -> crate::queue::StandingContext<'static> {
         crate::queue::StandingContext {
             base_prompt: Some("be helpful"),
+            agent_identity: Some(
+                "<agent-identity>\nDisplay name: Eva\nNostr public key: abc\n</agent-identity>",
+            ),
             system_prompt: Some("you are Eva"),
             team_instructions: Some("ship small"),
             agent_core: Some("[Agent Memory — core]\nremember this"),
@@ -5858,6 +5874,7 @@ pub(crate) mod tests {
         let composed = prepend_standing_for_legacy(1, &full_standing(), "do the thing");
         let positions: Vec<usize> = [
             "<base>",
+            "<agent-identity>",
             "<agent-instructions>",
             "<team-instructions>",
             "<core-memory>",
@@ -5914,8 +5931,9 @@ pub(crate) mod tests {
         // Also the regression guard against #2372: the session title travels
         // out of band in `_meta.sessionTitle`, so this exact-bytes assertion is
         // what pins the framing against a `[Session]` section reappearing here.
-        let framed = framed_system_prompt("/workspace", Some("base text"), Some("persona text"))
-            .expect("both present yields Some");
+        let framed =
+            framed_system_prompt("/workspace", Some("base text"), None, Some("persona text"))
+                .expect("both present yields Some");
         assert_eq!(
             framed,
             "<base>\nbase text\n</base>\n\n<workspace>\nCurrent working directory: /workspace\n</workspace>\n\n<agent-instructions>\npersona text\n</agent-instructions>"
@@ -5924,8 +5942,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_base_only_labels_base() {
-        let framed =
-            framed_system_prompt("/workspace", Some("base text"), None).expect("base yields Some");
+        let framed = framed_system_prompt("/workspace", Some("base text"), None, None)
+            .expect("base yields Some");
         assert_eq!(
             framed,
             "<base>\nbase text\n</base>\n\n<workspace>\nCurrent working directory: /workspace\n</workspace>"
@@ -5933,10 +5951,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_framed_system_prompt_carries_agent_identity() {
+        let identity =
+            "<agent-identity>\nDisplay name: Eva\nNostr public key: abc\n</agent-identity>";
+        let framed = framed_system_prompt("/workspace", None, Some(identity), Some("persona text"))
+            .expect("identity yields Some");
+        assert_eq!(
+            framed,
+            "<agent-identity>\nDisplay name: Eva\nNostr public key: abc\n</agent-identity>\n\n<agent-instructions>\npersona text\n</agent-instructions>"
+        );
+    }
+
+    #[test]
     fn test_framed_system_prompt_persona_only_labels_agent_instructions() {
         // A bare persona would be mislabeled "Base" downstream — it must carry
         // its own <agent-instructions> boundary even when no base prompt exists.
-        let framed = framed_system_prompt("/workspace", None, Some("persona text"))
+        let framed = framed_system_prompt("/workspace", None, None, Some("persona text"))
             .expect("persona yields Some");
         assert_eq!(
             framed,
@@ -5947,8 +5977,8 @@ pub(crate) mod tests {
     #[test]
     fn test_framed_system_prompt_preserves_persona_bytes_verbatim() {
         let persona = "literal </agent-instructions>, <T>, &quot;, & <policy>";
-        let framed =
-            framed_system_prompt("/workspace", None, Some(persona)).expect("persona yields Some");
+        let framed = framed_system_prompt("/workspace", None, None, Some(persona))
+            .expect("persona yields Some");
         assert_eq!(
             framed,
             format!("<agent-instructions>\n{persona}\n</agent-instructions>")
@@ -5957,7 +5987,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_neither_is_none() {
-        assert!(framed_system_prompt("/workspace", None, None).is_none());
+        assert!(framed_system_prompt("/workspace", None, None, None).is_none());
     }
 
     #[test]
@@ -11900,11 +11930,16 @@ done"#
                     .as_deref()
                     .map(crate::queue::base_section)
                     .unwrap_or_default();
-                if !include_base {
+                if !include_base && version == 1 {
                     assert!(request["params"].get("systemPrompt").is_none());
+                } else if !include_base {
+                    let system = request["params"]["systemPrompt"].as_str().unwrap();
+                    assert!(system.contains("<agent-identity>"));
+                    assert!(system.contains("Display name: Fizz"));
                 } else if version == 2 {
                     let system = request["params"]["systemPrompt"].as_str().unwrap();
                     assert!(system.starts_with(&base));
+                    assert!(system.contains("<agent-identity>"));
                     assert_eq!(system.matches("## Session Model").count(), 1);
                 } else {
                     assert!(request["params"].get("systemPrompt").is_none());
