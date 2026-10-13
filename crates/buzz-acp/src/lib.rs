@@ -2190,6 +2190,8 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(300); // 5 minute
 const RESPAWN_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum respawn backoff delay.
 const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Total initialize-handshake budget for initial and deferred workers.
+const AGENT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-slot circuit breaker state.
 ///
@@ -2318,6 +2320,39 @@ struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
     result: Result<(AcpClient, u32, String)>,
+}
+
+fn handle_respawn_result(
+    rr: RespawnResult,
+    crash_history: &mut [SlotCircuit],
+    pool: &mut AgentPool,
+    config: &Config,
+) {
+    crash_history[rr.index].respawn_in_flight = false;
+    match rr.result {
+        Ok((acp, protocol_version, agent_name)) => {
+            let agent = OwnedAgent {
+                index: rr.index,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: config.model.clone(),
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: config.effort_level.clone(),
+                agent_name,
+                goose_system_prompt_supported: None,
+                protocol_version,
+            };
+            pool.return_agent(agent);
+            tracing::info!(agent = rr.index, "respawn complete");
+        }
+        Err(e) => {
+            crash_history[rr.index].mark_spawn_failed();
+            tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
+        }
+    }
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -3290,7 +3325,16 @@ async fn run_harness(
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        idx,
+                        observer,
+                        AGENT_INITIALIZE_TIMEOUT,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -3938,34 +3982,7 @@ async fn run_harness(
             Some(PoolEvent::Recovery(wake)) => {
                 match wake {
                     recovery_wake::RecoveryWake::Respawn(rr) => {
-                        crash_history[rr.index].respawn_in_flight = false;
-                        match rr.result {
-                            Ok((acp, protocol_version, agent_name)) => {
-                                let agent = OwnedAgent {
-                                    index: rr.index,
-                                    acp,
-                                    state: SessionState::default(),
-                                    model_capabilities: None,
-                                    desired_model: config.model.clone(),
-                                    model_overridden: false,
-                                    desired_model_request_id: None,
-                                    desired_model_pending_ack: false,
-                                    startup_effort: config.effort_level.clone(),
-                                    agent_name,
-                                    goose_system_prompt_supported: None,
-                                    protocol_version,
-                                };
-                                pool.return_agent(agent);
-                                tracing::info!(agent = rr.index, "respawn complete");
-                            }
-                            Err(e) => {
-                                crash_history[rr.index].mark_spawn_failed();
-                                tracing::warn!(
-                                    agent = rr.index,
-                                    "respawn failed: {e} — circuit re-opened"
-                                );
-                            }
-                        }
+                        handle_respawn_result(*rr, &mut crash_history, &mut pool, config);
                     }
                     // Maintenance runs at the top of the next iteration.
                     recovery_wake::RecoveryWake::Maintenance => continue,
@@ -5762,7 +5779,16 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            i,
+            observer,
+            AGENT_INITIALIZE_TIMEOUT,
+        )
+        .await;
         guard.send(result);
     });
 }
@@ -6010,7 +6036,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            index,
+            observer,
+            AGENT_INITIALIZE_TIMEOUT,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -6066,7 +6101,7 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = initialize_agent(&mut acp, AGENT_INITIALIZE_TIMEOUT);
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -6080,7 +6115,7 @@ async fn initialize_agent_pool(
                     None => initialize.await,
                 };
                 match initialize_result {
-                    Ok(Ok(init_result)) => {
+                    Ok(init_result) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
                         let protocol_version =
                             init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -6120,14 +6155,8 @@ async fn initialize_agent_pool(
                         agent_slots.resize_with(startup.agents as usize, || None);
                         break;
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
-                        acp.shutdown().await;
-                        agent_slots.push(None);
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
-                        acp.shutdown().await;
                         agent_slots.push(None);
                     }
                 }
@@ -6149,6 +6178,22 @@ async fn initialize_agent_pool(
     Ok(AgentPool::from_slots(agent_slots))
 }
 
+// Keep the total handshake budget the same for startup and background refill.
+// AcpClient's individual write/read deadlines can otherwise add up to 90s.
+async fn initialize_agent(
+    acp: &mut AcpClient,
+    timeout: Duration,
+) -> std::result::Result<serde_json::Value, acp::AcpError> {
+    let result = tokio::time::timeout(timeout, acp.initialize())
+        .await
+        .unwrap_or(Err(acp::AcpError::Timeout(timeout)));
+    if result.is_err() {
+        // Drop is only best-effort; reap the owned child before returning its slot.
+        acp.shutdown().await;
+    }
+    result
+}
+
 // ── spawn_and_init ────────────────────────────────────────────────────────────
 /// Spawn an agent subprocess and run the MCP `initialize` handshake.
 ///
@@ -6161,13 +6206,14 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    initialize_timeout: Duration,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
-    match acp.initialize().await {
+    match initialize_agent(&mut acp, initialize_timeout).await {
         Ok(init_result) => {
             tracing::info!("agent initialized: {init_result}");
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -6181,13 +6227,7 @@ async fn spawn_and_init(
             let agent_name = normalized_agent_name(&init_result);
             Ok((acp, protocol_version, agent_name))
         }
-        Err(e) => {
-            // Explicitly shut down the spawned child to prevent zombie/leak.
-            // Drop only does start_kill + try_wait (best-effort); shutdown()
-            // does start_kill + bounded wait (guaranteed reap).
-            acp.shutdown().await;
-            Err(anyhow::anyhow!("agent initialize failed: {e}"))
-        }
+        Err(e) => Err(anyhow::anyhow!("agent initialize failed: {e}")),
     }
 }
 
