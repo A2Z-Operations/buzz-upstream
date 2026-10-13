@@ -199,7 +199,7 @@ fn journal_crash_child() {
     let steer = event(channel, "follow-up");
     let id = steer.event.id.to_hex();
     queue.push(steer);
-    queue.mark_native_steer_pending(&channel.into_scope(), &id);
+    queue.mark_native_steer_pending(channel.into_scope(), &id);
     queue.acknowledge_native_steer(&channel.into_scope(), &id);
     std::fs::write(path.with_extension("ready"), b"ready").unwrap();
     loop {
@@ -348,7 +348,7 @@ async fn graceful_shutdown_settles_original_and_follow_up_in_either_ack_order() 
         let follow_up = event(channel, "follow-up");
         let id = follow_up.event.id.to_hex();
         queue.push(follow_up);
-        queue.mark_native_steer_pending(&channel.into_scope(), &id);
+        queue.mark_native_steer_pending(channel.into_scope(), &id);
         if ack_first {
             queue.acknowledge_native_steer(&channel.into_scope(), &id);
         }
