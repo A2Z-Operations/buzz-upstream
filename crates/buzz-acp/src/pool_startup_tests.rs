@@ -42,7 +42,7 @@ for line in sys.stdin:
     assert_eq!(
         remaining,
         (true, true),
-        "refill retains configured capacity"
+        "startup preserves the slots for background refill"
     );
 }
 

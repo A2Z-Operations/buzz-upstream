@@ -14,6 +14,8 @@ mod observer;
 mod pool;
 mod pool_lifecycle;
 #[cfg(all(test, unix))]
+mod pool_refill_tests;
+#[cfg(all(test, unix))]
 mod pool_startup_tests;
 mod prompt_framing;
 mod prompt_project;
