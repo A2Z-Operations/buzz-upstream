@@ -13,6 +13,8 @@ mod isolated_execution;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+#[cfg(all(test, unix))]
+mod pool_startup_tests;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
@@ -3145,7 +3147,7 @@ async fn run_harness(
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
     let maintenance_interval = Duration::from_secs(30);
-    let mut last_maintenance = std::time::Instant::now();
+    let mut last_maintenance = std::time::Instant::now() - maintenance_interval;
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -4229,6 +4231,7 @@ async fn run_harness(
                             .take_ready()
                             .expect("successful wake stores a ready pool");
                         pool_ready = true;
+                        last_maintenance = std::time::Instant::now() - maintenance_interval;
                         emit_runtime_lifecycle(
                             observer.as_ref(),
                             &runtime_start_nonce,
@@ -6049,8 +6052,8 @@ async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
-    // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    // Serve work as soon as one worker is ready. Empty slots are filled by the
+    // main loop's existing background refill, without blocking relay intake.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
         let spawn_result = AcpClient::spawn(
@@ -6114,6 +6117,8 @@ async fn initialize_agent_pool(
                             goose_system_prompt_supported: None,
                             protocol_version,
                         }));
+                        agent_slots.resize_with(startup.agents as usize, || None);
+                        break;
                     }
                     Ok(Err(e)) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
@@ -6139,13 +6144,6 @@ async fn initialize_agent_pool(
             "all {} agents failed to start — cannot continue",
             startup.agents
         ));
-    }
-    if live_count < startup.agents as usize {
-        tracing::warn!(
-            "started {}/{} agents — continuing with reduced pool",
-            live_count,
-            startup.agents
-        );
     }
     tracing::info!("agent_pool_ready agents={}", live_count);
     Ok(AgentPool::from_slots(agent_slots))
