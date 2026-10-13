@@ -348,6 +348,7 @@ async fn planned_steer_retirements_preserve_availability_and_genuine_crashes_cou
             false,
             0,
             None,
+            AGENT_INITIALIZE_TIMEOUT,
         )
         .await
         .unwrap()
@@ -477,23 +478,9 @@ async fn planned_steer_retirements_preserve_availability_and_genuine_crashes_cou
                     .await
                     .unwrap()
                     .unwrap();
-                let (acp, protocol_version, agent_name) =
-                    replacement.result.expect("replacement handshake succeeds");
-                history[0].respawn_in_flight = false;
-                pool.return_agent(OwnedAgent {
-                    index: 0,
-                    acp,
-                    protocol_version,
-                    agent_name,
-                    state: Default::default(),
-                    model_capabilities: None,
-                    desired_model: None,
-                    model_overridden: false,
-                    desired_model_request_id: None,
-                    desired_model_pending_ack: false,
-                    startup_effort: None,
-                    goose_system_prompt_supported: None,
-                });
+                assert!(replacement.result.is_ok(), "replacement handshake succeeds");
+                handle_respawn_result(replacement, &mut history, &mut pool, &config);
+                assert!(!history[0].respawn_in_flight);
                 assert!(pool.any_idle());
             }
         }
