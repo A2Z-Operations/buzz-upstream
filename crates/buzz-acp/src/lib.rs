@@ -5440,6 +5440,24 @@ fn handle_prompt_result(
     };
 
     match result.outcome {
+        // A late steer may force worker retirement after its original prompt
+        // has already completed. Replace the worker without retrying that work
+        // or reporting the successful turn as an error.
+        PromptOutcome::Ok(_) if result.agent.acp.is_shutdown() => {
+            let slot_history = &mut crash_history[agent_index];
+            if !spawn_respawn_task(
+                result.agent,
+                config,
+                slot_history,
+                respawn_tx,
+                respawn_tasks,
+                observer,
+            ) && pool.live_count() == 0
+                && !any_respawn_in_flight(crash_history)
+            {
+                return LoopAction::Exit;
+            }
+        }
         // Successful prompt — return agent to pool.
         PromptOutcome::Ok(_) => {
             tracing::debug!(
@@ -5567,13 +5585,14 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
-            let is_transport_error = matches!(
-                e,
-                acp::AcpError::Io(_)
-                    | acp::AcpError::WriteTimeout(_)
-                    | acp::AcpError::Timeout(_)
-                    | acp::AcpError::Protocol(_)
-            );
+            let is_transport_error = result.agent.acp.is_shutdown()
+                || matches!(
+                    e,
+                    acp::AcpError::Io(_)
+                        | acp::AcpError::WriteTimeout(_)
+                        | acp::AcpError::Timeout(_)
+                        | acp::AcpError::Protocol(_)
+                );
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,

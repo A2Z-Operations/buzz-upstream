@@ -148,6 +148,8 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Retirement is independent of the terminal result of its last prompt.
+    shutdown: bool,
     /// Sole stdin writer; None after an interrupted/failed frame closes it.
     stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -425,12 +427,18 @@ fn build_client_capabilities() -> serde_json::Value {
 }
 
 impl AcpClient {
+    /// Whether shutdown has started and this client must never be reused.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown
+    }
+
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        self.shutdown = true;
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -596,6 +604,7 @@ impl AcpClient {
             };
         cmd.envs(launch_env.iter().cloned());
         cmd.env_remove(launch::PREFIX_ENV);
+        cmd.env_remove("BUZZ_ACP_DELIVERY_JOURNAL");
         let claude_thinking_summaries = standard_adapter == Some(StandardAdapterKind::Claude)
             && !launch_prefixed
             && claude_cli_accepts_thinking_display(&cmd).await;
@@ -617,6 +626,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            shutdown: false,
             stdin: Some(stdin),
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -1758,13 +1768,11 @@ impl AcpClient {
                                     // Until its outcome is known a detached turn may be running.
                                     self.shutdown().await;
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                                        let _ = ack_tx.send(crate::pool::SteerAck::Err(
-                                            crate::pool::SteerError::Transport(
-                                                "prompt ended before steering outcome".into(),
-                                            ),
-                                        ));
+                                        let _ = ack_tx
+                                            .send(crate::pool::SteerAck::PromptCompletedNeutral);
                                     }
-                                    return Err(AcpError::AgentExited);
+                                    // Preserve the original terminal response below. Retiring
+                                    // a worker must not replay an already completed request.
                                 }
                                 if let Some(error) = msg.get("error") {
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
@@ -4631,15 +4639,21 @@ sleep 1"#,
                     std::time::Duration::from_secs(5),
                 )
                 .await;
-            assert!(matches!(result, Err(AcpError::AgentExited)), "{result:?}");
+            if original_first {
+                assert_eq!(result.unwrap()["done"], serde_json::json!(true));
+            } else {
+                assert!(matches!(result, Err(AcpError::AgentExited)), "{result:?}");
+            }
             assert!(
                 client.child.try_wait().unwrap().is_some(),
                 "worker must be reaped before retry"
             );
-            assert!(matches!(
-                ack_rx.await.unwrap(),
-                crate::pool::SteerAck::Err(_)
-            ));
+            let ack = ack_rx.await.unwrap();
+            assert!(if original_first {
+                matches!(ack, crate::pool::SteerAck::PromptCompletedNeutral)
+            } else {
+                matches!(ack, crate::pool::SteerAck::Err(_))
+            });
         }
     }
 
