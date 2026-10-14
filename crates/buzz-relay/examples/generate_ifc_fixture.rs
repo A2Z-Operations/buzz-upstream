@@ -95,6 +95,15 @@ fn main() -> anyhow::Result<()> {
         .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x23), &broker)?;
     let memory_slug = "mem/fixture";
     let memory_key = v2::ConversationKey::derive(broker.secret_key(), &human.public_key())?;
+    let mut audience_principals = [human.public_key().to_hex(), broker.public_key().to_hex()];
+    audience_principals.sort();
+    let audience_bytes =
+        serde_json::to_vec(&json!([community, "restricted", audience_principals]))?;
+    let mut scope = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
+    scope.update(b"agent-memory/ifc/v1/scope");
+    scope.update(&[0]);
+    scope.update(&audience_bytes);
+    let memory_namespace = hex::encode(scope.finalize().into_bytes());
     let mut memory_address =
         <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
     memory_address.update(b"agent-memory/v1/d-tag");
@@ -119,6 +128,7 @@ fn main() -> anyhow::Result<()> {
             Tag::parse(["ifc", "1", community, "1792000000"])?,
             Tag::parse(["ifc-source", source, "17"])?,
             Tag::parse(["ifc-owner-memory", owner.as_str()])?,
+            Tag::parse(["s", memory_namespace.as_str()])?,
             Tag::parse(["expected-revision", "none"])?,
         ])
         .custom_created_at(Timestamp::from(1_791_999_920u64))
@@ -163,6 +173,7 @@ fn main() -> anyhow::Result<()> {
             "event": owner_memory,
             "canonical_slug": memory_slug,
             "d_tag": memory_d,
+            "namespace": memory_namespace,
             "plaintext_utf8": memory_plaintext,
             "application_metadata_status": "illustrative until the Kotlin protected IFC object is frozen"
         },

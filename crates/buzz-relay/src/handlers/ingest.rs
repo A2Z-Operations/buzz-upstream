@@ -7017,6 +7017,7 @@ mod postgres_tests {
         let community_text = community.to_string();
         let source_text = source.to_string();
         let expiry = (Utc::now().timestamp() + 120).to_string();
+        let memory_namespace = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let encrypt = |value: &str| {
             nip44::encrypt(
                 agent.secret_key(),
@@ -7035,6 +7036,7 @@ mod postgres_tests {
                         .expect("ifc tag"),
                     Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
                     Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                    Tag::parse(["s", memory_namespace]).expect("memory namespace tag"),
                 ];
                 if let Some(expected_revision) = expected_revision {
                     tags.push(
@@ -7250,6 +7252,78 @@ mod postgres_tests {
             .await,
             Err(IngestError::Rejected(message)) if message == "ifc-invalid"
         ));
+        let duplicate_namespace_tag =
+            Tag::parse(["s", memory_namespace]).expect("duplicate namespace tag");
+        let duplicate_namespace = memory(
+            now + 7,
+            "duplicate namespace",
+            Some(tombstone_id.as_str()),
+            &[duplicate_namespace_tag],
+        );
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                duplicate_namespace.clone(),
+                http()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        let missing_namespace_template = memory(
+            now + 7,
+            "missing namespace template",
+            Some(tombstone_id.as_str()),
+            &[],
+        );
+        let mut missing_namespace_tags = missing_namespace_template.tags;
+        missing_namespace_tags.retain(|tag| {
+            tag.as_slice()
+                .first()
+                .is_none_or(|name| name.as_str() != "s")
+        });
+        let missing_namespace = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt("missing namespace"),
+        )
+        .tags(missing_namespace_tags.clone())
+        .custom_created_at(Timestamp::from(now + 7))
+        .sign_with_keys(&agent)
+        .expect("sign missing-namespace memory");
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                missing_namespace.clone(),
+                websocket()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        missing_namespace_tags.push(
+            Tag::parse(["memory-scope", memory_namespace]).expect("substitute namespace tag"),
+        );
+        let substituted_namespace = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt("substituted namespace"),
+        )
+        .tags(missing_namespace_tags)
+        .custom_created_at(Timestamp::from(now + 7))
+        .sign_with_keys(&agent)
+        .expect("sign substituted-namespace memory");
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                substituted_namespace.clone(),
+                http()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
         let bad_cipher = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), "not-nip44")
             .tags(memory(now + 7, "template", Some(tombstone_id.as_str()), &[]).tags)
             .custom_created_at(Timestamp::from(now + 7))
@@ -7277,6 +7351,9 @@ mod postgres_tests {
             missing_precondition.id.as_bytes().as_slice(),
             malformed_precondition.id.as_bytes().as_slice(),
             duplicate_precondition.id.as_bytes().as_slice(),
+            duplicate_namespace.id.as_bytes().as_slice(),
+            missing_namespace.id.as_bytes().as_slice(),
+            substituted_namespace.id.as_bytes().as_slice(),
             bad_cipher.id.as_bytes().as_slice(),
         ])
         .fetch_one(&pool)

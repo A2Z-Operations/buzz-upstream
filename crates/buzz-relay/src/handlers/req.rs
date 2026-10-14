@@ -951,7 +951,7 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 ///
 /// Pushed constraints: kinds, authors (single or multi), ids, since, until,
 /// authorized channel scope (#h single or multi, injected by caller), #p (single),
-/// #d (single, NIP-33-only kinds), #e (any).
+/// #d (single, NIP-33-only kinds), #e (any), #s (single, kind 30174 only).
 ///
 /// Anything else (multi-#p, #t, #a, search, #d on non-NIP-33) requires
 /// post-filtering and cannot use the fast COUNT path.
@@ -962,6 +962,12 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
             && ks
                 .iter()
                 .all(|k| buzz_core::kind::is_parameterized_replaceable(k.as_u16() as u32))
+    });
+    let is_owner_memory_only = filter.kinds.as_ref().is_some_and(|ks| {
+        !ks.is_empty()
+            && ks
+                .iter()
+                .all(|kind| kind.as_u16() as u32 == KIND_AGENT_ENGRAM)
     });
 
     for (tag_key, tag_values) in filter.generic_tags.iter() {
@@ -986,6 +992,13 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
             }
             "e" => {
                 // #e is fully pushed (any count) via JSONB containment.
+            }
+            "s" => {
+                // A single owner-memory namespace is pushed through the
+                // existing JSONB containment predicate before SQL LIMIT.
+                if tag_values.len() != 1 || !is_owner_memory_only {
+                    return false;
+                }
             }
             _ => {
                 // Any other generic tag (#t, #a, etc.) is not pushed.
@@ -1161,6 +1174,22 @@ fn filter_to_query_params(
         .filter(|values| !values.is_empty())
         .map(|values| values.iter().map(|v| v.to_string()).collect());
 
+    // Fenced owner-memory lists use one opaque audience namespace. Push that
+    // exact signed tag through the existing JSONB containment predicate before
+    // SQL LIMIT. Mixed-kind and multi-namespace filters retain the generic
+    // post-filter path so other kind semantics are unchanged.
+    let s_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::S);
+    let custom_tag = kinds
+        .as_ref()
+        .is_some_and(|values| {
+            !values.is_empty() && values.iter().all(|kind| *kind == KIND_AGENT_ENGRAM as i32)
+        })
+        .then(|| filter.generic_tags.get(&s_tag_key))
+        .flatten()
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values.iter().next())
+        .map(|value| ("s".to_owned(), value.to_string()));
+
     EventQuery {
         channel_id,
         kinds,
@@ -1175,6 +1204,7 @@ fn filter_to_query_params(
         ids,
         e_tags,
         d_tag_values,
+        custom_tag,
         ..EventQuery::for_community(community)
     }
 }
@@ -2474,6 +2504,49 @@ mod tests {
             .limit(1);
         let q = filter_to_query_params(&other, None, community);
         assert_eq!(q.d_tag_values, None);
+    }
+
+    #[test]
+    fn owner_memory_namespace_is_pushed_only_for_one_exact_scope() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let s = nostr::SingleLetterTag::lowercase(nostr::Alphabet::S);
+        let namespace = "ab".repeat(32);
+        let memory = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tag(s, namespace.as_str())
+            .limit(1);
+        let query = filter_to_query_params(&memory, None, community);
+        assert_eq!(query.custom_tag, Some(("s".to_owned(), namespace.clone())));
+        assert!(filter_fully_pushable(&memory));
+
+        let mixed = memory.clone().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_STREAM_MESSAGE as u16,
+        ));
+        assert_eq!(
+            filter_to_query_params(&mixed, None, community).custom_tag,
+            None
+        );
+        assert!(!filter_fully_pushable(&mixed));
+
+        let multiple = Filter::new()
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tags(s, [namespace.as_str(), "cdcd"]);
+        assert_eq!(
+            filter_to_query_params(&multiple, None, community).custom_tag,
+            None
+        );
+        assert!(!filter_fully_pushable(&multiple));
+
+        let other = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_STREAM_MESSAGE as u16,
+            ))
+            .custom_tag(s, namespace.as_str());
+        assert_eq!(
+            filter_to_query_params(&other, None, community).custom_tag,
+            None
+        );
+        assert!(!filter_fully_pushable(&other));
     }
 
     #[test]

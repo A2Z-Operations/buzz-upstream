@@ -794,6 +794,11 @@ mod postgres_tests {
                 ])
                 .expect("source tag"),
                 Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                Tag::parse([
+                    "s",
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                ])
+                .expect("memory namespace tag"),
                 Tag::parse(["expected-revision", revision_and_timing.0])
                     .expect("expected revision tag"),
             ])

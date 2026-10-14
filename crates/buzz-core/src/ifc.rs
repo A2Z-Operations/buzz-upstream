@@ -67,6 +67,8 @@ pub enum IfcPublicationTarget {
         owner_pubkey: String,
         /// Opaque HMAC address used by the existing memory protocol.
         d_tag: String,
+        /// Opaque audience namespace carried by the signed event.
+        namespace: String,
         /// Exact head or absence frozen into the signed publication.
         expected_head: IfcMemoryExpectedHead,
     },
@@ -222,6 +224,7 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
         let owner_pubkey = owner_memory.ok_or_else(|| invalid("missing ifc-owner-memory tag"))?;
         let mut d_tag = None;
         let mut p_tag = None;
+        let mut namespace = None;
         let mut expected_head = None;
         for tag in event.tags.iter() {
             let parts = tag.as_slice();
@@ -235,6 +238,9 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
                 "p" if p_tag.is_none() && parts.len() == 2 && lowercase_hex_32(&parts[1]) => {
                     p_tag = Some(parts[1].clone());
                 }
+                "s" if namespace.is_none() && parts.len() == 2 && lowercase_hex_32(&parts[1]) => {
+                    namespace = Some(parts[1].clone());
+                }
                 "expected-revision" if expected_head.is_none() && parts.len() == 2 => {
                     expected_head = Some(parse_memory_expected_head(&parts[1])?);
                 }
@@ -244,6 +250,8 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
         }
         let d_tag = d_tag.ok_or_else(|| invalid("owner memory requires one opaque d tag"))?;
         let p_tag = p_tag.ok_or_else(|| invalid("owner memory requires one owner p tag"))?;
+        let namespace =
+            namespace.ok_or_else(|| invalid("owner memory requires one opaque s tag"))?;
         let expected_head = expected_head
             .ok_or_else(|| invalid("owner memory requires one expected-revision tag"))?;
         if p_tag != owner_pubkey {
@@ -252,6 +260,7 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
         IfcPublicationTarget::OwnerMemory {
             owner_pubkey,
             d_tag,
+            namespace,
             expected_head,
         }
     } else {
@@ -423,6 +432,7 @@ mod tests {
     fn parses_closed_owner_memory_fence() {
         let owner = "2222222222222222222222222222222222222222222222222222222222222222";
         let d_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let namespace = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let parsed = parse_publication_fence(&event(
             KIND_AGENT_ENGRAM,
             &[
@@ -436,6 +446,7 @@ mod tests {
                 ],
                 &["ifc-source", "11111111-1111-4111-8111-111111111111", "17"],
                 &["ifc-owner-memory", owner],
+                &["s", namespace],
                 &["expected-revision", "none"],
             ],
         ))
@@ -446,6 +457,7 @@ mod tests {
             IfcPublicationTarget::OwnerMemory {
                 owner_pubkey: owner.to_owned(),
                 d_tag: d_tag.to_owned(),
+                namespace: namespace.to_owned(),
                 expected_head: IfcMemoryExpectedHead::Absent,
             }
         );
@@ -455,6 +467,7 @@ mod tests {
     fn parses_owner_memory_expected_event_head() {
         let owner = "2222222222222222222222222222222222222222222222222222222222222222";
         let d_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let namespace = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let parsed = parse_publication_fence(&event(
             KIND_AGENT_ENGRAM,
@@ -469,6 +482,7 @@ mod tests {
                 ],
                 &["ifc-source", "11111111-1111-4111-8111-111111111111", "17"],
                 &["ifc-owner-memory", owner],
+                &["s", namespace],
                 &["expected-revision", head],
             ],
         ))
@@ -479,6 +493,7 @@ mod tests {
             IfcPublicationTarget::OwnerMemory {
                 owner_pubkey: owner.to_owned(),
                 d_tag: d_tag.to_owned(),
+                namespace: namespace.to_owned(),
                 expected_head: IfcMemoryExpectedHead::Event([0xbb; 32]),
             }
         );
@@ -565,6 +580,10 @@ mod tests {
         ];
         let source = ["ifc-source", "11111111-1111-4111-8111-111111111111", "17"];
         let expected = ["expected-revision", "none"];
+        let namespace = [
+            "s",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ];
         for tags in [
             vec![&["d", d_tag][..], &["p", owner], &common, &source],
             vec![
@@ -573,6 +592,7 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &expected,
             ],
             vec![
@@ -582,6 +602,7 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &expected,
             ],
             vec![
@@ -590,6 +611,7 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &[
                     "expected-revision",
                     "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD",
@@ -601,6 +623,7 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &["expected-revision", "abcd"],
             ],
             vec![
@@ -609,6 +632,7 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &expected,
                 &expected,
             ],
@@ -618,7 +642,47 @@ mod tests {
                 &common,
                 &source,
                 &["ifc-owner-memory", owner],
+                &namespace,
                 &["expected-revision", "none", "extra"],
+            ],
+            vec![
+                &["d", d_tag],
+                &["p", owner],
+                &common,
+                &source,
+                &["ifc-owner-memory", owner],
+                &expected,
+            ],
+            vec![
+                &["d", d_tag],
+                &["p", owner],
+                &common,
+                &source,
+                &["ifc-owner-memory", owner],
+                &namespace,
+                &namespace,
+                &expected,
+            ],
+            vec![
+                &["d", d_tag],
+                &["p", owner],
+                &common,
+                &source,
+                &["ifc-owner-memory", owner],
+                &[
+                    "s",
+                    "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                ],
+                &expected,
+            ],
+            vec![
+                &["d", d_tag],
+                &["p", owner],
+                &common,
+                &source,
+                &["ifc-owner-memory", owner],
+                &["memory-scope", namespace[1]],
+                &expected,
             ],
         ] {
             assert!(parse_publication_fence(&event(KIND_AGENT_ENGRAM, &tags)).is_err());

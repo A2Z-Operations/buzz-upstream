@@ -2850,6 +2850,11 @@ mod tests {
                     .expect("ifc tag"),
                 Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
                 Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                Tag::parse([
+                    "s",
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                ])
+                .expect("memory namespace"),
                 Tag::parse(["expected-revision", "none"]).expect("memory expected revision"),
             ])
             .sign_with_keys(agent)

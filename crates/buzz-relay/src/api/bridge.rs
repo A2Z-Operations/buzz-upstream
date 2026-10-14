@@ -7761,7 +7761,8 @@ pub(crate) mod postgres_tests {
         let community_text = community.to_string();
         let expiry = (chrono::Utc::now().timestamp() + 120).to_string();
         let memory_key = conversation_key(agent.secret_key(), &owner.public_key());
-        let memory_event = |slug: &str, fenced: bool| {
+        let namespace = "ab".repeat(32);
+        let memory_event = |slug: &str, fenced: bool, namespace: Option<&str>| {
             let d = d_tag(&memory_key, slug);
             let ciphertext = nip44::encrypt(
                 agent.secret_key(),
@@ -7780,6 +7781,8 @@ pub(crate) mod postgres_tests {
                         .expect("ifc tag"),
                     Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
                     Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                    Tag::parse(["s", namespace.expect("fenced memory namespace")])
+                        .expect("memory namespace"),
                     Tag::parse(["expected-revision", "none"]).expect("memory expected revision"),
                 ]);
             }
@@ -7788,8 +7791,8 @@ pub(crate) mod postgres_tests {
                 .sign_with_keys(&agent)
                 .expect("sign memory")
         };
-        let fenced = memory_event("read/fenced", true);
-        let legacy = memory_event("read/legacy", false);
+        let fenced = memory_event("read/fenced", true, Some(namespace.as_str()));
+        let legacy = memory_event("read/legacy", false, None);
         for event in [&fenced, &legacy] {
             let body = serde_json::to_vec(event).expect("serialize memory");
             let (status, response) =
@@ -7798,6 +7801,92 @@ pub(crate) mod postgres_tests {
             assert_eq!(status, axum::http::StatusCode::OK, "{response}");
             assert!(response.contains(r#""accepted":true"#), "{response}");
         }
+
+        // Seed more unrelated namespaces than the COUNT fallback budget in one
+        // isolated-Postgres statement. They are newer than the target, so
+        // removing the #s SQL predicate either loses the target behind LIMIT 1
+        // or trips the exact-count candidate budget.
+        let distractor_count = crate::handlers::req::COUNT_FALLBACK_CANDIDATE_LIMIT + 1;
+        sqlx::query(
+            r#"
+            INSERT INTO events
+                (community_id, id, pubkey, created_at, kind, tags, content, sig,
+                 received_at, channel_id, d_tag)
+            SELECT
+                $1,
+                decode(lpad(to_hex(g + 3000000), 64, '0'), 'hex'),
+                $2,
+                to_timestamp($3) + g * interval '1 second',
+                30174,
+                jsonb_build_array(
+                    jsonb_build_array('d', lpad(to_hex(g + 2000000), 64, '0')),
+                    jsonb_build_array('p', $4::text),
+                    jsonb_build_array('ifc', '1', $5::text, $6::text),
+                    jsonb_build_array('ifc-source', $7::text, '1'),
+                    jsonb_build_array('ifc-owner-memory', $4::text),
+                    jsonb_build_array('s', lpad(to_hex(g + 1000000), 64, '0')),
+                    jsonb_build_array('expected-revision', 'none')
+                ),
+                $8,
+                $9,
+                clock_timestamp(),
+                NULL,
+                lpad(to_hex(g + 2000000), 64, '0')
+            FROM generate_series(1, $10::bigint) AS series(g)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(community.as_uuid())
+        .bind(agent.public_key().to_bytes().to_vec())
+        .bind(fenced.created_at.as_secs() as i64)
+        .bind(&owner_hex)
+        .bind(&community_text)
+        .bind(&expiry)
+        .bind(&source_text)
+        .bind(&fenced.content)
+        .bind(fenced.sig.serialize().to_vec())
+        .bind(distractor_count)
+        .execute(state.db.pool())
+        .await
+        .expect("seed unrelated memory namespaces");
+
+        let scoped_body = serde_json::to_vec(&[serde_json::json!({
+            "authors": [agent.public_key().to_hex()],
+            "kinds": [KIND_AGENT_ENGRAM],
+            "#s": [namespace.clone()],
+            "limit": 1
+        })])
+        .expect("serialize scoped memory filter");
+        let (status, bytes) = post_read_route(
+            state.clone(),
+            &host,
+            "/query",
+            &agent.public_key().to_hex(),
+            &scoped_body,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let scoped_events: Vec<nostr::Event> =
+            serde_json::from_slice(&bytes).expect("scoped memory query");
+        assert_eq!(
+            scoped_events
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            [fenced.id]
+        );
+        let (status, bytes) = post_read_route(
+            state.clone(),
+            &host,
+            "/count",
+            &agent.public_key().to_hex(),
+            &scoped_body,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let scoped_count: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("scoped memory count");
+        assert_eq!(scoped_count["count"], 1);
 
         let no_kind = serde_json::to_vec(&[serde_json::json!({
             "ids": [fenced.id.to_hex()]
@@ -7891,6 +7980,43 @@ pub(crate) mod postgres_tests {
             events.iter().map(|event| event.id).collect::<Vec<_>>(),
             [legacy.id]
         );
+
+        let s_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::S);
+        let scoped_filter = nostr::Filter::new()
+            .author(agent.public_key())
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tag(s_tag, namespace.as_str())
+            .limit(1);
+        let scoped_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &agent,
+            Some(owner.public_key()),
+            scoped_filter.clone(),
+            false,
+        )
+        .await;
+        assert!(scoped_frames
+            .iter()
+            .any(|frame| frame.contains(&fenced.id.to_hex())));
+        assert!(!scoped_frames
+            .iter()
+            .any(|frame| frame.contains("restricted: count filter requires narrower constraints")));
+        let scoped_count_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &agent,
+            Some(owner.public_key()),
+            scoped_filter,
+            true,
+        )
+        .await;
+        assert!(scoped_count_frames
+            .iter()
+            .any(|frame| frame.contains(r#""count":1"#)));
+        assert!(!scoped_count_frames
+            .iter()
+            .any(|frame| frame.contains("requires narrower constraints")));
 
         let id_filter = nostr::Filter::new().id(fenced.id);
         let agent_frames = ws_read_frames(

@@ -560,13 +560,17 @@ mod tests {
         let expected_d = fixture["owner_memory"]["d_tag"]
             .as_str()
             .expect("memory d tag");
+        let expected_namespace = fixture["owner_memory"]["namespace"]
+            .as_str()
+            .expect("memory namespace");
         assert!(matches!(
             memory_fence.target,
             IfcPublicationTarget::OwnerMemory {
                 ref d_tag,
+                ref namespace,
                 expected_head: IfcMemoryExpectedHead::Absent,
                 ..
-            } if d_tag == expected_d
+            } if d_tag == expected_d && namespace == expected_namespace
         ));
         let broker = Keys::parse(
             fixture["test_keys"]["broker_secret_hex"]
