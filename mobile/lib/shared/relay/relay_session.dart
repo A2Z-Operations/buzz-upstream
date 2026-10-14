@@ -413,6 +413,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   int get debugPendingRelayAdmissions => _pendingRelayAdmissions;
 
   @visibleForTesting
+  int get debugBufferedEventCount => _eventBuffer.length;
+
+  @visibleForTesting
   void debugSupersedeConnection() {
     _connectionGeneration++;
     _retireLiveVerification();
@@ -888,9 +891,18 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       if (_recentDeliveryKeys.length >= _maxRecentDeliveryKeys) {
         _recentDeliveryKeys.clear();
       }
-      _recentDeliveryKeys.add(deliveryKey);
 
       sub.onEvent(buffered.event);
+      // A callback that throws has not durably consumed the event, so do not
+      // let it move the reconnect cursor past data the consumer may still need.
+      // A callback may also unsubscribe synchronously; that retired owner no
+      // longer needs dedup or replay state.
+      if (_liveSubscriptions[buffered.subId] != sub) continue;
+      _recentDeliveryKeys.add(deliveryKey);
+      if (sub.lastSeenCreatedAt == null ||
+          buffered.event.createdAt > sub.lastSeenCreatedAt!) {
+        sub.lastSeenCreatedAt = buffered.event.createdAt;
+      }
     }
   }
 

@@ -1326,35 +1326,83 @@ void main() {
     );
   }
 
-  test('retryable CLOSED drops an already verified buffered event', () async {
-    final verification = Completer<List<Map<String, dynamic>?>>();
-    final timers = <_ManualTimer>[];
-    final socket = _RecordingRelaySocket();
-    final delivered = <NostrEvent>[];
-    final session = RelaySessionNotifier(
-      verifyEventBatch: (_) => verification.future,
-      retryTimerFactory: (duration, callback) {
-        final timer = _ManualTimer(duration, callback);
-        timers.add(timer);
-        return timer;
-      },
-    );
-    session.debugAttachSocketForTest(socket);
-    final subscribe = session.subscribe(_channelFilter, delivered.add);
-    session.debugHandleMessage(['EOSE', 'l-1']);
-    final unsubscribe = await subscribe;
-    final stale = _signedEvent(createdAt: 30);
+  test(
+    'retryable CLOSED replays all dropped verified buffered events',
+    () async {
+      final heldVerification = Completer<List<Map<String, dynamic>?>>();
+      var verificationCalls = 0;
+      final timers = <_ManualTimer>[];
+      final socket = _RecordingRelaySocket();
+      final delivered = <NostrEvent>[];
+      final session = RelaySessionNotifier(
+        verifyEventBatch: (events) {
+          verificationCalls++;
+          if (verificationCalls == 2) return heldVerification.future;
+          return Future.value([
+            for (final event in events) event as Map<String, dynamic>,
+          ]);
+        },
+        retryTimerFactory: (duration, callback) {
+          final timer = _ManualTimer(duration, callback);
+          timers.add(timer);
+          return timer;
+        },
+      );
+      session.debugAttachSocketForTest(socket);
+      final subscribe = session.subscribe(_channelFilter, delivered.add);
+      session.debugHandleMessage(['EOSE', 'l-1']);
+      final unsubscribe = await subscribe;
+      final alreadyDelivered = _signedEvent(
+        createdAt: 10,
+        content: 'already delivered',
+      );
+      final droppedEarlier = _signedEvent(
+        createdAt: 20,
+        content: 'dropped earlier',
+      );
+      final droppedLater = _signedEvent(
+        createdAt: 100,
+        content: 'dropped later',
+      );
 
-    session.debugHandleMessage(['EVENT', 'l-1', stale.toJson()]);
-    verification.complete([stale.toJson()]);
-    await _waitUntil(() => session.debugPendingRelayAdmissions == 0);
-    session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
-    await Future<void>.delayed(const Duration(milliseconds: 30));
+      session.debugHandleMessage(['EVENT', 'l-1', alreadyDelivered.toJson()]);
+      await _waitUntil(() => delivered.length == 1);
 
-    expect(delivered, isEmpty);
-    expect(timers.single.isActive, isTrue);
-    unsubscribe();
-  });
+      session.debugHandleMessage(['EVENT', 'l-1', droppedEarlier.toJson()]);
+      session.debugHandleMessage(['EVENT', 'l-1', droppedLater.toJson()]);
+      await _waitUntil(() => verificationCalls == 2);
+      heldVerification.complete([
+        droppedEarlier.toJson(),
+        droppedLater.toJson(),
+      ]);
+      await _waitUntil(() => session.debugBufferedEventCount == 2);
+
+      session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
+      expect(delivered, [alreadyDelivered]);
+      expect(session.debugBufferedEventCount, 0);
+      expect(timers.single.isActive, isTrue);
+
+      timers.single.fire();
+      await Future<void>.delayed(Duration.zero);
+      final firstReplayReq = _reqs(socket).where((req) => req[1] == 'l-1').last;
+      expect(firstReplayReq[2]['since'], 5);
+
+      session.debugHandleMessage(['EVENT', 'l-1', droppedEarlier.toJson()]);
+      session.debugHandleMessage(['EVENT', 'l-1', droppedLater.toJson()]);
+      session.debugHandleMessage(['EOSE', 'l-1']);
+      await _waitUntil(() => delivered.length == 3);
+      expect(delivered, [alreadyDelivered, droppedEarlier, droppedLater]);
+
+      session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
+      timers.last.fire();
+      await Future<void>.delayed(Duration.zero);
+      final secondReplayReq = _reqs(
+        socket,
+      ).where((req) => req[1] == 'l-1').last;
+      expect(secondReplayReq[2]['since'], 95);
+      unsubscribe();
+    },
+  );
 
   test('local OK acknowledgment bypasses pending verification', () async {
     final verification = Completer<List<Map<String, dynamic>?>>();

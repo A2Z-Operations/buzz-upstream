@@ -91,13 +91,10 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
         liveSub.pendingVerificationBytes -= encodedBytes;
         if (event == null) return;
 
-        // Only a verified event can prove activity or advance replay state.
+        // Only a verified event can prove relay activity. Replay progress is
+        // recorded later, after the event reaches the subscription callback.
         _resetClosedRetry(liveSub);
         liveSub.validEventFrames++;
-        if (liveSub.lastSeenCreatedAt == null ||
-            event.createdAt > liveSub.lastSeenCreatedAt!) {
-          liveSub.lastSeenCreatedAt = event.createdAt;
-        }
         _eventBuffer.add(_BufferedEvent(subId, event));
         _scheduleFlush();
       });
