@@ -3326,6 +3326,8 @@ pub async fn guard_community_write(
     // Refuse it before reading state; READ COMMITTED takes a fresh snapshot
     // for the state query after any wait for the deletion lock.
     if isolation != "read committed" {
+        tracing::error!(%isolation, %community, "community write admission requires read committed isolation");
+        // AccessDenied deliberately refuses writes; the log distinguishes config errors from fences.
         return Err(DbError::AccessDenied(format!(
             "community write admission requires read committed isolation, got {isolation}"
         )));
@@ -7320,6 +7322,80 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
             Some("57014"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_acquire_waits_for_fence_lock_then_refuses() {
+        let db = Db::new(&DbConfig {
+            database_url: crate::test_support::database_url(),
+            max_connections: 5,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect isolated test DB");
+        let community = db
+            .ensure_configured_community("lease-fence-lock.example")
+            .await
+            .expect("active community")
+            .id;
+        let mut fence_tx = db.pool.begin().await.expect("begin fence transaction");
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(community.as_uuid())
+            .execute(&mut *fence_tx)
+            .await
+            .expect("hold exclusive deletion lock");
+
+        let store = db.deletion_store();
+        let mut acquisition = tokio::spawn(async move {
+            store
+                .acquire_serving_write_lease(
+                    community,
+                    "fence_lock_test",
+                    "test-owner",
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut acquisition)
+                .await
+                .is_err(),
+            "lease acquisition must wait for the exclusive deletion lock"
+        );
+
+        sqlx::query(
+            "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                    set_config('buzz.deletion_fence_generation', \
+                        (SELECT deletion_fence_generation::text FROM communities WHERE id = $2), true)",
+        )
+        .bind(community.to_string())
+        .bind(community.as_uuid())
+        .execute(&mut *fence_tx)
+        .await
+        .expect("authorize fence transition");
+        sqlx::query("UPDATE communities SET deletion_state = 'fenced' WHERE id = $1")
+            .bind(community.as_uuid())
+            .execute(&mut *fence_tx)
+            .await
+            .expect("fence community while holding the lock");
+        fence_tx.commit().await.expect("commit fence");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), acquisition)
+            .await
+            .expect("acquisition completes after fence commit")
+            .expect("acquisition task")
+            .expect_err("fenced community refuses a new lease");
+        assert!(matches!(error, DbError::AccessDenied(_)), "{error:?}");
+        let leases: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM community_serving_write_leases WHERE community_id = $1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count serving leases");
+        assert_eq!(leases, 0, "refused acquisition must not persist a lease");
     }
 
     #[tokio::test]

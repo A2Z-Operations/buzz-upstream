@@ -2822,18 +2822,19 @@ mod postgres_tests {
             .begin_quiescing(&claim.lease)
             .await
             .expect("quiesce");
+        let error = services
+            .store
+            .acquire_serving_write_lease(
+                community,
+                "late_external",
+                "late-owner",
+                DEFAULT_LEASE_DURATION,
+            )
+            .await
+            .expect_err("quiescing must reject newly admitted work");
         assert!(
-            services
-                .store
-                .acquire_serving_write_lease(
-                    community,
-                    "late_external",
-                    "late-owner",
-                    DEFAULT_LEASE_DURATION,
-                )
-                .await
-                .is_err(),
-            "quiescing must reject newly admitted work"
+            matches!(error, buzz_db::DbError::AccessDenied(_)),
+            "{error:?}"
         );
 
         let completed = Arc::new(AtomicBool::new(false));
