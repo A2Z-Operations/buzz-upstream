@@ -209,13 +209,8 @@ pub async fn resolve_author(client: &BuzzClient, author_flag: &str) -> Result<Pu
         return PublicKey::from_hex(author_flag)
             .map_err(|e| CliError::Usage(format!("invalid pubkey: {e}")));
     }
-    // Petname lookup: NIP-50 search on kind:0, then exact-name filter.
-    let filter = serde_json::json!({
-        "kinds": [0],
-        "search": author_flag,
-        "limit": 100,
-    });
-    let raw = client.query(&filter).await?;
+    // Petname lookup: profile name search, then exact-name filter.
+    let raw = crate::profile_search::search_profiles(client, author_flag, 100).await?;
     let events = parse_events(&raw)?;
     let lower = author_flag.to_ascii_lowercase();
     let matches: Vec<&Event> = events

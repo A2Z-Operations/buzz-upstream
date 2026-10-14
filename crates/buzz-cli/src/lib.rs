@@ -4,6 +4,7 @@ mod commands;
 mod error;
 mod help_tree;
 mod links;
+mod profile_search;
 mod validate;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};

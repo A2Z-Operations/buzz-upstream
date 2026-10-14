@@ -514,7 +514,7 @@ pub async fn cmd_search(
 /// Resolve an `--author` value to a 64-char hex pubkey.
 ///
 /// Accepts, in order of precedence: 64-char hex (validated), an `npub1…`
-/// bech32 key, or a display name resolved via NIP-50 profile search. A name
+/// bech32 key, or a display name resolved via profile name search. A name
 /// must match exactly one user (case-insensitive, on `display_name` or
 /// `name`) — ambiguity is an error listing the candidates rather than a
 /// silent mix of authors.
@@ -529,13 +529,8 @@ async fn resolve_author(client: &BuzzClient, author: &str) -> Result<String, Cli
             .map_err(|_| CliError::Usage(format!("invalid npub: {author}")));
     }
 
-    // Display name → NIP-50 search on kind:0, exact case-insensitive match.
-    let filter = serde_json::json!({
-        "kinds": [0],
-        "search": author,
-        "limit": 100
-    });
-    let raw = client.query(&filter).await?;
+    // Display name → profile name search, exact case-insensitive match.
+    let raw = crate::profile_search::search_profiles(client, author, 100).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
     let mut matches = match_profiles_by_name(&events, author);
     match matches.len() {

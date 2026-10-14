@@ -11,7 +11,7 @@ use crate::validate::validate_hex64;
 ///
 /// - 0 pubkeys, no name → query our own profile
 /// - 1+ pubkeys → query those users' profiles
-/// - --name "foo" → NIP-50 search on kind:0, then client-side filter
+/// - --name "foo" → profile name search, then client-side filter
 pub async fn cmd_get_users(
     client: &BuzzClient,
     pubkeys: &[String],
@@ -283,7 +283,7 @@ fn owner_scoped_profiles(
 }
 
 /// Search for users by display name. Owner-scoped searches resolve managed-agent records
-/// and verify their profiles; unscoped searches use NIP-50 and return [] if unsupported.
+/// and verify their profiles; unscoped searches use the relay's profile name search.
 async fn search_by_name(
     client: &BuzzClient,
     query: &str,
@@ -319,12 +319,7 @@ async fn search_by_name(
         };
         owner_scoped_profiles(&events, &pubkeys, &owner, &effective_owner(client))
     } else {
-        let filter = serde_json::json!({
-            "kinds": [0],
-            "search": query,
-            "limit": 100
-        });
-        let raw = client.query(&filter).await?;
+        let raw = crate::profile_search::search_profiles(client, query, 100).await?;
         let events: Vec<serde_json::Value> = serde_json::from_str(&raw)
             .map_err(|e| CliError::Other(format!("failed to parse response: {e}")))?;
         name_search_profiles(&events, query)
