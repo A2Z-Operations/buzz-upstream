@@ -590,9 +590,10 @@ pub async fn latest_scheduled_workflow_fire(
 /// spawning execution. If run creation fails, leaving `workflow_run_id` NULL is
 /// intentional: the schedule instant was claimed and must not duplicate later.
 ///
-/// Returns `false` when the run is missing or belongs to another workflow.
-/// Workflow delete removes only its own fires before its runs, and the fire→run
-/// FK is NO ACTION, so a cross-workflow link would block that delete.
+/// Returns `false` when no unlinked claim matches, or the run is missing or
+/// belongs to another workflow. Workflow delete removes only its own fires
+/// before its runs, and the fire→run FK is NO ACTION, so a cross-workflow link
+/// would block that delete.
 pub async fn attach_scheduled_workflow_run(
     pool: &PgPool,
     community_id: CommunityId,
