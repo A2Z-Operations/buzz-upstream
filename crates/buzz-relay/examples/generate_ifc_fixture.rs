@@ -119,6 +119,7 @@ fn main() -> anyhow::Result<()> {
             Tag::parse(["ifc", "1", community, "1792000000"])?,
             Tag::parse(["ifc-source", source, "17"])?,
             Tag::parse(["ifc-owner-memory", owner.as_str()])?,
+            Tag::parse(["expected-revision", "none"])?,
         ])
         .custom_created_at(Timestamp::from(1_791_999_920u64))
         .build(broker.public_key())

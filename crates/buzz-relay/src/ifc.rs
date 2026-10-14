@@ -461,7 +461,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use buzz_core::engram::{conversation_key, d_tag, Body};
-    use buzz_core::ifc::{parse_publication_fence, IfcPublicationTarget};
+    use buzz_core::ifc::{parse_publication_fence, IfcMemoryExpectedHead, IfcPublicationTarget};
     use nostr::nips::nip44::v2;
     use nostr::Keys;
 
@@ -562,7 +562,11 @@ mod tests {
             .expect("memory d tag");
         assert!(matches!(
             memory_fence.target,
-            IfcPublicationTarget::OwnerMemory { ref d_tag, .. } if d_tag == expected_d
+            IfcPublicationTarget::OwnerMemory {
+                ref d_tag,
+                expected_head: IfcMemoryExpectedHead::Absent,
+                ..
+            } if d_tag == expected_d
         ));
         let broker = Keys::parse(
             fixture["test_keys"]["broker_secret_hex"]

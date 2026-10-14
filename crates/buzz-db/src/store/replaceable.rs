@@ -33,6 +33,8 @@ pub enum ParameterizedReplacePrecondition<'a> {
     Unconditional,
     /// Require the live head to match this validated event ID.
     ExpectedRevision(&'a [u8]),
+    /// Require the coordinate to have no live head.
+    ExpectNoHead,
     /// Accept only an exact live-head replay and perform no mutation otherwise.
     ExactReplayOnly,
 }
@@ -223,6 +225,15 @@ async fn replace_parameterized_event_in_transaction_impl(
             received_at,
             channel_id,
             ParameterizedReplaceStatus::ReplayOnlyMiss,
+        ));
+    }
+
+    if precondition == ParameterizedReplacePrecondition::ExpectNoHead && existing.is_some() {
+        return Ok(ParameterizedReplaceResult::new(
+            event,
+            received_at,
+            channel_id,
+            ParameterizedReplaceStatus::RevisionMismatch,
         ));
     }
 
@@ -1323,6 +1334,28 @@ mod postgres_tests {
         );
         tx.rollback().await.expect("roll back stale revision tx");
 
+        let mut tx = db
+            .begin_event_write_transaction(community)
+            .await
+            .expect("begin occupied-coordinate tx");
+        let occupied = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                &new,
+                &d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::ExpectNoHead,
+            )
+            .await
+            .expect("evaluate occupied coordinate");
+        assert_eq!(
+            occupied.status,
+            replaceable::ParameterizedReplaceStatus::RevisionMismatch
+        );
+        tx.rollback()
+            .await
+            .expect("roll back occupied-coordinate tx");
+
         let missing_d_tag = format!("missing-project-{}", Uuid::new_v4().simple());
         let missing = EventBuilder::new(
             Kind::Custom(buzz_core::kind::KIND_PROJECT as u16),
@@ -1355,6 +1388,26 @@ mod postgres_tests {
             replaceable::ParameterizedReplaceStatus::RevisionMissing
         );
         tx.rollback().await.expect("roll back missing revision tx");
+
+        let mut tx = db
+            .begin_event_write_transaction(community)
+            .await
+            .expect("begin absent-coordinate tx");
+        let absent = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                &missing,
+                &missing_d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::ExpectNoHead,
+            )
+            .await
+            .expect("insert absent coordinate");
+        assert_eq!(
+            absent.status,
+            replaceable::ParameterizedReplaceStatus::Inserted
+        );
+        tx.rollback().await.expect("roll back absent-coordinate tx");
     }
 
     #[tokio::test]

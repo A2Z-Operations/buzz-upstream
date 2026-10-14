@@ -7026,22 +7026,29 @@ mod postgres_tests {
             )
             .expect("encrypt memory")
         };
-        let memory = |created_at: u64, value: &str, extra: &[Tag]| {
-            let mut tags = vec![
-                Tag::parse(["d", d.as_str()]).expect("d tag"),
-                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
-                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
-                    .expect("ifc tag"),
-                Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
-                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
-            ];
-            tags.extend_from_slice(extra);
-            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt(value))
-                .tags(tags)
-                .custom_created_at(Timestamp::from(created_at))
-                .sign_with_keys(&agent)
-                .expect("sign fenced memory")
-        };
+        let memory =
+            |created_at: u64, value: &str, expected_revision: Option<&str>, extra: &[Tag]| {
+                let mut tags = vec![
+                    Tag::parse(["d", d.as_str()]).expect("d tag"),
+                    Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                    Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                        .expect("ifc tag"),
+                    Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
+                    Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                ];
+                if let Some(expected_revision) = expected_revision {
+                    tags.push(
+                        Tag::parse(["expected-revision", expected_revision])
+                            .expect("expected revision tag"),
+                    );
+                }
+                tags.extend_from_slice(extra);
+                EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt(value))
+                    .tags(tags)
+                    .custom_created_at(Timestamp::from(created_at))
+                    .sign_with_keys(&agent)
+                    .expect("sign fenced memory")
+            };
         let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
         let http = || IngestAuth::Http {
             pubkey: agent.public_key(),
@@ -7055,17 +7062,105 @@ mod postgres_tests {
             conn_id: Uuid::new_v4(),
         };
         let now = Utc::now().timestamp() as u64;
-        let first = memory(now, "first", &[]);
+        let first = memory(now, "first", Some("none"), &[]);
+        let conn_id = Uuid::new_v4();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(4);
+        state.conn_manager.register(
+            conn_id,
+            event_tx,
+            control_tx,
+            tokio::sync::mpsc::channel(1).0,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            community,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        );
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, owner.public_key().to_bytes().to_vec());
+        state.sub_registry.register_scoped(
+            community,
+            conn_id,
+            "memory-cas-retry".to_owned(),
+            vec![nostr::Filter::new()
+                .kind(Kind::Custom(KIND_AGENT_ENGRAM as u16))
+                .id(first.id)],
+            None,
+        );
         ingest_event_inner(&state, &tracer, &tenant, first.clone(), http())
             .await
             .expect("insert first memory");
-        let second = memory(now + 1, "second", &[]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("first fanout deadline")
+                .is_some(),
+            "first acceptance must fan out"
+        );
+        let first_id = first.id.to_hex();
+        let second = memory(now + 1, "second", Some(first_id.as_str()), &[]);
         ingest_event_inner(&state, &tracer, &tenant, second.clone(), websocket())
             .await
             .expect("insert second memory");
-        let stale = memory(now - 1, "stale", &[]);
+        let second_id = second.id.to_hex();
+        let stale = memory(now - 1, "stale", Some(second_id.as_str()), &[]);
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, stale.clone(), http()).await,
+            Err(IngestError::CanvasConflict(message))
+                if message == "conflict: stale owner-memory replacement"
+        ));
+
+        let legacy = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt("legacy"))
+            .tags([
+                Tag::parse(["d", d.as_str()]).expect("legacy d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("legacy p tag"),
+            ])
+            .custom_created_at(Timestamp::from(now + 2))
+            .sign_with_keys(&agent)
+            .expect("sign legacy memory");
+        ingest_event_inner(&state, &tracer, &tenant, legacy.clone(), websocket())
+            .await
+            .expect("insert ordinary unfenced replacement");
+        let raced = memory(now + 3, "raced", Some(second_id.as_str()), &[]);
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, raced.clone(), http()).await,
+            Err(IngestError::CanvasConflict(message))
+                if message == "conflict: stale owner-memory replacement"
+        ));
+
+        let legacy_id = legacy.id.to_hex();
+        let tombstone_ciphertext = nip44::encrypt(
+            agent.secret_key(),
+            &owner.public_key(),
+            format!(r#"{{"slug":"{slug}","value":null}}"#),
+            Version::V2,
+        )
+        .expect("encrypt memory tombstone");
+        let tombstone =
+            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), tombstone_ciphertext)
+                .tags(memory(now + 4, "tombstone template", Some(legacy_id.as_str()), &[]).tags)
+                .custom_created_at(Timestamp::from(now + 4))
+                .sign_with_keys(&agent)
+                .expect("sign memory tombstone");
+        ingest_event_inner(&state, &tracer, &tenant, tombstone.clone(), http())
+            .await
+            .expect("replace memory with encrypted tombstone");
+        let absent_after_tombstone = memory(now + 5, "must conflict", Some("none"), &[]);
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                absent_after_tombstone.clone(),
+                websocket()
+            )
+            .await,
             Err(IngestError::CanvasConflict(message))
                 if message == "conflict: stale owner-memory replacement"
         ));
@@ -7086,8 +7181,15 @@ mod postgres_tests {
             .await
             .expect("historic memory retry");
         assert_eq!(retry.message, "duplicate:");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+                .await
+                .is_err(),
+            "historic acceptance must not fan out again"
+        );
 
-        let stale_source = memory(now + 2, "stale source", &[]);
+        let tombstone_id = tombstone.id.to_hex();
+        let stale_source = memory(now + 6, "stale source", Some(tombstone_id.as_str()), &[]);
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, stale_source.clone(), http()).await,
             Err(IngestError::CanvasConflict(message)) if message == "ifc-policy-changed"
@@ -7095,14 +7197,62 @@ mod postgres_tests {
 
         let destination =
             Tag::parse(["ifc-destination", source_text.as_str(), "2"]).expect("destination tag");
-        let malformed = memory(now + 2, "malformed", &[destination]);
+        let malformed = memory(
+            now + 6,
+            "malformed",
+            Some(tombstone_id.as_str()),
+            &[destination],
+        );
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, malformed.clone(), http()).await,
             Err(IngestError::Rejected(message)) if message == "ifc-invalid"
         ));
+        let missing_precondition = memory(now + 7, "missing", None, &[]);
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                missing_precondition.clone(),
+                websocket()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        let malformed_precondition = memory(now + 7, "bad expected", Some("abcd"), &[]);
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                malformed_precondition.clone(),
+                http()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        let duplicate_expected = Tag::parse(["expected-revision", tombstone_id.as_str()])
+            .expect("duplicate expected tag");
+        let duplicate_precondition = memory(
+            now + 7,
+            "duplicate expected",
+            Some(tombstone_id.as_str()),
+            &[duplicate_expected],
+        );
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                duplicate_precondition.clone(),
+                websocket()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
         let bad_cipher = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), "not-nip44")
-            .tags(memory(now + 3, "template", &[]).tags)
-            .custom_created_at(Timestamp::from(now + 3))
+            .tags(memory(now + 7, "template", Some(tombstone_id.as_str()), &[]).tags)
+            .custom_created_at(Timestamp::from(now + 7))
             .sign_with_keys(&agent)
             .expect("sign malformed ciphertext");
         assert!(matches!(
@@ -7117,15 +7267,22 @@ mod postgres_tests {
         .bind(vec![
             first.id.as_bytes().as_slice(),
             second.id.as_bytes().as_slice(),
+            legacy.id.as_bytes().as_slice(),
+            tombstone.id.as_bytes().as_slice(),
             stale.id.as_bytes().as_slice(),
+            raced.id.as_bytes().as_slice(),
+            absent_after_tombstone.id.as_bytes().as_slice(),
             stale_source.id.as_bytes().as_slice(),
             malformed.id.as_bytes().as_slice(),
+            missing_precondition.id.as_bytes().as_slice(),
+            malformed_precondition.id.as_bytes().as_slice(),
+            duplicate_precondition.id.as_bytes().as_slice(),
             bad_cipher.id.as_bytes().as_slice(),
         ])
         .fetch_one(&pool)
         .await
         .expect("count memory production rows");
-        assert_eq!(stored, 2);
+        assert_eq!(stored, 4);
         let active: Vec<(Vec<u8>,)> = sqlx::query_as(
             "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
              AND d_tag=$4 AND deleted_at IS NULL",
@@ -7137,7 +7294,7 @@ mod postgres_tests {
         .fetch_all(&pool)
         .await
         .expect("read memory head");
-        assert_eq!(active, vec![(second.id.as_bytes().to_vec(),)]);
+        assert_eq!(active, vec![(tombstone.id.as_bytes().to_vec(),)]);
     }
 
     /// End-to-end CAS dispatch wiring: a tagged write inserts, a stale same-head

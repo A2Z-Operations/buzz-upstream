@@ -37,10 +37,10 @@
     "event": {
       "content": "AkREREREREREREREREREREREREREREREREREREREREREQpFvZ/ygpdh8oBcoxHeFvIPj5KMRE7gj18SwdfeX5Qsv8BDW9VIdrJoWkmnz0nw78QBsb7HFbjDX21PMHa8CL5ot5ULx1c/BOEU4tarpV0XACUUICh9rMtp5BFgXoJMTNbe5ZRRuUFpO1UP1lU9yYNIbuLE7J+jKQLGalyDNe5liOxmA0Zs4V54zLCOuf7PWQvBdeDTgrhWcu7IFe+uJe3pm6qBv7wu9e5/882VunBBPRQN/bI2m18Wn+w+aAmLqkewdsw6JzeahGt9lbBVVRO8mgFG4yIK/OAe7XP6czR9O/vj3Aoysuh5NI06W9SNjPjNyKTgZAyjS9NE9WmCLD4MiMZs4zeuaT3QF5eu1YwLyPGbXv3PVaqeR6eszCqJF1y6BZ52HqcLm0VKkjc0KFRJLcCqImqyDaBQGBbmfEpa7YfyOLKEmXFloSjxdTP6cBxeHMojOogDpSih1xha8+6Hy",
       "created_at": 1791999920,
-      "id": "1386ef4d498595826ff186e25fa7324c7f41ec0d1af8e43d506cf8c5d7879c3d",
+      "id": "3f75f3ed90d00a402ab5d9ee0da9692860be6ce62add02734fa92c992c0baeac",
       "kind": 30174,
       "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
-      "sig": "de03b626272d1608821b846e2d2d43e53cc3845820fea23da4f34e64135d01e584d6f7bb7ae1504a6ca4e7a193cf0e92abb0fa4d8b754a2edb6a731ec9e18653",
+      "sig": "eb6cb03ea0ff80c1b291238aef0bb017732d273b8ff9f038098311fa77aa06d7057483cd8dab567eac4d8508154641d5414f096b1105749121acdd89545e8af5",
       "tags": [
         [
           "d",
@@ -64,6 +64,10 @@
         [
           "ifc-owner-memory",
           "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "expected-revision",
+          "none"
         ]
       ]
     },

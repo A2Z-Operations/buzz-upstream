@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use buzz_core::ifc::{IfcPublicationFence, IfcPublicationTarget};
+use buzz_core::ifc::{IfcMemoryExpectedHead, IfcPublicationFence, IfcPublicationTarget};
 use buzz_core::{CommunityId, StoredEvent};
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -436,6 +436,7 @@ impl Db {
             IfcPublicationTarget::OwnerMemory {
                 owner_pubkey,
                 d_tag,
+                ..
             } => {
                 super::replaceable::acquire_parameterized_event_write_lock(&mut tx, event, d_tag)
                     .await?;
@@ -511,17 +512,27 @@ impl Db {
                     IfcPublishOutcome::Inserted(Box::new(stored))
                 }
             }
-            IfcPublicationTarget::OwnerMemory { d_tag, .. } => {
+            IfcPublicationTarget::OwnerMemory {
+                d_tag,
+                expected_head,
+                ..
+            } => {
                 if thread_meta.is_some() || canvas_precondition.is_some() {
                     return Err(IfcError::Invalid);
                 }
+                let precondition = match expected_head {
+                    IfcMemoryExpectedHead::Absent => ParameterizedReplacePrecondition::ExpectNoHead,
+                    IfcMemoryExpectedHead::Event(event_id) => {
+                        ParameterizedReplacePrecondition::ExpectedRevision(event_id.as_slice())
+                    }
+                };
                 let replacement = self
                     .replace_parameterized_event_in_transaction(
                         &mut tx,
                         event,
                         d_tag,
                         None,
-                        ParameterizedReplacePrecondition::Unconditional,
+                        precondition,
                     )
                     .await?;
                 match replacement.status {
@@ -762,14 +773,14 @@ mod postgres_tests {
         community: CommunityId,
         source: (Uuid, i64),
         d_tag: &str,
-        timing: (u64, i64),
+        revision_and_timing: (&str, u64, i64),
         content: &str,
     ) -> Event {
         let owner_hex = owner.public_key().to_hex();
         let source_channel = source.0.to_string();
         let source_generation = source.1.to_string();
         let community_text = community.to_string();
-        let expiry = timing.1.to_string();
+        let expiry = revision_and_timing.2.to_string();
         EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), content)
             .tags([
                 Tag::parse(["d", d_tag]).expect("d tag"),
@@ -783,8 +794,10 @@ mod postgres_tests {
                 ])
                 .expect("source tag"),
                 Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                Tag::parse(["expected-revision", revision_and_timing.0])
+                    .expect("expected revision tag"),
             ])
-            .custom_created_at(Timestamp::from(timing.0))
+            .custom_created_at(Timestamp::from(revision_and_timing.1))
             .sign_with_keys(keys)
             .expect("sign owner memory")
     }
@@ -1540,7 +1553,7 @@ mod postgres_tests {
             community,
             (source, 1),
             d_tag,
-            (now, Utc::now().timestamp() + 120),
+            ("none", now, Utc::now().timestamp() + 120),
             "first ciphertext",
         );
         let first_fence = parse_publication_fence(&first)
@@ -1565,7 +1578,7 @@ mod postgres_tests {
             community,
             (source, 1),
             d_tag,
-            (now + 1, Utc::now().timestamp() + 120),
+            (&first.id.to_hex(), now + 1, Utc::now().timestamp() + 120),
             "second ciphertext",
         );
         let second_fence = parse_publication_fence(&second)
@@ -1590,7 +1603,7 @@ mod postgres_tests {
             community,
             (source, 1),
             d_tag,
-            (now - 1, Utc::now().timestamp() + 120),
+            (&second.id.to_hex(), now - 1, Utc::now().timestamp() + 120),
             "stale ciphertext",
         );
         let stale_fence = parse_publication_fence(&stale)
@@ -1614,6 +1627,38 @@ mod postgres_tests {
             .ifc_event_was_accepted(community, stale.id.as_bytes())
             .await
             .expect("stale receipt"));
+
+        let wrong_head_text = "42".repeat(32);
+        let wrong_head = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 1),
+            d_tag,
+            (&wrong_head_text, now + 2, Utc::now().timestamp() + 120),
+            "wrong expected head",
+        );
+        let wrong_head_fence = parse_publication_fence(&wrong_head)
+            .expect("parse wrong head")
+            .expect("wrong head fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &wrong_head,
+                &wrong_head_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::MemoryConflict(
+                ParameterizedReplaceStatus::RevisionMismatch
+            ))
+        ));
+        assert!(!db
+            .ifc_event_was_accepted(community, wrong_head.id.as_bytes())
+            .await
+            .expect("wrong-head receipt"));
 
         sqlx::query("UPDATE channels SET visibility='open' WHERE community_id=$1 AND id=$2")
             .bind(community.as_uuid())
@@ -1640,7 +1685,7 @@ mod postgres_tests {
             community,
             (source, 2),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            (now + 2, Utc::now().timestamp() + 120),
+            ("none", now + 2, Utc::now().timestamp() + 120),
             "wrong owner ciphertext",
         );
         let wrong_fence = parse_publication_fence(&wrong)
@@ -1659,6 +1704,136 @@ mod postgres_tests {
             Err(IfcError::AccessDenied)
         ));
 
+        let interleaved_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let frozen_absence = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 2),
+            interleaved_d,
+            ("none", now + 5, Utc::now().timestamp() + 120),
+            "frozen absence",
+        );
+        let frozen_absence_fence = parse_publication_fence(&frozen_absence)
+            .expect("parse frozen absence")
+            .expect("frozen absence fence");
+        let owner_hex = owner.public_key().to_hex();
+        let legacy = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), "legacy ciphertext")
+            .tags([
+                Tag::parse(["d", interleaved_d]).expect("legacy d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("legacy owner tag"),
+            ])
+            .custom_created_at(Timestamp::from(now + 4))
+            .sign_with_keys(&agent)
+            .expect("sign legacy memory");
+        assert!(
+            db.replace_parameterized_event(community, &legacy, interleaved_d, None)
+                .await
+                .expect("insert interleaved legacy head")
+                .1
+        );
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &frozen_absence,
+                &frozen_absence_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::MemoryConflict(
+                ParameterizedReplaceStatus::RevisionMismatch
+            ))
+        ));
+        assert!(!db
+            .ifc_event_was_accepted(community, frozen_absence.id.as_bytes())
+            .await
+            .expect("frozen absence receipt"));
+
+        let tombstone = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 2),
+            interleaved_d,
+            (&legacy.id.to_hex(), now + 6, Utc::now().timestamp() + 120),
+            "encrypted value null",
+        );
+        let tombstone_fence = parse_publication_fence(&tombstone)
+            .expect("parse tombstone")
+            .expect("tombstone fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &tombstone,
+                &tombstone_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::Inserted(_))
+        ));
+        let missing_tombstone_head = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 2),
+            interleaved_d,
+            ("none", now + 7, Utc::now().timestamp() + 120),
+            "must not replace tombstone",
+        );
+        let missing_tombstone_fence = parse_publication_fence(&missing_tombstone_head)
+            .expect("parse missing tombstone head")
+            .expect("missing tombstone head fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &missing_tombstone_head,
+                &missing_tombstone_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::MemoryConflict(
+                ParameterizedReplaceStatus::RevisionMismatch
+            ))
+        ));
+        assert!(!db
+            .ifc_event_was_accepted(community, missing_tombstone_head.id.as_bytes())
+            .await
+            .expect("missing tombstone receipt"));
+        let after_tombstone = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 2),
+            interleaved_d,
+            (
+                &tombstone.id.to_hex(),
+                now + 8,
+                Utc::now().timestamp() + 120,
+            ),
+            "replacement after tombstone",
+        );
+        let after_tombstone_fence = parse_publication_fence(&after_tombstone)
+            .expect("parse replacement after tombstone")
+            .expect("replacement after tombstone fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &after_tombstone,
+                &after_tombstone_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::Inserted(_))
+        ));
+
         let expires_at = Utc::now().timestamp() + 2;
         let expiring = fenced_memory_event(
             &agent,
@@ -1666,7 +1841,7 @@ mod postgres_tests {
             community,
             (source, 2),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            (now + 3, expires_at),
+            ("none", now + 9, expires_at),
             "expiring ciphertext",
         );
         let expiring_fence = parse_publication_fence(&expiring)
@@ -1684,6 +1859,24 @@ mod postgres_tests {
             .await,
             Ok(IfcPublishOutcome::Inserted(_))
         ));
+        let expiring_d = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let later_legacy = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            "later legacy ciphertext",
+        )
+        .tags([
+            Tag::parse(["d", expiring_d]).expect("later legacy d tag"),
+            Tag::parse(["p", owner_hex.as_str()]).expect("later legacy owner tag"),
+        ])
+        .custom_created_at(Timestamp::from(now + 10))
+        .sign_with_keys(&agent)
+        .expect("sign later legacy memory");
+        assert!(
+            db.replace_parameterized_event(community, &later_legacy, expiring_d, None)
+                .await
+                .expect("insert later legacy head")
+                .1
+        );
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert!(matches!(
             db.publish_ifc_event(
@@ -1697,6 +1890,19 @@ mod postgres_tests {
             .await,
             Ok(IfcPublishOutcome::HistoricDuplicate)
         ));
+
+        let expiring_head: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_AGENT_ENGRAM as i32)
+        .bind(agent.public_key().as_bytes())
+        .bind(expiring_d)
+        .fetch_one(db.pool())
+        .await
+        .expect("read post-retry memory head");
+        assert_eq!(expiring_head, later_legacy.id.as_bytes().to_vec());
 
         let active: Vec<(Vec<u8>,)> = sqlx::query_as(
             "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
