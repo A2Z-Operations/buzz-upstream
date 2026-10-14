@@ -37,7 +37,8 @@ CREATE TABLE events (
     d_tag       TEXT,
     not_before  BIGINT,
     delivered_at BIGINT,
-    origin_generation BIGINT CHECK (origin_generation IS NULL OR origin_generation > 0),
+    origin_generation BIGINT CONSTRAINT chk_events_origin_generation
+        CHECK (origin_generation IS NULL OR origin_generation > 0),
     PRIMARY KEY (community_id, created_at, id)
 ) PARTITION BY RANGE (created_at);
 
