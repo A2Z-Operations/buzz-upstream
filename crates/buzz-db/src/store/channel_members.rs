@@ -197,6 +197,97 @@ async fn acquire_channel_membership_lock(
     Ok(())
 }
 
+/// Check the same p-tag shape and canonical active membership as migration 0032.
+/// The caller holds this channel's membership advisory lock on the admitted
+/// transaction before calling. Membership writers take that key before reading
+/// roles or changing rows; roster replacement takes its replacement key first,
+/// then this key, matching legacy writers followed by the retained trigger.
+pub(crate) async fn validate_channel_roster_snapshot(
+    tx: &mut AdmittedTx,
+    channel_id: Uuid,
+    tags: &serde_json::Value,
+) -> Result<()> {
+    let invalid: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM jsonb_array_elements($1::jsonb) AS roster_tag(tag_json)
+            WHERE roster_tag.tag_json->>0 = 'p'
+              AND (jsonb_array_length(roster_tag.tag_json) <> 4
+                   OR COALESCE(roster_tag.tag_json->>1, '') !~ '^[0-9a-fA-F]{64}$'
+                   OR roster_tag.tag_json->>2 <> ''
+                   OR COALESCE(roster_tag.tag_json->>3, '')
+                      NOT IN ('owner', 'admin', 'bot', 'member', 'guest'))
+        )
+        "#,
+    )
+    .bind(tags)
+    .fetch_one(tx.conn())
+    .await?;
+    if invalid {
+        sqlx::query(
+            "DO $$ BEGIN RAISE EXCEPTION 'kind 39002 roster contains an invalid p tag' USING ERRCODE = '23514'; END $$",
+        )
+        .execute(tx.conn())
+        .await?;
+        return Err(DbError::InvalidData(
+            "roster check did not reject invalid p tag".into(),
+        ));
+    }
+
+    let matches: bool = sqlx::query_scalar(
+        r#"
+        SELECT
+            (SELECT COALESCE(array_agg(encode(cm.pubkey, 'hex') || ':' || cm.role::text
+                                        ORDER BY cm.pubkey), ARRAY[]::text[])
+             FROM channel_members cm
+             WHERE cm.community_id = $1 AND cm.channel_id = $2
+               AND cm.removed_at IS NULL)
+            IS NOT DISTINCT FROM
+            (SELECT COALESCE(array_agg(lower(roster_tag.tag_json->>1) || ':' ||
+                                        (roster_tag.tag_json->>3)
+                                        ORDER BY decode(roster_tag.tag_json->>1, 'hex')),
+                             ARRAY[]::text[])
+             FROM jsonb_array_elements($3::jsonb) AS roster_tag(tag_json)
+             WHERE roster_tag.tag_json->>0 = 'p')
+        "#,
+    )
+    .bind(tx.community().as_uuid())
+    .bind(channel_id)
+    .bind(tags)
+    .fetch_one(tx.conn())
+    .await?;
+    if !matches {
+        sqlx::query(
+            "DO $$ BEGIN RAISE EXCEPTION 'kind 39002 roster does not match canonical channel membership' USING ERRCODE = '23514'; END $$",
+        )
+        .execute(tx.conn())
+        .await?;
+        return Err(DbError::InvalidData(
+            "roster check did not reject stale membership".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the app-side roster fence to a general event writer. The trigger
+/// reacquires this transaction's advisory key until the fleet has upgraded;
+/// PostgreSQL advisory locks are reentrant for their current owner.
+pub(crate) async fn guard_channel_roster_event(
+    tx: &mut AdmittedTx,
+    kind: i32,
+    channel_id: Option<Uuid>,
+    tags: &serde_json::Value,
+) -> Result<()> {
+    if kind == 39002 {
+        if let Some(channel_id) = channel_id {
+            let community_id = tx.community();
+            acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
+            validate_channel_roster_snapshot(tx, channel_id, tags).await?;
+        }
+    }
+    Ok(())
+}
+
 // ── Transaction-level membership helpers (for commit_participant_join) ────────
 
 /// Acquire the per-channel membership advisory lock on a caller-owned transaction.
@@ -396,11 +487,12 @@ impl LockedMemberSnapshot {
                 ));
             }
         }
+        let tags = serde_json::to_value(&event.tags)?;
+        validate_channel_roster_snapshot(&mut self.tx, channel_id, &tags).await?;
         sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND channel_id = $4 AND deleted_at IS NULL")
             .bind(community_id.as_uuid()).bind(kind).bind(pubkey.as_slice()).bind(channel_id)
             .execute(self.tx.conn()).await?;
         let received_at = Utc::now();
-        let tags = serde_json::to_value(&event.tags)?;
         let sig = event.sig.serialize();
         let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING")
             .bind(community_id.as_uuid()).bind(event.id.as_bytes().as_slice())
@@ -2983,6 +3075,268 @@ mod postgres_tests {
         .expect("promote second owner");
 
         (community, channel.id, owner_a, owner_b)
+    }
+
+    async fn disable_roster_trigger(pool: &PgPool) {
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
+             FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE i.inhparent = 'public.events'::regclass",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("list event partitions");
+        for partition in partitions {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {partition} DISABLE TRIGGER trg_events_guard_channel_roster_snapshot"
+            )))
+            .execute(pool)
+            .await
+            .expect("disable only the roster trigger on partition");
+        }
+        sqlx::query(
+            "ALTER TABLE ONLY events DISABLE TRIGGER trg_events_guard_channel_roster_snapshot",
+        )
+        .execute(pool)
+        .await
+        .expect("disable only the roster trigger on parent");
+    }
+
+    fn signed_roster(
+        keys: &Keys,
+        channel_id: Uuid,
+        members: &[(&[u8], &str, &str)],
+    ) -> nostr::Event {
+        use nostr::{EventBuilder, Kind, Tag};
+
+        let mut tags = vec![Tag::parse(["d", &channel_id.to_string()]).expect("d tag")];
+        for (pubkey, relay, role) in members {
+            tags.push(Tag::parse(["p", &hex::encode(pubkey), relay, role]).expect("p tag"));
+        }
+        EventBuilder::new(Kind::Custom(39002), "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign roster")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn app_roster_guard_locked_writer_rejects_stale_and_accepts_current_without_trigger() {
+        let pool = setup_pool().await;
+        disable_roster_trigger(&pool).await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let owner = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_uuid,
+            "app-roster-locked",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        let keys = Keys::generate();
+        let stale = signed_roster(&keys, channel.id, &[]);
+        let mut snapshot =
+            lock_member_snapshot(&pool, community, channel.id, &keys.public_key().to_bytes())
+                .await
+                .expect("lock snapshot");
+        let error = snapshot
+            .replace_member_event(&stale)
+            .await
+            .expect_err("app must reject stale roster without trigger");
+        assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(ref db))
+            if db.code().as_deref() == Some("23514")
+            && db.message() == "kind 39002 roster does not match canonical channel membership"));
+        drop(snapshot);
+
+        let current = signed_roster(&keys, channel.id, &[(&owner, "", "owner")]);
+        let mut snapshot =
+            lock_member_snapshot(&pool, community, channel.id, &keys.public_key().to_bytes())
+                .await
+                .expect("lock current snapshot");
+        assert!(
+            snapshot
+                .replace_member_event(&current)
+                .await
+                .expect("current roster")
+                .1
+        );
+        snapshot.release().await.expect("commit current roster");
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
+             AND kind=39002 AND deleted_at IS NULL",
+        )
+        .bind(community_uuid)
+        .bind(channel.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load current roster");
+        assert_eq!(live_id, current.id.as_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn app_roster_guard_addressable_rejects_invalid_p_tag_without_trigger() {
+        let pool = setup_pool().await;
+        disable_roster_trigger(&pool).await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let owner = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_uuid,
+            "app-roster-shape",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        let invalid = signed_roster(
+            &Keys::generate(),
+            channel.id,
+            &[(&owner, "wss://relay.invalid", "owner")],
+        );
+        let error = Db::from_pool(pool.clone())
+            .replace_addressable_event(community, &invalid, Some(channel.id))
+            .await
+            .expect_err("app must reject invalid p tag without trigger");
+        assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(ref db))
+            if db.code().as_deref() == Some("23514")
+            && db.message() == "kind 39002 roster contains an invalid p tag"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn app_roster_guard_covers_generic_and_parameterized_writers_without_trigger() {
+        let pool = setup_pool().await;
+        disable_roster_trigger(&pool).await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let owner = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_uuid,
+            "app-roster-generic",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        let stale = signed_roster(&Keys::generate(), channel.id, &[]);
+        let db = Db::from_pool(pool.clone());
+
+        for result in [
+            db.insert_event(community, &stale, Some(channel.id)).await,
+            db.insert_event_with_thread_metadata(community, &stale, Some(channel.id), None)
+                .await,
+            db.replace_parameterized_event(
+                community,
+                &stale,
+                &channel.id.to_string(),
+                Some(channel.id),
+            )
+            .await,
+        ] {
+            let error = result.expect_err("every event writer must reject stale roster");
+            assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(ref db))
+                if db.code().as_deref() == Some("23514")
+                && db.message() == "kind 39002 roster does not match canonical channel membership"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn app_roster_guard_rechecks_after_concurrent_membership_commit_without_trigger() {
+        let pool = setup_pool().await;
+        disable_roster_trigger(&pool).await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let owner = random_pubkey();
+        let newcomer = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_uuid,
+            "app-roster-race",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        let old = signed_roster(&Keys::generate(), channel.id, &[(&owner, "", "owner")]);
+
+        let mut holder = pool.begin().await.expect("hold membership transaction");
+        acquire_channel_membership_lock(&mut holder, community, channel.id)
+            .await
+            .expect("hold membership key");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(community_uuid)
+        .bind(channel.id)
+        .bind(&newcomer)
+        .bind(&owner)
+        .execute(&mut *holder)
+        .await
+        .expect("stage newer canonical roster");
+
+        let writer_pool = pool.clone();
+        let old_id = old.id.as_bytes().to_vec();
+        let writer = tokio::spawn(async move {
+            Db::from_pool(writer_pool)
+                .replace_addressable_event(community, &old, Some(channel.id))
+                .await
+        });
+        // A waiting advisory lock proves the old publication has reached the
+        // app fence before the newer canonical membership commits.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' \
+                     AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("observe waiting roster writer");
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old roster writer must wait for membership key");
+        holder
+            .commit()
+            .await
+            .expect("commit newer canonical roster");
+
+        let error = writer
+            .await
+            .expect("join old writer")
+            .expect_err("old in-flight roster must be rejected");
+        assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(ref db))
+            if db.code().as_deref() == Some("23514")
+            && db.message() == "kind 39002 roster does not match canonical channel membership"));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE id=$1")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rejected old roster");
+        assert_eq!(count, 0);
     }
 
     /// A captured roster holds the same lock as membership writers until the

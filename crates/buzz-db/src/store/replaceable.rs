@@ -259,6 +259,11 @@ async fn replace_parameterized_event_in_transaction_impl(
         .execute(tx.conn())
         .await?;
     let written: Result<bool> = async {
+        if kind_i32 == 39002 {
+            let tags = serde_json::to_value(&event.tags)?;
+            crate::channel_members::guard_channel_roster_event(tx, kind_i32, channel_id, &tags)
+                .await?;
+        }
         if existing.is_some() {
             let previous_nip_rs_hard_delete: Option<String> = if is_nip_rs {
                 sqlx::query_scalar(
@@ -483,6 +488,14 @@ impl Db {
                             false,
                         ));
                     }
+                }
+
+                if kind_i32 == 39002 {
+                    let tags = serde_json::to_value(&event.tags)?;
+                    crate::channel_members::guard_channel_roster_event(
+                        &mut tx, kind_i32, channel_id, &tags,
+                    )
+                    .await?;
                 }
 
                 // Soft-delete the old event (if any). IS NOT DISTINCT FROM for NULL safety.
