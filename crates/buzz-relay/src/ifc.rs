@@ -507,6 +507,20 @@ mod tests {
     #[test]
     fn golden_fixture_has_valid_signatures_and_exact_request_digest() {
         let fixture_text = include_str!("../tests/fixtures/ifc-v1-golden.json");
+        let managed_plaintext =
+            include_str!("../tests/fixtures/ifc-managed-memory-v2-plaintext.json");
+        let managed_fields_text =
+            include_str!("../tests/fixtures/ifc-managed-memory-v2-fields.json");
+        assert_eq!(
+            hex::encode(Sha256::digest(managed_plaintext.as_bytes())),
+            "531b1a1093050826f6f7556c344d3d4b6bf1464c2281d8c9fdf5ae8c6e2148b7"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(managed_fields_text.as_bytes())),
+            "7b1e786fe7407b910c1b53995613b61d59f6465a56feb342b39ce57e31004397"
+        );
+        let managed_fields: Value =
+            serde_json::from_str(managed_fields_text).expect("managed-memory fields");
         assert!(!fixture_text.contains("REPLACE_WITH"));
         let fixture: Value = serde_json::from_str(fixture_text).expect("parse fixture");
         let request = fixture["request_body_utf8"]
@@ -598,6 +612,33 @@ mod tests {
             human.public_key().to_hex()
         );
         assert_eq!(
+            fixture["managed_memory"]["application_fields"],
+            managed_fields
+        );
+        assert_eq!(
+            fixture["managed_memory"]["human_readers"],
+            serde_json::json!([human.public_key().to_hex()])
+        );
+        assert_ne!(
+            fixture["managed_memory"]["human_readers"],
+            serde_json::json!([broker.public_key().to_hex()])
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                fixture["managed_memory"]["scope_canonical_json_utf8"]
+                    .as_str()
+                    .expect("canonical scope bytes")
+            )
+            .expect("canonical scope JSON"),
+            serde_json::json!([
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                broker.public_key().to_hex(),
+                human.public_key().to_hex(),
+                "restricted",
+                [human.public_key().to_hex()]
+            ])
+        );
+        assert_eq!(
             memory
                 .tags
                 .public_keys()
@@ -608,9 +649,9 @@ mod tests {
         assert_eq!(
             d_tag(
                 &memory_key,
-                fixture["managed_memory"]["canonical_slug"]
+                fixture["managed_memory"]["physical_slug"]
                     .as_str()
-                    .expect("memory slug")
+                    .expect("physical memory slug")
             ),
             expected_d
         );
@@ -629,16 +670,60 @@ mod tests {
             hex::encode(namespace_hmac.finalize().into_bytes()),
             expected_namespace
         );
+        let logical_slug = fixture["managed_memory"]["logical_slug"]
+            .as_str()
+            .expect("logical memory slug");
+        let mut name_hmac =
+            <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())
+                .expect("name HMAC key");
+        name_hmac.update(b"agent-memory/ifc/v1/name");
+        name_hmac.update(&[0]);
+        name_hmac.update(logical_slug.as_bytes());
+        assert_eq!(
+            hex::encode(name_hmac.finalize().into_bytes()),
+            fixture["managed_memory"]["name"]
+        );
+        assert_eq!(
+            fixture["managed_memory"]["physical_slug"],
+            format!(
+                "mem/ifc1/{expected_namespace}/{}",
+                fixture["managed_memory"]["name"]
+                    .as_str()
+                    .expect("memory name")
+            )
+        );
         let payload = base64::engine::general_purpose::STANDARD
             .decode(memory.content.as_bytes())
             .expect("memory base64");
         let plaintext = v2::decrypt_to_bytes(&memory_key, &payload).expect("memory decrypt");
+        assert_eq!(plaintext, managed_plaintext.as_bytes());
         assert_eq!(
-            plaintext,
-            fixture["managed_memory"]["plaintext_utf8"]
-                .as_str()
-                .expect("memory plaintext")
-                .as_bytes()
+            fixture["managed_memory"]["plaintext_utf8"],
+            managed_plaintext
+        );
+        assert_eq!(
+            fixture["managed_memory"]["plaintext_sha256"],
+            hex::encode(Sha256::digest(managed_plaintext.as_bytes()))
+        );
+        let protected_memory: Value =
+            serde_json::from_slice(&plaintext).expect("protected managed memory");
+        assert_eq!(
+            protected_memory["slug"],
+            fixture["managed_memory"]["physical_slug"]
+        );
+        assert_eq!(protected_memory["ifc"]["version"], 2);
+        assert_eq!(protected_memory["ifc"]["logical_slug"], logical_slug);
+        assert_eq!(
+            protected_memory["ifc"]["agent_pubkey"],
+            broker.public_key().to_hex()
+        );
+        assert_eq!(
+            protected_memory["ifc"]["human_owner_pubkey"],
+            human.public_key().to_hex()
+        );
+        assert_eq!(
+            protected_memory["ifc"]["derivation_event_ids"],
+            serde_json::json!([resource.id.to_hex()])
         );
         let owner_key = conversation_key(human.secret_key(), &broker.public_key());
         assert!(v2::decrypt_to_bytes(&owner_key, &payload).is_err());

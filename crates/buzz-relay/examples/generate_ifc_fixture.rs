@@ -3,8 +3,19 @@ use hmac::{Hmac, Mac};
 use nostr::nips::nip44::v2;
 use nostr::secp256k1::rand::RngCore;
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+const MANAGED_MEMORY_PLAINTEXT: &str =
+    include_str!("../tests/fixtures/ifc-managed-memory-v2-plaintext.json");
+const MANAGED_MEMORY_FIELDS: &str =
+    include_str!("../tests/fixtures/ifc-managed-memory-v2-fields.json");
+
+fn required_string<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("managed-memory field {field} must be a string"))
+}
 
 struct FixedNonce(u8);
 
@@ -93,40 +104,73 @@ fn main() -> anyhow::Result<()> {
         .custom_created_at(Timestamp::from(1_791_999_900u64))
         .build(broker.public_key())
         .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x23), &broker)?;
-    let memory_slug = "mem/fixture";
     let memory_key = v2::ConversationKey::derive(broker.secret_key(), &broker.public_key())?;
-    let mut audience_principals = [human.public_key().to_hex(), broker.public_key().to_hex()];
-    audience_principals.sort();
-    let audience_bytes = serde_json::to_vec(&json!([
-        community,
-        broker.public_key().to_hex(),
-        human.public_key().to_hex(),
-        "restricted",
-        audience_principals
-    ]))?;
+    let memory_fields: Value = serde_json::from_str(MANAGED_MEMORY_FIELDS)?;
+    let broker_pubkey = broker.public_key().to_hex();
+    let owner = human.public_key().to_hex();
+    anyhow::ensure!(memory_fields["format"] == "buzz-ifc-managed-memory-golden-fields");
+    anyhow::ensure!(memory_fields["version"] == 1);
+    anyhow::ensure!(memory_fields["envelope_version"] == 2);
+    anyhow::ensure!(memory_fields["community"] == community);
+    anyhow::ensure!(memory_fields["source_conversation"] == source);
+    anyhow::ensure!(memory_fields["source_generation"] == "17");
+    anyhow::ensure!(memory_fields["agent_pubkey"] == broker_pubkey);
+    anyhow::ensure!(memory_fields["human_owner_pubkey"] == owner);
+    anyhow::ensure!(memory_fields["audience"] == json!([owner]));
+    anyhow::ensure!(memory_fields["recipient_pubkey"] == broker_pubkey);
+    anyhow::ensure!(memory_fields["p"] == broker_pubkey);
+    anyhow::ensure!(memory_fields["kind"] == 30174);
+    anyhow::ensure!(memory_fields["expected_revision"] == "none");
+
+    let plaintext_sha256 = hex::encode(Sha256::digest(MANAGED_MEMORY_PLAINTEXT.as_bytes()));
+    anyhow::ensure!(memory_fields["plaintext_sha256"] == plaintext_sha256);
+    let scope_canonical_json = required_string(&memory_fields, "canonical_scope_utf8")?;
+    anyhow::ensure!(
+        serde_json::from_str::<Value>(scope_canonical_json)?
+            == json!([community, broker_pubkey, owner, "restricted", [owner]])
+    );
     let mut scope = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
     scope.update(b"agent-memory/ifc/v1/scope");
     scope.update(&[0]);
-    scope.update(&audience_bytes);
+    scope.update(scope_canonical_json.as_bytes());
     let memory_namespace = hex::encode(scope.finalize().into_bytes());
+    anyhow::ensure!(memory_fields["namespace"] == memory_namespace);
+    anyhow::ensure!(memory_fields["s"] == memory_namespace);
+
+    let logical_slug = required_string(&memory_fields, "logical_slug")?;
+    let mut memory_name_hmac =
+        <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
+    memory_name_hmac.update(b"agent-memory/ifc/v1/name");
+    memory_name_hmac.update(&[0]);
+    memory_name_hmac.update(logical_slug.as_bytes());
+    let memory_name = hex::encode(memory_name_hmac.finalize().into_bytes());
+    anyhow::ensure!(memory_fields["name"] == memory_name);
+    let memory_slug = format!("mem/ifc1/{memory_namespace}/{memory_name}");
+    anyhow::ensure!(memory_fields["physical_slug"] == memory_slug);
+
     let mut memory_address =
         <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
     memory_address.update(b"agent-memory/v1/d-tag");
     memory_address.update(&[0]);
     memory_address.update(memory_slug.as_bytes());
     let memory_d = hex::encode(memory_address.finalize().into_bytes());
-    let memory_plaintext = format!(
-        "{{\"slug\":\"{memory_slug}\",\"value\":\"fixture protected memory\",\"ifc\":{{\"version\":1,\"community_id\":\"{community}\",\"sources\":[{{\"channel_id\":\"{source}\",\"generation\":\"17\"}}],\"provenance\":[{{\"event_id\":\"{}\"}}]}}}}",
-        resource.id.to_hex()
+    anyhow::ensure!(memory_fields["identifier"] == memory_d);
+    anyhow::ensure!(memory_fields["d"] == memory_d);
+    let protected_memory: Value = serde_json::from_str(MANAGED_MEMORY_PLAINTEXT)?;
+    anyhow::ensure!(protected_memory["slug"] == memory_slug);
+    anyhow::ensure!(protected_memory["ifc"]["version"] == 2);
+    anyhow::ensure!(protected_memory["ifc"]["logical_slug"] == logical_slug);
+    anyhow::ensure!(protected_memory["ifc"]["agent_pubkey"] == broker_pubkey);
+    anyhow::ensure!(protected_memory["ifc"]["human_owner_pubkey"] == owner);
+    anyhow::ensure!(
+        protected_memory["ifc"]["derivation_event_ids"] == json!([resource.id.to_hex()])
     );
     let memory_payload = v2::encrypt_to_bytes_with_rng(
         &mut FixedNonce(0x44),
         &memory_key,
-        memory_plaintext.as_bytes(),
+        MANAGED_MEMORY_PLAINTEXT.as_bytes(),
     )?;
     let memory_ciphertext = base64::engine::general_purpose::STANDARD.encode(memory_payload);
-    let owner = human.public_key().to_hex();
-    let broker_pubkey = broker.public_key().to_hex();
     let managed_memory = EventBuilder::new(Kind::Custom(30174), memory_ciphertext)
         .tags([
             Tag::parse(["d", memory_d.as_str()])?,
@@ -178,14 +222,19 @@ fn main() -> anyhow::Result<()> {
         "channel_publication_event": publication,
         "managed_memory": {
             "event": managed_memory,
-            "canonical_slug": memory_slug,
+            "logical_slug": logical_slug,
+            "physical_slug": memory_slug,
+            "name": memory_name,
             "d_tag": memory_d,
             "namespace": memory_namespace,
             "recipient": broker_pubkey,
             "saved_human_owner": owner,
-            "scope_canonical_json_utf8": String::from_utf8(audience_bytes)?,
-            "plaintext_utf8": memory_plaintext,
-            "application_metadata_status": "illustrative until the exact Kotlin protected version-two object is supplied"
+            "human_readers": memory_fields["audience"],
+            "scope_canonical_json_utf8": scope_canonical_json,
+            "plaintext_utf8": MANAGED_MEMORY_PLAINTEXT,
+            "plaintext_sha256": plaintext_sha256,
+            "application_fields": memory_fields,
+            "application_metadata_status": "actual interim Kotlin version-two export; immutable contributing-source provenance is not yet frozen"
         },
         "owner_telemetry": {
             "event": owner_telemetry,

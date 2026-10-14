@@ -31,20 +31,45 @@
   },
   "contract": "buzz-ifc-v1",
   "managed_memory": {
-    "application_metadata_status": "illustrative until the exact Kotlin protected version-two object is supplied",
-    "canonical_slug": "mem/fixture",
-    "d_tag": "0b9b4ad03afac3515462d87cd388142ca5bc79ed3575a8c7bc8b968b2f89fc9b",
+    "application_fields": {
+      "agent_pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "audience": [
+        "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+      ],
+      "canonical_scope_utf8": "[\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"restricted\",[\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\"]]",
+      "community": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "d": "a8c8ea1f18fdf50079905e1e49c9f212c5f796f3822d8fd56cee610761305343",
+      "envelope_version": 2,
+      "expected_revision": "none",
+      "format": "buzz-ifc-managed-memory-golden-fields",
+      "human_owner_pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "identifier": "a8c8ea1f18fdf50079905e1e49c9f212c5f796f3822d8fd56cee610761305343",
+      "kind": 30174,
+      "logical_slug": "mem/ifc-golden",
+      "name": "506f38db9a1584cadcb97b66bdea0ffaa589884d9c3e8fe1866dd264690f8160",
+      "namespace": "2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640",
+      "p": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "physical_slug": "mem/ifc1/2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640/506f38db9a1584cadcb97b66bdea0ffaa589884d9c3e8fe1866dd264690f8160",
+      "plaintext_sha256": "531b1a1093050826f6f7556c344d3d4b6bf1464c2281d8c9fdf5ae8c6e2148b7",
+      "recipient_pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "s": "2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640",
+      "source_conversation": "11111111-1111-4111-8111-111111111111",
+      "source_generation": "17",
+      "version": 1
+    },
+    "application_metadata_status": "actual interim Kotlin version-two export; immutable contributing-source provenance is not yet frozen",
+    "d_tag": "a8c8ea1f18fdf50079905e1e49c9f212c5f796f3822d8fd56cee610761305343",
     "event": {
-      "content": "AkREREREREREREREREREREREREREREREREREREREREREQyeDCXIKMB6Cl7kRHCVPj5H6qYt0cdDfscZBFEP2ExIdJ7ANgaiiWXarVduJns4Wb7A7MqXKITuswUqZZCXTxpuGF3LmIW4qfeLLQVReOg7Pe3lIkzwCqndl9xf5DkjTL9lkH4xC0MDU0wxDd6pSJetjf8+BffF1VlrB0VYPX0GXPTLCrEd5mr4AGFALcL2antXb68eVMbjAS/7zBXOnvISLI+We7QSSQ9DHa+WhrTqMoZNwgMNxjgFoycb+Gg+YfxOz9XBPlQAAyNciGehG0WeDQ0bqcgPZHTj+8g+gz0HzJRwoQW0QO9RuY8Tiwq8dFg/Xi156AE8OASlvpytS4wjH9Me0vmc5cNVakmoyEM9jmE1TStPaCtiGIsdwfJkUQNMCvHCQyAMz7gj3t559Z9y9esRg0R0UcfN6BJrYkLX3C6Msu6vIpAFDV+LX7qehD5izB/wnDwiAJu66CpCphW7Q",
+      "content": "AkRERERERERERERERERERERERERERERERERERERERERERs2DCXIKMB6Cl7kRHCVPgJ7h7NE0d5SV8tEQGQCrCUlbJLsTx7/hDWHtRYXOyZsEPuUoZ/aWdnzsgAWDPHeI0MLKAjCwZSV6cLTZSFFLKgiVICAN0mBG5U4/q1GhFUiDe4AxHYxHnsOMhQ9YdalXIadreMiBMaUsDgOYhFNXXROTZHaLvwwg2agHTxUdfN/R2o6CvJnZePbpQ/akWnOsr9PTaqDarkyDApOZMrTz6G7Fuc8k3IEyxhJ12p6pSByTNQDnvCBbmQELmIxkXKVEnDrIERCkUC2ZSi+up1uoxE2yLx9pVlEEddV9aIi6v6ceUVuB7Uo5VEEJQGoxsSkJsw7GrMfnv2Y5Lo5Qlj5lHp1nzx8JHYGAVt+EJcZ8JpgfEtQPviObmAVmsVegvsN9YN/pfdcu7gMMQcBMYqP6vJeffoJi6AAHEMVLQ79OCz6atMu0WPNeyHw9eRq4ZvPVvwPaBzLyA+9/RQuQ8VYnp9FUKklTGNtf2JxIe9wO3s3kiA3tbeXMccGkE6woxaw10OmXpHfD0SWq86bvm4v5pWJROTIbvnOHzUbv45FumezB6YqByJz1GTESAGrb1eqezzhedTP+nMkADBxZh+FG6HLDYui+q54qUs2h/kgnep294M54edCVfdBprngz+0dmF6dGmWyGQXZvX7tLZvWVR9JF+JQt8yE/gEL4WZa38z6TjJbByZwHa+cJx2/GVLFKYrjeZvGiGYKZ/ojelJLxNktxOAOTa6EupNsQYwsN/D/utiNOjZMs2NcCnhpk8yNrZ++MheLu8Tj3zwCTyASVXjIn6+IAFoSb2QqAzrmMqqTnWSPaYfGnixbkCW65Who61/cAmCc0jeE9g2VjYlRSj1UzcKlwmk+NTBtCptJ7kxi+JfgaHHnCY/X/KFHWMH4mOdLzcfIBPMUZ29RYgvx2zba4BoS6HaZNLU4wh0T64GXSHTuzPoC5UZsJkYbVqgvTmWMWFqFZYIv7FHF3zGtt4sX0/ziEr0kgvuGJLFrR2hqHxGwc1y/UHzz5YDD8S11Xj/o7U5fHNGdRF7vv0Tga4zd9n8BYQa3Zbds9HZocXVo3hjZejUFjZAvdlqdfTl+VpdnqXCdhHdk6lrFN1FEoeGcSl8K0tV6qIDwcxInPsNF0QutGlfbjJhLDWGXVVFlWxWpS0OOIoXiPGDlT7bNAcZS7Q9/Z+SlINJVfNQZD7QYKxy8Boc0nuq+Da4cyuwepLqxUwbW+lKbkJaONuHYIGkRxF5VjpmbNMx/oO95yTKB29h7GzJUc1Rvgxyp9FqtmhzGiWobzgrA2Y8Mto+WDZkJJVkSFbqfPfAD1fzdwrg74Q1ufSNSoF5M+ZkXWac9DVdKHvsPHfUDN0vnVZrE+sZAjkx4IcbGshXt4o6N3z/Qkxp+1USfakrJ+3APkJJL1iRt/QE2NC4U4bFGSPTfmNPgVlldtZYKHiJII5yGfDcufnbJ8547HsBnVx02d+3/5YQ6q4JyUX2Y6XYE0h6JHLqR3tUrgL84HCHXGaZZN6tpgqluojGnCLGechP6SREP4rZ60V5N6tXh5T5AGSnXVIuqP8XBl24hUqEZ4zTIDSQP+FaqaBMga7PedGcRXZG1qXIEKxSdxaCnEelcXHgr16rfDEHcY9eV7FvmYTiGwLAdJ0pqs0Hg8ZmX/Gtg5/lsRrr+h609HNUAlGpO4ub6pJMBIC0/8DNbNzlKFfQ1klTuXBPc/gR7UiVUhXGbaw517kR/y",
       "created_at": 1791999920,
-      "id": "e83145b7910fb28b9698bfda3512cb613d85c710eea6f24a6a430b829c5cf7cf",
+      "id": "3523d9334ad2c1ba117d51f8a99c7ca388296836eb17e926bccca75b43ceb523",
       "kind": 30174,
       "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
-      "sig": "b806a0093646c3e88074666874fa6eabf5ea58855caa1d220586b8fdd4aaa39d82e7d33c0b39719daf37385fd59c3c8c68b0d175cfb563d8587264cfd154a6ca",
+      "sig": "d459c0ccedf48c8569f4f7d0d6b208ac310ac5842445d0d12678130ed93bb8184a8ccc2fc2bc4582b10776f53da990aaddd10f8e349e961fa024519a179b8228",
       "tags": [
         [
           "d",
-          "0b9b4ad03afac3515462d87cd388142ca5bc79ed3575a8c7bc8b968b2f89fc9b"
+          "a8c8ea1f18fdf50079905e1e49c9f212c5f796f3822d8fd56cee610761305343"
         ],
         [
           "p",
@@ -67,7 +92,7 @@
         ],
         [
           "s",
-          "45e1406b5f47f4745839990578415c705644e318ad2570d35882b2e72b0f369d"
+          "2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640"
         ],
         [
           "expected-revision",
@@ -75,11 +100,18 @@
         ]
       ]
     },
-    "namespace": "45e1406b5f47f4745839990578415c705644e318ad2570d35882b2e72b0f369d",
-    "plaintext_utf8": "{\"slug\":\"mem/fixture\",\"value\":\"fixture protected memory\",\"ifc\":{\"version\":1,\"community_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"sources\":[{\"channel_id\":\"11111111-1111-4111-8111-111111111111\",\"generation\":\"17\"}],\"provenance\":[{\"event_id\":\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\"}]}}",
+    "human_readers": [
+      "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    ],
+    "logical_slug": "mem/ifc-golden",
+    "name": "506f38db9a1584cadcb97b66bdea0ffaa589884d9c3e8fe1866dd264690f8160",
+    "namespace": "2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640",
+    "physical_slug": "mem/ifc1/2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640/506f38db9a1584cadcb97b66bdea0ffaa589884d9c3e8fe1866dd264690f8160",
+    "plaintext_sha256": "531b1a1093050826f6f7556c344d3d4b6bf1464c2281d8c9fdf5ae8c6e2148b7",
+    "plaintext_utf8": "{\"slug\":\"mem/ifc1/2cffaa0a688adebf2b1176b1326f413861859cc81484c7743689b803492e5640/506f38db9a1584cadcb97b66bdea0ffaa589884d9c3e8fe1866dd264690f8160\",\"value\":\"fixture protected memory\",\"ifc\":{\"version\":2,\"logical_slug\":\"mem/ifc-golden\",\"agent_pubkey\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"human_owner_pubkey\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"binding_json\":\"{\\\"version\\\":1,\\\"community\\\":\\\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\\\",\\\"agent\\\":\\\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\\\",\\\"owner\\\":\\\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\\\",\\\"audience\\\":{\\\"public\\\":false,\\\"readers\\\":[\\\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\\\"]},\\\"context\\\":{\\\"type\\\":\\\"conversation\\\",\\\"conversation\\\":\\\"11111111-1111-4111-8111-111111111111\\\"},\\\"capability_ceiling\\\":[\\\"READ_CORE_MEMORY\\\",\\\"READ_NAMED_MEMORY\\\",\\\"WRITE_MEMORY\\\"],\\\"model_history_conversation\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"model_history_id\\\":\\\"ifc-v1-golden-memory-history\\\",\\\"source_generation\\\":\\\"17\\\",\\\"unknown_managed_input\\\":false}\",\"derivation_event_ids\":[\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\"],\"release\":null}}",
     "recipient": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
     "saved_human_owner": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-    "scope_canonical_json_utf8": "[\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"restricted\",[\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\"]]"
+    "scope_canonical_json_utf8": "[\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"restricted\",[\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\"]]"
   },
   "owner_telemetry": {
     "application_payload_status": "deterministic wire example; backend preserves its existing encrypted telemetry envelope",
