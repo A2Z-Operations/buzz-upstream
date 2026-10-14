@@ -25,20 +25,25 @@ const LATEST_REPLY: &str = "SELECT tm.event_id AS id, tm.received_at, e.pubkey, 
 
 /// Unread replies in thread `t` at position `t.position` that are directed at
 /// the actor: every one in a DM (`t.dm`), otherwise those that tag the actor.
-/// Nothing is walked unless `t.unread`.
-const THREAD_MENTIONS: &str = "SELECT count(*) AS n FROM (
+/// Nothing is walked unless `t.unread`. Root first: the thread's unread
+/// replies (idx_thread_metadata_read_arrival), each probed against the
+/// mention key, never the actor's mentions across the channel.
+pub(super) const THREAD_MENTIONS: &str = "SELECT count(*) AS n FROM (
         SELECT 1 FROM thread_metadata tm JOIN events e ON e.community_id=$1
             AND e.created_at=tm.event_created_at AND e.id=tm.event_id
         WHERE t.unread AND t.dm AND tm.community_id=$1 AND tm.root_event_id=t.root_id
             AND tm.received_at > t.position AND tm.channel_id=t.channel_id
-            AND e.deleted_at IS NULL AND e.pubkey<>$2 AND e.created_at >= $4
+            AND e.deleted_at IS NULL AND e.pubkey<>$2
         UNION ALL
-        SELECT 1 FROM event_mentions em JOIN thread_metadata tm ON tm.community_id=$1
-            AND tm.event_created_at=em.event_created_at AND tm.event_id=em.event_id
-        JOIN events e ON e.community_id=$1 AND e.created_at=em.event_created_at AND e.id=em.event_id
-        WHERE t.unread AND NOT t.dm AND em.community_id=$1 AND em.pubkey_hex=$5 AND em.channel_id=t.channel_id
-            AND em.event_created_at >= GREATEST(t.position-$6, $4)
-            AND tm.root_event_id=t.root_id AND tm.received_at > t.position
+        SELECT 1 FROM (
+            SELECT tm.event_id, tm.event_created_at FROM thread_metadata tm
+            WHERE t.unread AND NOT t.dm AND tm.community_id=$1 AND tm.root_event_id=t.root_id
+                AND tm.channel_id=t.channel_id AND tm.received_at > t.position
+            OFFSET 0
+        ) tm JOIN event_mentions em ON em.community_id=$1 AND em.pubkey_hex=$5
+            AND em.event_created_at=tm.event_created_at AND em.event_id=tm.event_id
+        JOIN events e ON e.community_id=$1 AND e.created_at=tm.event_created_at AND e.id=tm.event_id
+        WHERE em.channel_id=t.channel_id AND em.event_created_at >= t.position-$6
             AND e.deleted_at IS NULL AND e.pubkey<>$2
         LIMIT $7
     ) x";
@@ -100,7 +105,7 @@ impl Db {
         )
         .await?;
         let mut tx = conn.begin().await?;
-        // The horizon and every read position share one read-only cut.
+        // The dormancy cutoff and every read position share one read-only cut.
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await?;
@@ -113,13 +118,14 @@ impl Db {
         //
         // Timeline, per channel:
         // - latest_id: the last timeline message to arrive (idx_events_read_timeline);
-        // - unread: latest is someone else's, inside the horizon, and arrived
-        //   after the position (an own post moves the position past it);
+        // - unread: latest is someone else's and arrived after the position
+        //   (an own post moves the position past it);
         // - mentions: unread timeline messages that tag the actor, found by
         //   author time (event_mentions) from the skew before the position,
         //   or every one in a DM.
-        // Threads: each followed thread whose last reply is unread the same
-        // way, then its mentions for the listed ones only.
+        // Threads: each live follow (explicit, or involved since the cutoff)
+        // whose last reply is unread the same way, then its mentions for the
+        // listed ones only. A dormant follow is filtered before its probe.
         let sql = format!(
             r#"WITH roster AS MATERIALIZED (
                 SELECT c.id, c.channel_type='dm' AS dm,
@@ -144,19 +150,18 @@ impl Db {
                 ORDER BY e.received_at DESC, e.id LIMIT 1
              ) l ON true
              CROSS JOIN LATERAL (
-                SELECT COALESCE(l.received_at > r.position AND l.pubkey<>$2
-                    AND l.created_at >= $4, false) AS unread
+                SELECT COALESCE(l.received_at > r.position AND l.pubkey<>$2, false) AS unread
              ) u
              LEFT JOIN LATERAL (
                 SELECT count(*) AS mentions FROM (
                     SELECT 1 FROM events e WHERE r.dm AND e.community_id=$1
                         AND e.channel_id=r.id AND e.read_timeline AND e.deleted_at IS NULL
-                        AND e.received_at > r.position AND e.pubkey<>$2 AND e.created_at >= $4
+                        AND e.received_at > r.position AND e.pubkey<>$2
                     UNION ALL
                     SELECT 1 FROM event_mentions em JOIN events e ON e.community_id=$1
                         AND e.created_at=em.event_created_at AND e.id=em.event_id
                     WHERE NOT r.dm AND em.community_id=$1 AND em.pubkey_hex=$5
-                        AND em.channel_id=r.id AND em.event_created_at >= GREATEST(r.position-$6, $4)
+                        AND em.channel_id=r.id AND em.event_created_at >= r.position-$6
                         AND e.read_timeline AND e.deleted_at IS NULL
                         AND e.received_at > r.position AND e.pubkey<>$2
                     LIMIT $7
@@ -177,14 +182,15 @@ impl Db {
                     CROSS JOIN LATERAL ({LATEST_REPLY}) tl
                     WHERE tf.community_id=$1 AND tf.actor=$2 AND tf.channel_id=r.id
                         AND tf.root_id<>''::bytea AND NOT tf.unfollowed
-                        AND tl.received_at > p.position AND tl.pubkey<>$2 AND tl.created_at >= $4
+                        AND (tf.explicit OR tf.active_at >= $4)
+                        AND tl.received_at > p.position AND tl.pubkey<>$2
                     ORDER BY tl.received_at DESC, tf.root_id LIMIT $11
                 ) t CROSS JOIN LATERAL ({THREAD_MENTIONS}) tc
              ) th ON true
              ORDER BY r.id"#
         );
         let cutoff = DateTime::from_timestamp_millis(account.cutoff_ms)
-            .ok_or_else(|| DbError::InvalidData("invalid unread cutoff".into()))?;
+            .ok_or_else(|| DbError::InvalidData("invalid dormancy cutoff".into()))?;
         // Only compile-time constants are interpolated.
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(community.as_uuid())
@@ -256,8 +262,8 @@ impl Db {
         sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
         let actor_bytes = actor.to_bytes();
         let account = read_account(&mut tx, community, &actor_bytes, retention_seconds).await?;
-        // Every follow is probed for its last arrival and sorted: the cost
-        // grows with the actor's lifetime follows, not with community size.
+        // Every live follow is probed for its last arrival and sorted: the
+        // cost grows with the actor's recent follows, not with community size.
         let sql = format!(
             r#"SELECT t.channel_id, encode(t.root_id,'hex') AS root_id, t.unread,
                 tc.n AS mentions,
@@ -266,7 +272,7 @@ impl Db {
              FROM (
                 SELECT tf.root_id, tf.channel_id, c.channel_type='dm' AS dm, p.position,
                     tf.through_message_id, tl.id AS latest_id, tl.received_at AS latest_at,
-                    (tl.received_at > p.position AND tl.pubkey<>$2 AND tl.created_at >= $4) AS unread
+                    (tl.received_at > p.position AND tl.pubkey<>$2) AS unread
                 FROM personal_read_frontiers tf
                 JOIN channel_members cm ON cm.community_id=$1 AND cm.channel_id=tf.channel_id
                     AND cm.pubkey=$2 AND cm.removed_at IS NULL
@@ -275,14 +281,15 @@ impl Db {
                     COALESCE($3::timestamptz, 'infinity')) AS position) p
                 CROSS JOIN LATERAL ({LATEST_REPLY}) tl
                 WHERE tf.community_id=$1 AND tf.actor=$2 AND tf.root_id<>''::bytea
-                    AND NOT tf.unfollowed AND ($8::timestamptz IS NULL OR tl.received_at < $8
+                    AND NOT tf.unfollowed AND (tf.explicit OR tf.active_at >= $4)
+                    AND ($8::timestamptz IS NULL OR tl.received_at < $8
                         OR (tl.received_at=$8 AND tf.root_id>$9))
                 ORDER BY tl.received_at DESC, tf.root_id LIMIT $10
              ) t CROSS JOIN LATERAL ({THREAD_MENTIONS}) tc
              ORDER BY t.latest_at DESC, t.root_id"#
         );
         let cutoff = DateTime::from_timestamp_millis(account.cutoff_ms)
-            .ok_or_else(|| DbError::InvalidData("invalid unread cutoff".into()))?;
+            .ok_or_else(|| DbError::InvalidData("invalid dormancy cutoff".into()))?;
         // Only compile-time constants are interpolated.
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(community.as_uuid())
@@ -333,8 +340,8 @@ fn skew() -> chrono::Duration {
     chrono::Duration::seconds(i64::from(MAX_ARRIVAL_SKEW_SECONDS))
 }
 
-/// Read-time horizon and the account's start, in the caller's snapshot.
-/// Frontier state is not discarded on expiry.
+/// The follow dormancy cutoff and the account's start, in the caller's
+/// snapshot. A dormant follow keeps its row and position.
 pub(super) async fn read_account(
     conn: &mut PgConnection,
     community: CommunityId,

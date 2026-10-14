@@ -645,3 +645,224 @@ async fn the_threads_view_lists_follows_newest_arrival_first() {
         .threads
         .is_empty());
 }
+
+/// Put every one of the actor's follows past the default window.
+async fn go_dormant(pool: &PgPool, community: CommunityId, actor: &Keys) {
+    sqlx::query(
+        "UPDATE personal_read_frontiers SET active_at=now()-interval '31 days'
+         WHERE community_id=$1 AND actor=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(actor.public_key().to_bytes().as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Roots of the threads listed for the actor, by the sidebar and by the
+/// threads view.
+async fn listed(db: &Db, community: CommunityId, channel: Uuid, actor: &Keys) -> [Vec<String>; 2] {
+    let sidebar = row(db, community, channel, actor)
+        .await
+        .threads
+        .into_iter()
+        .map(|t| t.root_id)
+        .collect();
+    let view = threads_page(db, community, actor, MAX_THREADS, None)
+        .await
+        .threads
+        .into_iter()
+        .map(|t| t.thread.root_id)
+        .collect();
+    [sidebar, view]
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_dormant_follow_is_hidden_until_a_mention_or_post_revives_it() {
+    let (db, pool, community, channel, actor, root) = fixture().await;
+    let id = root.id.to_hex();
+    let own = reply(&db, community, channel, &root, &actor, vec![]).await;
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        listed(&db, community, channel, &actor).await,
+        [vec![id.clone()], vec![id.clone()]]
+    );
+
+    go_dormant(&pool, community, &actor).await;
+    // A reply that does not involve the actor leaves it dormant; the row and
+    // its position stay.
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        listed(&db, community, channel, &actor).await,
+        [Vec::<String>::new(), vec![]]
+    );
+    assert_eq!(
+        follow(&pool, community, &actor, &root).await,
+        Some(Some(own.id.to_hex()))
+    );
+
+    // A mention revives it at its old position.
+    reply(
+        &db,
+        community,
+        channel,
+        &root,
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert_eq!(threads(&summary), [(id.clone(), 1)]);
+    assert_eq!(summary.threads[0].read_through_id, Some(own.id.to_hex()));
+
+    // So does posting, which reads through the post.
+    go_dormant(&pool, community, &actor).await;
+    assert!(row(&db, community, channel, &actor)
+        .await
+        .threads
+        .is_empty());
+    let again = reply(&db, community, channel, &root, &actor, vec![]).await;
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    let summary = row(&db, community, channel, &actor).await;
+    assert_eq!(threads(&summary), [(id.clone(), 0)]);
+    assert_eq!(summary.threads[0].read_through_id, Some(again.id.to_hex()));
+
+    // And reading it.
+    go_dormant(&pool, community, &actor).await;
+    let last = reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert!(row(&db, community, channel, &actor)
+        .await
+        .threads
+        .is_empty());
+    assert_eq!(
+        intent(
+            &db,
+            community,
+            &actor,
+            mark_thread(channel, &root, &last.id.to_hex())
+        )
+        .await,
+        IntentOutcome::Applied
+    );
+    reply(&db, community, channel, &root, &Keys::generate(), vec![]).await;
+    assert_eq!(
+        listed(&db, community, channel, &actor).await,
+        [vec![id.clone()], vec![id]]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn an_explicit_follow_never_goes_dormant() {
+    let (db, pool, community, channel, actor, _) = fixture().await;
+    // One thread followed only by intent, one followed implicitly first.
+    let chosen = post(&db, community, channel, &Keys::generate(), vec![]).await;
+    let joined = post(&db, community, channel, &Keys::generate(), vec![]).await;
+    reply(&db, community, channel, &joined, &actor, vec![]).await;
+    for root in [&chosen, &joined] {
+        assert_eq!(
+            intent(
+                &db,
+                community,
+                &actor,
+                follow_intent(channel, Some(root), true)
+            )
+            .await,
+            IntentOutcome::Applied
+        );
+    }
+    let implicit = post(&db, community, channel, &Keys::generate(), vec![]).await;
+    reply(&db, community, channel, &implicit, &actor, vec![]).await;
+    for root in [&chosen, &joined, &implicit] {
+        reply(&db, community, channel, root, &Keys::generate(), vec![]).await;
+    }
+    go_dormant(&pool, community, &actor).await;
+    let mut explicit = vec![chosen.id.to_hex(), joined.id.to_hex()];
+    explicit.sort();
+    let [mut sidebar, mut view] = listed(&db, community, channel, &actor).await;
+    sidebar.sort();
+    view.sort();
+    assert_eq!([sidebar, view], [explicit.clone(), explicit]);
+
+    // Unfollowing ends it; a later mention re-follows it implicitly, so it
+    // can go dormant again.
+    intent(
+        &db,
+        community,
+        &actor,
+        follow_intent(channel, Some(&chosen), false),
+    )
+    .await;
+    reply(
+        &db,
+        community,
+        channel,
+        &chosen,
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    assert_eq!(
+        threads(&row(&db, community, channel, &actor).await).len(),
+        2
+    );
+    go_dormant(&pool, community, &actor).await;
+    assert_eq!(
+        listed(&db, community, channel, &actor).await,
+        [vec![joined.id.to_hex()], vec![joined.id.to_hex()]]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn an_agent_keeps_no_read_state() {
+    let (db, pool, community, channel, actor, _) = fixture().await;
+    let agent = member(&db, &pool, community, channel).await;
+    sqlx::query("DELETE FROM personal_read_accounts WHERE community_id=$1 AND actor=$2")
+        .bind(community.as_uuid())
+        .bind(agent.public_key().to_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (who, owner) in [(&actor, None), (&agent, Some(&actor))] {
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) VALUES ($1,$2,$3)",
+        )
+        .bind(community.as_uuid())
+        .bind(who.public_key().to_bytes().as_slice())
+        .bind(owner.map(|o| o.public_key().to_bytes().to_vec()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // The agent posts, replies to its owner's root, is mentioned, and has a
+    // root replied to: every way a person would gain a position or a follow.
+    let own_root = post(&db, community, channel, &agent, mention(&actor)).await;
+    reply(&db, community, channel, &own_root, &actor, mention(&agent)).await;
+    let owner_root = post(&db, community, channel, &actor, mention(&agent)).await;
+    reply(
+        &db,
+        community,
+        channel,
+        &owner_root,
+        &agent,
+        mention(&actor),
+    )
+    .await;
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM personal_read_frontiers WHERE community_id=$1 AND actor=$2)
+              + (SELECT count(*) FROM personal_read_accounts WHERE community_id=$1 AND actor=$2)",
+    )
+    .bind(community.as_uuid())
+    .bind(agent.public_key().to_bytes().as_slice())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "an agent has no positions, follows or account");
+    // The agent's messages still involve its owner.
+    assert!(follow(&pool, community, &actor, &own_root).await.is_some());
+    assert!(follow(&pool, community, &actor, &owner_root)
+        .await
+        .is_some());
+}

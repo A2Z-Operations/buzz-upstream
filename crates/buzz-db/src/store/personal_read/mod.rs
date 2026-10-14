@@ -1,9 +1,11 @@
 //! Private, signer-owned accessory read progress, separate from NIP-RS events.
 //!
 //! A frontier is the relay arrival time of the message a context was read
-//! through; the unread horizon alone uses author time. Read intents and the
-//! author's own posts advance frontiers. A thread frontier exists only for a
-//! followed thread, and the sidebar counts forward from each frontier.
+//! through. Read intents and the author's own posts advance frontiers. A
+//! thread frontier exists only for a followed thread, and the sidebar counts
+//! forward from each frontier. An implicit follow goes dormant after the
+//! relay's window without the actor's involvement; an explicit one never does.
+//! Agent accounts keep no read state.
 
 mod follows;
 mod model;

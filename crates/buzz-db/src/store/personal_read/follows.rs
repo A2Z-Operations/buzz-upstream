@@ -80,6 +80,9 @@ pub(crate) fn place<'a>(
 /// Everyone but the author starts just before the message, so it is unread
 /// to them. A follower keeps an existing position. An unfollow sticks until
 /// its actor posts in the thread or is mentioned there again.
+///
+/// Each of these involves its actor in the thread (`active_at`), which keeps
+/// an implicit follow live. Agent accounts keep no read state.
 pub(crate) async fn record_message(
     tx: &mut AdmittedTx,
     event: &Event,
@@ -129,16 +132,23 @@ pub(crate) async fn record_message(
             WHERE $9 AND cm.community_id=$1 AND cm.channel_id=$2 AND cm.removed_at IS NULL
                 AND c.channel_type='dm' AND cm.pubkey<>$4
          ), rows AS (
-            -- An existing follower keeps their position, so is not touched;
-            -- nor is an unfollow, unless this message re-follows (the author
-            -- posting, or a mention). Existence probes are LIMIT 1 laterals:
-            -- always one index lookup.
+            -- An existing follower keeps their position, so is only touched
+            -- to keep the follow live, at most daily rather than per message;
+            -- an unfollow is not touched unless this message re-follows (the
+            -- author posting, or a mention). Existence probes are LIMIT 1
+            -- laterals: always one index lookup.
             SELECT DISTINCT ON (i.actor, i.root_id) i.* FROM involved i
             LEFT JOIN LATERAL (
-                SELECT f.unfollowed FROM personal_read_frontiers f WHERE f.community_id=$1
-                    AND f.actor=i.actor AND f.channel_id=$2 AND f.root_id=i.root_id LIMIT 1
+                SELECT f.unfollowed, f.active_at FROM personal_read_frontiers f
+                WHERE f.community_id=$1 AND f.actor=i.actor AND f.channel_id=$2
+                    AND f.root_id=i.root_id LIMIT 1
             ) f ON true
-            WHERE i.message IS NOT NULL OR f.unfollowed IS NULL OR (i.refollow AND f.unfollowed)
+            WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.community_id=$1
+                    AND u.pubkey=i.actor AND u.agent_owner_pubkey IS NOT NULL)
+                AND (i.message IS NOT NULL OR f.unfollowed IS NULL
+                    OR (i.refollow AND f.unfollowed)
+                    OR (i.root_id<>''::bytea AND NOT f.unfollowed
+                        AND f.active_at < now()-interval '1 day'))
             ORDER BY i.actor, i.root_id, i.message IS NULL, NOT i.refollow
          ), accounts AS (
             INSERT INTO personal_read_accounts (community_id, actor)
@@ -152,21 +162,29 @@ pub(crate) async fn record_message(
          )
          -- A re-follow starts just before this message, like a new follow,
          -- unless the unfollow is later. A row that a concurrent message
-         -- created is only advanced when it carries an anchor.
+         -- created is only advanced when it carries an anchor; one kept live
+         -- keeps its position.
          INSERT INTO personal_read_frontiers
             (community_id, actor, channel_id, root_id, through_timestamp, through_message_id)
          SELECT $1, actor, $2, root_id, through, message
          FROM rows CROSS JOIN (SELECT count(*) FROM accounts) written
          ORDER BY actor, root_id
          ON CONFLICT (community_id, actor, channel_id, root_id) DO UPDATE
-         SET through_timestamp=GREATEST(personal_read_frontiers.through_timestamp,
-                excluded.through_timestamp),
+         SET through_timestamp=CASE
+                WHEN excluded.through_message_id IS NOT NULL OR personal_read_frontiers.unfollowed
+                THEN GREATEST(personal_read_frontiers.through_timestamp, excluded.through_timestamp)
+                ELSE personal_read_frontiers.through_timestamp END,
             through_message_id=CASE
-                WHEN excluded.through_timestamp > personal_read_frontiers.through_timestamp
+                WHEN (excluded.through_message_id IS NOT NULL OR personal_read_frontiers.unfollowed)
+                    AND excluded.through_timestamp > personal_read_frontiers.through_timestamp
                 THEN excluded.through_message_id ELSE personal_read_frontiers.through_message_id END,
-            unfollowed=false
+            unfollowed=false,
+            active_at=CASE WHEN excluded.root_id<>''::bytea THEN now()
+                ELSE personal_read_frontiers.active_at END
          WHERE excluded.through_message_id IS NOT NULL OR (personal_read_frontiers.unfollowed
-            AND excluded.through_timestamp > personal_read_frontiers.through_timestamp)",
+            AND excluded.through_timestamp > personal_read_frontiers.through_timestamp)
+            OR (excluded.root_id<>''::bytea AND NOT personal_read_frontiers.unfollowed
+                AND personal_read_frontiers.active_at < now()-interval '1 day')",
     )
     .bind(community.as_uuid())
     .bind(channel)

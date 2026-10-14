@@ -470,6 +470,86 @@ async fn accessory_follow_intents_and_threads_view() {
     assert_eq!(result.0, StatusCode::BAD_REQUEST, "{}", result.1);
 }
 
+/// Read state is for people: an agent account is refused every endpoint,
+/// while its owner's sidebar is served.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn accessory_refuses_agent_accounts() {
+    let fixture = crate::api::bridge::postgres_tests::bridge_handler_test_state()
+        .await
+        .unwrap();
+    let mut state = (*fixture).clone();
+    Arc::make_mut(&mut state.config).buzz_v1_enabled = true;
+    let state = Arc::new(state);
+    let host = format!("bff-agents-{}.local", uuid::Uuid::new_v4());
+    let community = state
+        .db
+        .ensure_configured_community(&host)
+        .await
+        .unwrap()
+        .id;
+    let (owner, agent) = (Keys::generate(), Keys::generate());
+    let channel = state
+        .db
+        .create_channel(
+            community,
+            "agents",
+            buzz_db::channel::ChannelType::Stream,
+            buzz_db::channel::ChannelVisibility::Open,
+            None,
+            &owner.public_key().to_bytes(),
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    for (who, by) in [(&owner, None), (&agent, Some(&owner))] {
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) VALUES ($1,$2,$3)",
+        )
+        .bind(community.as_uuid())
+        .bind(who.public_key().to_bytes().as_slice())
+        .bind(by.map(|k| k.public_key().to_bytes().to_vec()))
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    }
+    let write = serde_json::to_vec(&json!({"intents":[
+        {"type":"mark_through","target":{"channel_id":channel},"message_id":"ab".repeat(32)}
+    ]}))
+    .unwrap();
+    for (path, method, body) in [
+        ("/buzz/v1/me/sidebar", "GET", &b""[..]),
+        ("/buzz/v1/me/threads", "GET", &b""[..]),
+        ("/buzz/v1/me/read-state", "POST", write.as_slice()),
+    ] {
+        let auth = proof(
+            &agent,
+            &host,
+            path,
+            method,
+            (method == "POST").then_some(body),
+        );
+        let (status, json) = request(state.clone(), &host, path, method, Some(&auth), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(json["error"]["code"], "forbidden");
+    }
+    let path = "/buzz/v1/me/sidebar";
+    let auth = proof(&owner, &host, path, "GET", None);
+    let (status, json) = request(state.clone(), &host, path, "GET", Some(&auth), b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["channels"][0]["channel_id"], channel.to_string());
+    let accounts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM personal_read_accounts WHERE community_id=$1 AND actor=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(agent.public_key().to_bytes().as_slice())
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(accounts, 0);
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn accessory_write_revocation_is_terminal_before_persistence() {

@@ -9,8 +9,12 @@
 -- thread_metadata.received_at: a reply's arrival, set at insert; NULL on root
 -- stubs and earlier rows.
 -- personal_read_frontiers.unfollowed: a sticky unfollow of a thread.
+-- personal_read_frontiers.explicit: a follow intent, never dormant.
+-- personal_read_frontiers.active_at: the actor's last involvement in a
+-- thread; an implicit follow is dormant once it is older than the relay's
+-- window. Earlier rows start at migration time.
 --
--- Brownfield operators MUST add the three columns and prebuild the three
+-- Brownfield operators MUST add the five columns and prebuild the four
 -- indexes concurrently as documented in docs/buzz-v1-read-state.md. Startup is
 -- bounded like 0049: a large table fails deployment rather than blocking
 -- ingestion.
@@ -27,7 +31,9 @@ BEGIN
         ('events', 'read_timeline', 'BOOLEAN NOT NULL DEFAULT false'),
         ('thread_metadata', 'received_at', 'TIMESTAMPTZ'),
         ('personal_read_frontiers', 'unfollowed',
-         $d$BOOLEAN NOT NULL DEFAULT false CHECK (NOT unfollowed OR root_id <> ''::bytea)$d$)
+         $d$BOOLEAN NOT NULL DEFAULT false CHECK (NOT unfollowed OR root_id <> ''::bytea)$d$),
+        ('personal_read_frontiers', 'explicit', 'BOOLEAN NOT NULL DEFAULT false'),
+        ('personal_read_frontiers', 'active_at', 'TIMESTAMPTZ NOT NULL DEFAULT now()')
     ) AS s(tbl, col, definition) LOOP
         IF NOT EXISTS (
             SELECT 1 FROM pg_attribute
@@ -47,7 +53,9 @@ BEGIN
         ('idx_thread_metadata_read_arrival',
          'CREATE INDEX idx_thread_metadata_read_arrival ON public.thread_metadata USING btree (community_id, root_event_id, received_at DESC, event_id) WHERE (received_at IS NOT NULL)'),
         ('idx_event_mentions_pubkey_channel_created',
-         'CREATE INDEX idx_event_mentions_pubkey_channel_created ON public.event_mentions USING btree (community_id, pubkey_hex, channel_id, event_created_at DESC)')
+         'CREATE INDEX idx_event_mentions_pubkey_channel_created ON public.event_mentions USING btree (community_id, pubkey_hex, channel_id, event_created_at DESC)'),
+        ('idx_personal_read_frontiers_active',
+         $d$CREATE INDEX idx_personal_read_frontiers_active ON public.personal_read_frontiers USING btree (community_id, actor, active_at DESC) WHERE (root_id <> '\x'::bytea)$d$)
     ) AS s(name, definition) LOOP
         -- IF NOT EXISTS still requests a writer-conflicting lock: skip CREATE
         -- for a prebuilt index, then validate it.

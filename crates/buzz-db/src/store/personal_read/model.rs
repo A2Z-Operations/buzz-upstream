@@ -4,7 +4,8 @@ use uuid::Uuid;
 
 /// Maximum independent operations in one HTTP request.
 pub const MAX_INTENTS: usize = 100;
-/// Default unread-tracking duration, not event or encrypted NIP-RS retention.
+/// Default time an implicit thread follow stays live without the actor's
+/// involvement; not event or encrypted NIP-RS retention.
 pub const DEFAULT_RETENTION_SECONDS: u32 = 30 * 24 * 60 * 60;
 
 /// A channel or canonical thread; absence of a root denotes only the channel timeline.
@@ -68,7 +69,8 @@ pub enum IntentOutcome {
 /// The tracking boundary for the authenticated account. Not on the wire.
 #[derive(Clone, Debug)]
 pub(super) struct ReadAccount {
-    /// Read-time author-time cutoff (Unix milliseconds), not a discard boundary.
+    /// Implicit follows not involved since this instant (Unix milliseconds) are
+    /// dormant; nothing is discarded.
     pub(super) cutoff_ms: i64,
     /// Arrival floor of every frontier: the account's first applied read
     /// intent. `None` until then, and nothing counts as unread.

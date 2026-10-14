@@ -2258,16 +2258,25 @@ mod postgres_tests {
             .sql
             .as_str();
         assert!(through_message.contains("DROP COLUMN threads_through_timestamp"));
-        // 0061 adds the sticky thread unfollow.
+        // 0061 adds the sticky thread unfollow and follow liveness.
         let unfollowed_column = "unfollowed boolean not null default false \
-            check (not unfollowed or root_id <> ''::bytea), ";
-        assert!(MIGRATOR
+            check (not unfollowed or root_id <> ''::bytea), \
+            explicit boolean not null default false, \
+            active_at timestamptz not null default now(), ";
+        let access_paths = MIGRATOR
             .iter()
             .find(|m| m.version == 61)
             .expect("read-state access path migration")
             .sql
-            .as_str()
-            .contains("$d$BOOLEAN NOT NULL DEFAULT false CHECK (NOT unfollowed OR root_id <> ''::bytea)$d$"));
+            .as_str();
+        assert!(access_paths.contains(
+            "$d$BOOLEAN NOT NULL DEFAULT false CHECK (NOT unfollowed OR root_id <> ''::bytea)$d$"
+        ));
+        assert!(access_paths
+            .contains("('personal_read_frontiers', 'explicit', 'BOOLEAN NOT NULL DEFAULT false')"));
+        assert!(access_paths.contains(
+            "('personal_read_frontiers', 'active_at', 'TIMESTAMPTZ NOT NULL DEFAULT now()')"
+        ));
         for (table, definition) in personal.tables {
             let in_schema = schema.tables.get(&table).map(|schema_definition| {
                 if table == "personal_read_accounts" {

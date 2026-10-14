@@ -165,7 +165,8 @@ pub(super) async fn valid_target(
 
 /// Advance a monotone frontier. The anchor ID follows the greatest arrival;
 /// an equal arrival keeps the existing anchor. Reading a thread never follows
-/// it: only a followed thread has a row to advance.
+/// it: only a followed thread has a row to advance, and reading involves the
+/// actor, which keeps the follow live.
 async fn frontier(
     conn: &mut PgConnection,
     community: CommunityId,
@@ -187,7 +188,8 @@ async fn frontier(
         "UPDATE personal_read_frontiers
          SET through_timestamp=GREATEST(through_timestamp, $5),
             through_message_id=CASE WHEN $5 > through_timestamp
-                THEN $6 ELSE through_message_id END
+                THEN $6 ELSE through_message_id END,
+            active_at=now()
          WHERE community_id=$1 AND actor=$2 AND channel_id=$3 AND root_id=$4"
     };
     sqlx::query(sql)
@@ -204,7 +206,8 @@ async fn frontier(
 
 /// Follow or unfollow a thread. A follow that changes state starts now, so
 /// earlier replies are read; an unfollowed row keeps ingest from following
-/// again, except as `record_message` allows.
+/// again, except as `record_message` allows. An explicit follow, including of
+/// a thread already followed implicitly, never goes dormant.
 async fn follow(
     conn: &mut PgConnection,
     community: CommunityId,
@@ -215,14 +218,18 @@ async fn follow(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO personal_read_frontiers
-         (community_id, actor, channel_id, root_id, through_timestamp, unfollowed)
-         VALUES ($1,$2,$3,$4,now(),$5)
+         (community_id, actor, channel_id, root_id, through_timestamp, unfollowed, explicit)
+         VALUES ($1,$2,$3,$4,now(),$5,NOT $5)
          ON CONFLICT (community_id, actor, channel_id, root_id) DO UPDATE
-         SET unfollowed=$5,
-            through_timestamp=GREATEST(personal_read_frontiers.through_timestamp, now()),
-            through_message_id=CASE WHEN now() > personal_read_frontiers.through_timestamp
+         SET unfollowed=$5, explicit=NOT $5, active_at=now(),
+            through_timestamp=CASE WHEN personal_read_frontiers.unfollowed <> $5
+                THEN GREATEST(personal_read_frontiers.through_timestamp, now())
+                ELSE personal_read_frontiers.through_timestamp END,
+            through_message_id=CASE WHEN personal_read_frontiers.unfollowed <> $5
+                AND now() > personal_read_frontiers.through_timestamp
                 THEN NULL ELSE personal_read_frontiers.through_message_id END
-         WHERE personal_read_frontiers.unfollowed <> $5",
+         WHERE personal_read_frontiers.unfollowed <> $5
+            OR personal_read_frontiers.explicit = $5",
     )
     .bind(community.as_uuid())
     .bind(actor)
