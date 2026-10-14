@@ -34,9 +34,8 @@ class _HistorySubscription {
   final Timer timeout;
   Future<void> verificationTail = Future.value();
   int pendingVerifications = 0;
+  int pendingVerificationBytes = 0;
   int receivedEventFrames = 0;
-  Object? verificationError;
-  StackTrace? verificationStackTrace;
 
   _HistorySubscription({required this.completer, required this.timeout});
 }
@@ -52,9 +51,11 @@ class _LiveSubscription {
   Timer? closedRetryTimer;
   Future<void> verificationTail = Future.value();
   int pendingVerifications = 0;
+  int pendingVerificationBytes = 0;
   int receivedEventFrames = 0;
   int validEventFrames = 0;
   int verificationEpoch = 0;
+  bool acceptsRelayFrames = false;
 
   _LiveSubscription({
     required this.filter,
@@ -156,6 +157,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   bool _socketConnected = false;
   bool _closedRetryReplayScheduled = false;
   _RelayEventVerifier? _eventVerifier;
+  int _pendingRelayAdmissions = 0;
+  int _pendingRelayAdmissionBytes = 0;
 
   _RelayEventVerifier get _verifier =>
       _eventVerifier ??= _RelayEventVerifier(verifyBatch: _verifyEventBatch);
@@ -333,7 +336,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       readyCompleter: readyCompleter,
     );
 
-    _sendReq(subId, filter);
+    _sendLiveReq(subId, _liveSubscriptions[subId]!, filter);
 
     try {
       await readyCompleter.future.timeout(
@@ -405,6 +408,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
   @visibleForTesting
   void debugDispose() => _dispose();
+
+  @visibleForTesting
+  int get debugPendingRelayAdmissions => _pendingRelayAdmissions;
 
   @visibleForTesting
   void debugSupersedeConnection() {
@@ -652,7 +658,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
           }
           _pendingClosedRetries.remove(entry.key);
         }
-        _sendReq(entry.key, _replayFilter(entry.value));
+        _sendLiveReq(entry.key, entry.value, _replayFilter(entry.value));
       }
       if (i + _replayBatchSize < entries.length) {
         await _replayDelay(_replayInterBatchDelay);
@@ -711,6 +717,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
     final liveSub = _liveSubscriptions[subId];
     if (liveSub == null) return;
+    if (!liveSub.acceptsRelayFrames) return;
     final readyCompleter = liveSub.readyCompleter;
     // A deadline is terminal for one-shot history, but a live subscription
     // retries it: same filter under backoff, which can keep retrying at the
@@ -725,6 +732,10 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       _removeLiveSubscription(subId, liveSub);
       return;
     }
+    // CLOSED retires the relay's current REQ boundary. Results and EOSE from
+    // that request must not deliver, signal ready, advance the replay cursor,
+    // or cancel the retry scheduled below.
+    _retireLiveSubscriptionVerification(subId, liveSub);
     if (readyCompleter != null && !readyCompleter.isCompleted) {
       readyCompleter.complete();
       liveSub.readyCompleter = null;
@@ -892,22 +903,30 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _socket?.send(['REQ', subId, filter.toJson()]);
   }
 
+  void _sendLiveReq(
+    String subId,
+    _LiveSubscription subscription,
+    NostrFilter filter,
+  ) {
+    subscription.acceptsRelayFrames = true;
+    _sendReq(subId, filter);
+  }
+
   void _sendClose(String subId) {
     _socket?.send(['CLOSE', subId]);
   }
 
   void _unsubscribe(String subId) {
     final subscription = _liveSubscriptions[subId];
-    if (subscription != null) {
-      _removeLiveSubscription(subId, subscription);
-    }
+    if (subscription == null) return;
+    _removeLiveSubscription(subId, subscription);
     _sendClose(subId);
   }
 
   void _removeLiveSubscription(String subId, _LiveSubscription subscription) {
     if (_liveSubscriptions[subId] != subscription) return;
     _liveSubscriptions.remove(subId);
-    _retireLiveSubscriptionVerification(subscription);
+    _retireLiveSubscriptionVerification(subId, subscription);
     _pendingClosedRetries.remove(subId);
     subscription.closedRetryTimer?.cancel();
     subscription.closedRetryTimer = null;
@@ -980,6 +999,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _eventBuffer.clear();
     _eventVerifier?.close();
     _eventVerifier = null;
+    _pendingRelayAdmissions = 0;
+    _pendingRelayAdmissionBytes = 0;
     _socket?.dispose();
     _socket = null;
     _httpQueryClient.close();

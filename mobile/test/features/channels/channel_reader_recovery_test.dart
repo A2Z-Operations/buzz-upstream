@@ -52,7 +52,7 @@ final _lanes = [
     final m = ChannelStarsManager(
       pubkey: relay.pubkey,
       prefs: prefs,
-      crypto: ChannelStarsCrypto(relay.keys.nsec, relay.pubkey),
+      crypto: _DeterministicStarsCrypto(relay),
       relaySession: relay.session,
       signedEventRelay: relay.signer,
       remoteEnabled: true,
@@ -72,7 +72,7 @@ final _lanes = [
     final m = ChannelMutesManager(
       pubkey: relay.pubkey,
       prefs: prefs,
-      crypto: ChannelMutesCrypto(relay.keys.nsec, relay.pubkey),
+      crypto: _DeterministicMutesCrypto(relay),
       relaySession: relay.session,
       signedEventRelay: relay.signer,
       remoteEnabled: true,
@@ -264,17 +264,20 @@ void main() {
 
       for (final priorHead in [false, true]) {
         fakeAsyncTest('OK before echo keeps a coherent cursor '
-            '(${priorHead ? 'stale prior id' : 'no prior id'})', (clock) {
-          if (priorHead) {
-            relay.stored.add(relay.event(lane.dTag, blob({}), t + 30));
-          }
-          start(clock).set('mine', true);
+            '(${priorHead ? 'newer prior head' : 'older prior head'})', (
+          clock,
+        ) {
+          final priorCreatedAt =
+              deterministicFixtureEpoch + (priorHead ? 30 : 0);
+          relay.stored.add(
+            relay.deterministicEvent(lane.dTag, blob({}), priorCreatedAt),
+          );
+          start(clock);
+          clock.elapse(const Duration(milliseconds: 20));
+          subject.set('mine', true);
           clock.elapse(const Duration(seconds: 5));
           final own = relay.published.single;
-          expect(
-            own.createdAt,
-            priorHead ? t + 31 : inInclusiveRange(t, nowSeconds()),
-          );
+          expect(own.createdAt, priorCreatedAt + 1);
 
           // The OK beat the (never delivered) echo. A same-second peer that
           // the relay retains over our event must still be adopted.
@@ -284,12 +287,20 @@ void main() {
             ('peer', true),
           ]) {
             relay.emit(
-              relay.eventComparedTo(
+              relay.orderedEvent(
                 lane.dTag,
-                blob({name: (true, own.createdAt)}),
+                blob({name: (true, deterministicFixtureEpoch)}),
                 own.createdAt,
                 referenceId: own.id,
                 sortsBefore: sortsBefore,
+                nonce: switch ((lane.dTag, priorHead, name)) {
+                  ('channel-stars', false, 'peer') => 1,
+                  ('channel-stars', true, 'loser') => 2,
+                  ('channel-stars', true, 'peer') => 1,
+                  ('channel-mutes', false, 'peer') => 2,
+                  ('channel-mutes', true, 'loser') => 4,
+                  _ => 0,
+                },
               ),
             );
           }
@@ -404,6 +415,75 @@ void main() {
   }
 }
 
+class _DeterministicStarsCrypto extends ChannelStarsCrypto {
+  _DeterministicStarsCrypto(SidebarRelay relay)
+    : super(relay.keys.nsec, relay.pubkey);
+
+  @override
+  String encrypt(String plaintext) => _fixedEntryTimestamps(plaintext);
+
+  @override
+  String decrypt(String ciphertext) =>
+      _plaintextOr(ciphertext, () => super.decrypt(ciphertext));
+}
+
+class _DeterministicMutesCrypto extends ChannelMutesCrypto {
+  _DeterministicMutesCrypto(SidebarRelay relay)
+    : super(relay.keys.nsec, relay.pubkey);
+
+  @override
+  String encrypt(String plaintext) => _fixedEntryTimestamps(plaintext);
+
+  @override
+  String decrypt(String ciphertext) =>
+      _plaintextOr(ciphertext, () => super.decrypt(ciphertext));
+}
+
+class _DeterministicSectionsCrypto extends ChannelSectionsCrypto {
+  _DeterministicSectionsCrypto(SidebarRelay relay)
+    : super(relay.keys.nsec, relay.pubkey);
+
+  @override
+  String encrypt(String plaintext) {
+    final decoded = jsonDecode(plaintext) as Map<String, dynamic>;
+    final sections = (decoded['sections'] as List).cast<Map<String, dynamic>>();
+    final renamedIds = <String, String>{};
+    for (final section in sections) {
+      final oldId = section['id'] as String;
+      final fixedId = section['name'] as String;
+      renamedIds[oldId] = fixedId;
+      section['id'] = fixedId;
+    }
+    final assignments = decoded['assignments'] as Map<String, dynamic>;
+    for (final entry in assignments.entries.toList()) {
+      assignments[entry.key] = renamedIds[entry.value] ?? entry.value;
+    }
+    return jsonEncode(decoded);
+  }
+
+  @override
+  String decrypt(String ciphertext) =>
+      _plaintextOr(ciphertext, () => super.decrypt(ciphertext));
+}
+
+String _plaintextOr(String value, String Function() fallback) {
+  try {
+    jsonDecode(value);
+    return value;
+  } on FormatException {
+    return fallback();
+  }
+}
+
+String _fixedEntryTimestamps(String plaintext) {
+  final decoded = jsonDecode(plaintext) as Map<String, dynamic>;
+  final channels = decoded['channels'] as Map<String, dynamic>;
+  for (final entry in channels.values.cast<Map<String, dynamic>>()) {
+    entry['updatedAt'] = deterministicFixtureEpoch;
+  }
+  return jsonEncode(decoded);
+}
+
 /// Whole-blob lanes: resume re-read, and sections' publication cursor.
 void wholeBlobLanes(SharedPreferences Function() prefs) {
   group('sections', () {
@@ -424,7 +504,7 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       m = ChannelSectionsManager(
         pubkey: relay.pubkey,
         prefs: prefs(),
-        crypto: ChannelSectionsCrypto(relay.keys.nsec, relay.pubkey),
+        crypto: _DeterministicSectionsCrypto(relay),
         relaySession: relay.session,
         signedEventRelay: relay.signer,
         remoteEnabled: true,
@@ -435,6 +515,14 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
     }
 
     List<String> names() => [for (final s in m.store.sections) s.name];
+
+    void seedDeterministicCursor() => relay.stored.add(
+      relay.deterministicEvent('channel-sections', const {
+        'version': 1,
+        'sections': [],
+        'assignments': {},
+      }, deterministicFixtureEpoch),
+    );
 
     fakeAsyncTest('resume adopts a head the healthy socket missed', (clock) {
       final t = nowSeconds();
@@ -456,7 +544,10 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
     });
 
     fakeAsyncTest('OK before echo keeps a coherent cursor', (clock) {
-      start(clock).createSection('mine');
+      seedDeterministicCursor();
+      start(clock);
+      clock.elapse(const Duration(milliseconds: 20));
+      m.createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
       // A same-second higher ID loses to our own event; a lower one wins.
@@ -465,12 +556,13 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
         ('peer', true, 'peer'),
       ]) {
         relay.emit(
-          relay.eventComparedTo(
+          relay.orderedEvent(
             'channel-sections',
             blob(name),
             own.createdAt,
             referenceId: own.id,
             sortsBefore: sortsBefore,
+            nonce: 0,
           ),
         );
         clock.elapse(const Duration(milliseconds: 20));
@@ -481,16 +573,20 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
     fakeAsyncTest('a same-second loser merged during the OK wait is undone', (
       clock,
     ) {
+      seedDeterministicCursor();
       relay.holdOk = Completer<void>();
-      start(clock).createSection('mine');
+      start(clock);
+      clock.elapse(const Duration(milliseconds: 20));
+      m.createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
-      final loser = relay.eventComparedTo(
+      final loser = relay.orderedEvent(
         'channel-sections',
         blob('loser'),
         own.createdAt,
         referenceId: own.id,
         sortsBefore: false,
+        nonce: 0,
       );
       relay
         ..stored.add(loser)
@@ -509,17 +605,21 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
     fakeAsyncTest('a same-second loser adopted after an edit re-converges', (
       clock,
     ) {
+      seedDeterministicCursor();
       relay.holdOk = Completer<void>();
-      start(clock).createSection('mine');
+      start(clock);
+      clock.elapse(const Duration(milliseconds: 20));
+      m.createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
       m.renameSection(m.store.sections.single.id, 'new-local');
-      final loser = relay.eventComparedTo(
+      final loser = relay.orderedEvent(
         'channel-sections',
         blob('loser'),
         own.createdAt,
         referenceId: own.id,
         sortsBefore: false,
+        nonce: 0,
       );
       relay
         ..stored.add(loser)
@@ -556,7 +656,7 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
         m = ChannelSectionsManager(
           pubkey: relay.pubkey,
           prefs: prefs(),
-          crypto: ChannelSectionsCrypto(relay.keys.nsec, relay.pubkey),
+          crypto: _DeterministicSectionsCrypto(relay),
           relaySession: relay.session,
           signedEventRelay: relay.signer,
           remoteEnabled: false,
@@ -594,16 +694,20 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
     fakeAsyncTest('a retired late OK cannot rewrite the successor cache', (
       clock,
     ) {
+      seedDeterministicCursor();
       relay.holdOk = Completer<void>();
-      start(clock).createSection('mine');
+      start(clock);
+      clock.elapse(const Duration(milliseconds: 20));
+      m.createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
-      final loser = relay.eventComparedTo(
+      final loser = relay.orderedEvent(
         'channel-sections',
         blob('loser'),
         own.createdAt,
         referenceId: own.id,
         sortsBefore: false,
+        nonce: 0,
       );
       relay
         ..stored.add(loser)
@@ -614,7 +718,7 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       m = ChannelSectionsManager(
         pubkey: relay.pubkey,
         prefs: prefs(),
-        crypto: ChannelSectionsCrypto(relay.keys.nsec, relay.pubkey),
+        crypto: _DeterministicSectionsCrypto(relay),
         relaySession: relay.session,
         signedEventRelay: relay.signer,
         remoteEnabled: false,

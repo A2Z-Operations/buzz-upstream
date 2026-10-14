@@ -8,6 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:shared_preferences/shared_preferences.dart';
 
+const deterministicFixtureEpoch = 4102444800;
+
 /// A scripted relay behind the real [RelaySessionNotifier], so REQ/EOSE,
 /// CLOSED classification, event batching and OK all run production code.
 /// Retains replaceable heads the way the relay does: `created_at DESC, id ASC`.
@@ -16,7 +18,7 @@ class SidebarRelay {
     session.debugAttachSocketForTest(_ScriptedSocket(_onSend));
   }
 
-  final keys = nostr.Keys.generate();
+  final keys = nostr.Keys('1'.padLeft(64, '0'));
   final session = ConnectedRelaySession();
   late final signer = SignedEventRelay(session: session, nsec: keys.nsec);
   final stored = <NostrEvent>[];
@@ -44,34 +46,54 @@ class SidebarRelay {
     return NostrEvent.fromJson(event.toMap());
   }
 
-  NostrEvent eventComparedTo(
+  NostrEvent deterministicEvent(
+    String dTag,
+    Object payload,
+    int createdAt, {
+    List<List<String>> extraTags = const [],
+  }) {
+    final event = nostr.Event.from(
+      kind: EventKind.readState,
+      content: jsonEncode(payload),
+      tags: [
+        ['d', dTag],
+        ...extraTags,
+      ],
+      createdAt: createdAt,
+      secretKey: _privateKey,
+    );
+    return NostrEvent.fromJson(event.toMap());
+  }
+
+  NostrEvent orderedEvent(
     String dTag,
     Object payload,
     int createdAt, {
     required String referenceId,
     required bool sortsBefore,
+    required int nonce,
   }) {
-    for (var attempt = 0; attempt < 4096; attempt++) {
-      final event = nostr.Event.from(
-        kind: EventKind.readState,
-        content: nip44Encrypt(_key, jsonEncode(payload)),
-        tags: [
-          ['d', dTag],
-          ['nonce', '$attempt'],
-        ],
-        createdAt: createdAt,
-        secretKey: _privateKey,
-      );
-      final candidate = NostrEvent.fromJson(event.toMap());
-      if ((candidate.id.compareTo(referenceId) < 0) == sortsBefore) {
-        return candidate;
-      }
+    final candidate = deterministicEvent(
+      dTag,
+      payload,
+      createdAt,
+      extraTags: [
+        ['nonce', '$nonce'],
+      ],
+    );
+    if ((candidate.id.compareTo(referenceId) < 0) != sortsBefore) {
+      throw StateError('The fixed signed fixture has the wrong event ordering');
     }
-    throw StateError('Could not produce the requested signed event ordering');
+    return candidate;
   }
 
-  Object? decrypt(NostrEvent event) =>
-      jsonDecode(nip44Decrypt(_key, event.content));
+  Object? decrypt(NostrEvent event) {
+    try {
+      return jsonDecode(event.content);
+    } on FormatException {
+      return jsonDecode(nip44Decrypt(_key, event.content));
+    }
+  }
 
   late final String _privateKey = nostr.Nip19.decode(payload: keys.nsec).data;
   late final _key = getConversationKey(_privateKey, keys.public);

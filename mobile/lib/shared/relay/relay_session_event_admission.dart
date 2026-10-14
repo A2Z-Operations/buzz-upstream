@@ -10,72 +10,173 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
     final historySub = _historySubscriptions[subId];
     if (historySub != null) {
       historySub.receivedEventFrames++;
+      final encodedBytes = _relayEventEncodedByteUpperBound(data[2]);
+      if (encodedBytes == null) return;
+      if (!_reserveRelayAdmission(
+        encodedBytes,
+        historySub.pendingVerifications,
+        historySub.pendingVerificationBytes,
+      )) {
+        _failHistoryVerification(
+          subId,
+          historySub,
+          StateError('Relay event admission queue is full'),
+          StackTrace.current,
+        );
+        return;
+      }
       historySub.pendingVerifications++;
-      final verification = _verifier.verify(data[2]);
+      historySub.pendingVerificationBytes += encodedBytes;
+      final verification = _observeHistoryVerification(
+        subId,
+        historySub,
+        _verifier.verify(data[2]),
+        encodedBytes,
+        connectionGeneration,
+        contextGeneration,
+      );
       historySub.verificationTail = historySub.verificationTail.then((_) async {
-        try {
-          final event = await verification;
-          if (_historySubscriptions[subId] != historySub ||
-              connectionGeneration != _connectionGeneration ||
-              contextGeneration != _contextGeneration) {
-            return;
-          }
-          if (event != null) historySub.events.add(event);
-        } catch (error, stackTrace) {
-          if (_historySubscriptions[subId] == historySub &&
-              connectionGeneration == _connectionGeneration &&
-              contextGeneration == _contextGeneration) {
-            historySub.verificationError ??= error;
-            historySub.verificationStackTrace ??= stackTrace;
-          }
-        } finally {
-          historySub.pendingVerifications--;
+        final event = await verification;
+        if (_historySubscriptions[subId] != historySub ||
+            connectionGeneration != _connectionGeneration ||
+            contextGeneration != _contextGeneration) {
+          return;
         }
+        historySub.pendingVerifications--;
+        historySub.pendingVerificationBytes -= encodedBytes;
+        if (event != null) historySub.events.add(event);
       });
       return;
     }
 
     final liveSub = _liveSubscriptions[subId];
-    if (liveSub != null) {
+    if (liveSub != null && liveSub.acceptsRelayFrames) {
       final verificationEpoch = liveSub.verificationEpoch;
       liveSub.receivedEventFrames++;
+      final encodedBytes = _relayEventEncodedByteUpperBound(data[2]);
+      if (encodedBytes == null) return;
+      if (!_reserveRelayAdmission(
+        encodedBytes,
+        liveSub.pendingVerifications,
+        liveSub.pendingVerificationBytes,
+      )) {
+        _failLiveVerification(
+          subId,
+          liveSub,
+          StateError('Relay event admission queue is full'),
+          StackTrace.current,
+        );
+        return;
+      }
       liveSub.pendingVerifications++;
-      final verification = _verifier.verify(data[2]);
+      liveSub.pendingVerificationBytes += encodedBytes;
+      final verification = _observeLiveVerification(
+        subId,
+        liveSub,
+        _verifier.verify(data[2]),
+        encodedBytes,
+        connectionGeneration,
+        contextGeneration,
+        verificationEpoch,
+      );
       liveSub.verificationTail = liveSub.verificationTail.then((_) async {
-        try {
-          final event = await verification;
-          if (_liveSubscriptions[subId] != liveSub ||
-              connectionGeneration != _connectionGeneration ||
-              contextGeneration != _contextGeneration ||
-              verificationEpoch != liveSub.verificationEpoch ||
-              event == null) {
-            return;
-          }
-
-          // Only a verified event can prove activity or advance replay state.
-          _resetClosedRetry(liveSub);
-          liveSub.validEventFrames++;
-          if (liveSub.lastSeenCreatedAt == null ||
-              event.createdAt > liveSub.lastSeenCreatedAt!) {
-            liveSub.lastSeenCreatedAt = event.createdAt;
-          }
-          _eventBuffer.add(_BufferedEvent(subId, event));
-          _scheduleFlush();
-        } catch (error, stackTrace) {
-          if (_liveSubscriptions[subId] == liveSub &&
-              connectionGeneration == _connectionGeneration &&
-              contextGeneration == _contextGeneration &&
-              verificationEpoch == liveSub.verificationEpoch) {
-            _failLiveVerification(subId, liveSub, error, stackTrace);
-          }
-        } finally {
-          if (verificationEpoch == liveSub.verificationEpoch) {
-            liveSub.pendingVerifications--;
-          }
+        final event = await verification;
+        if (_liveSubscriptions[subId] != liveSub ||
+            connectionGeneration != _connectionGeneration ||
+            contextGeneration != _contextGeneration ||
+            verificationEpoch != liveSub.verificationEpoch) {
+          return;
         }
+        liveSub.pendingVerifications--;
+        liveSub.pendingVerificationBytes -= encodedBytes;
+        if (event == null) return;
+
+        // Only a verified event can prove activity or advance replay state.
+        _resetClosedRetry(liveSub);
+        liveSub.validEventFrames++;
+        if (liveSub.lastSeenCreatedAt == null ||
+            event.createdAt > liveSub.lastSeenCreatedAt!) {
+          liveSub.lastSeenCreatedAt = event.createdAt;
+        }
+        _eventBuffer.add(_BufferedEvent(subId, event));
+        _scheduleFlush();
       });
     }
   }
+
+  bool _reserveRelayAdmission(
+    int encodedBytes,
+    int subscriptionPending,
+    int subscriptionPendingBytes,
+  ) {
+    if (subscriptionPending >= _maxPendingRelayEvents ||
+        encodedBytes >
+            _maxPendingRelayEventEncodedByteUpperBound -
+                subscriptionPendingBytes ||
+        _pendingRelayAdmissions >= _maxPendingRelayEvents ||
+        encodedBytes >
+            _maxPendingRelayEventEncodedByteUpperBound -
+                _pendingRelayAdmissionBytes) {
+      return false;
+    }
+    _pendingRelayAdmissions++;
+    _pendingRelayAdmissionBytes += encodedBytes;
+    return true;
+  }
+
+  void _releaseRelayAdmission(int encodedBytes) {
+    if (_pendingRelayAdmissions == 0) return;
+    _pendingRelayAdmissions--;
+    _pendingRelayAdmissionBytes -= encodedBytes;
+  }
+
+  Future<NostrEvent?> _observeHistoryVerification(
+    String subId,
+    _HistorySubscription subscription,
+    Future<NostrEvent?> verification,
+    int encodedBytes,
+    int connectionGeneration,
+    int contextGeneration,
+  ) => verification.then(
+    (event) {
+      _releaseRelayAdmission(encodedBytes);
+      return event;
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      _releaseRelayAdmission(encodedBytes);
+      if (_historySubscriptions[subId] == subscription &&
+          connectionGeneration == _connectionGeneration &&
+          contextGeneration == _contextGeneration) {
+        _failHistoryVerification(subId, subscription, error, stackTrace);
+      }
+      return null;
+    },
+  );
+
+  Future<NostrEvent?> _observeLiveVerification(
+    String subId,
+    _LiveSubscription subscription,
+    Future<NostrEvent?> verification,
+    int encodedBytes,
+    int connectionGeneration,
+    int contextGeneration,
+    int verificationEpoch,
+  ) => verification.then(
+    (event) {
+      _releaseRelayAdmission(encodedBytes);
+      return event;
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      _releaseRelayAdmission(encodedBytes);
+      if (_liveSubscriptions[subId] == subscription &&
+          connectionGeneration == _connectionGeneration &&
+          contextGeneration == _contextGeneration &&
+          verificationEpoch == subscription.verificationEpoch) {
+        _failLiveVerification(subId, subscription, error, stackTrace);
+      }
+      return null;
+    },
+  );
 
   void _handleEose(List<dynamic> data) {
     if (data.length < 2 || data[1] is! String) return;
@@ -92,7 +193,7 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
     }
 
     final liveSub = _liveSubscriptions[subId];
-    if (liveSub != null) {
+    if (liveSub != null && liveSub.acceptsRelayFrames) {
       final connectionGeneration = _connectionGeneration;
       final contextGeneration = _contextGeneration;
       final verificationEpoch = liveSub.verificationEpoch;
@@ -130,15 +231,8 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
     if (_historySubscriptions[subId] != subscription) return;
     _historySubscriptions.remove(subId);
     subscription.timeout.cancel();
-    final verificationError = subscription.verificationError;
     if (!subscription.completer.isCompleted) {
-      if (verificationError != null) {
-        subscription.completer.completeError(
-          verificationError,
-          subscription.verificationStackTrace,
-        );
-      } else if (subscription.receivedEventFrames > 0 &&
-          subscription.events.isEmpty) {
+      if (subscription.receivedEventFrames > 0 && subscription.events.isEmpty) {
         subscription.completer.completeError(
           const FormatException(
             'relay history returned no valid signed events',
@@ -147,6 +241,21 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
       } else {
         subscription.completer.complete(subscription.events);
       }
+    }
+    _sendClose(subId);
+  }
+
+  void _failHistoryVerification(
+    String subId,
+    _HistorySubscription subscription,
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    if (_historySubscriptions[subId] != subscription) return;
+    _historySubscriptions.remove(subId);
+    subscription.timeout.cancel();
+    if (!subscription.completer.isCompleted) {
+      subscription.completer.completeError(error, stackTrace);
     }
     _sendClose(subId);
   }
@@ -222,19 +331,30 @@ extension _RelaySessionEventAdmission on RelaySessionNotifier {
       subscription.onClosed?.call('event verification failed: $error');
     }
     _removeLiveSubscription(subId, subscription);
+    _sendClose(subId);
   }
 
   void _retireLiveVerification() {
-    for (final subscription in _liveSubscriptions.values) {
-      _retireLiveSubscriptionVerification(subscription);
+    for (final entry in _liveSubscriptions.entries) {
+      _retireLiveSubscriptionVerification(entry.key, entry.value);
     }
   }
 
-  void _retireLiveSubscriptionVerification(_LiveSubscription subscription) {
+  void _retireLiveSubscriptionVerification(
+    String subId,
+    _LiveSubscription subscription,
+  ) {
     subscription.verificationEpoch++;
+    subscription.acceptsRelayFrames = false;
     subscription.verificationTail = Future.value();
     subscription.pendingVerifications = 0;
+    subscription.pendingVerificationBytes = 0;
     subscription.receivedEventFrames = 0;
     subscription.validEventFrames = 0;
+    _eventBuffer.removeWhere((event) => event.subId == subId);
+    if (_eventBuffer.isEmpty) {
+      _flushTimer?.cancel();
+      _flushTimer = null;
+    }
   }
 }

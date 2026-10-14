@@ -1070,6 +1070,104 @@ void main() {
     expect(delivered, [beforeEose]);
   });
 
+  test(
+    'history overflow retires promptly while prior verification is held',
+    () async {
+      final firstVerification = Completer<List<Map<String, dynamic>?>>();
+      var verificationCalls = 0;
+      final socket = _RecordingRelaySocket();
+      final session = RelaySessionNotifier(
+        verifyEventBatch: (events) {
+          verificationCalls++;
+          if (verificationCalls == 1) return firstVerification.future;
+          return Future.value(List.filled(events.length, null));
+        },
+      );
+      session.debugAttachSocketForTest(socket);
+      final history = session.fetchHistory(_channelFilter);
+      final historyFailure = expectLater(history, throwsStateError);
+      final valid = _signedEvent();
+
+      session.debugHandleMessage(['EVENT', 'h-1', valid.toJson()]);
+      await _waitUntil(() => verificationCalls == 1);
+      final large = {
+        ...valid.toJson(),
+        'content': List.filled(600000, 'x').join(),
+      };
+      for (var i = 0; i < 12; i++) {
+        session.debugHandleMessage(['EVENT', 'h-1', large]);
+      }
+
+      await historyFailure.timeout(const Duration(milliseconds: 200));
+      expect(_closes(socket, 'h-1'), hasLength(1));
+      expect(session.debugPendingRelayAdmissions, lessThanOrEqualTo(10));
+
+      firstVerification.complete([valid.toJson()]);
+      await _waitUntil(() => session.debugPendingRelayAdmissions == 0);
+      expect(_closes(socket, 'h-1'), hasLength(1));
+    },
+  );
+
+  for (final initiallyReady in [false, true]) {
+    test('live overflow retires ${initiallyReady ? 'ready' : 'initial'} '
+        'subscription exactly once', () async {
+      final firstVerification = Completer<List<Map<String, dynamic>?>>();
+      var verificationCalls = 0;
+      final socket = _RecordingRelaySocket();
+      final delivered = <NostrEvent>[];
+      final closed = <String>[];
+      final session = RelaySessionNotifier(
+        verifyEventBatch: (events) {
+          verificationCalls++;
+          if (verificationCalls == 1) return firstVerification.future;
+          return Future.value(List.filled(events.length, null));
+        },
+      );
+      session.debugAttachSocketForTest(socket);
+      final subscribe = session.subscribe(
+        _channelFilter,
+        delivered.add,
+        onClosed: closed.add,
+      );
+      final Future<void>? subscribeFailure = initiallyReady
+          ? null
+          : expectLater(subscribe, throwsStateError);
+      void Function()? unsubscribe;
+      if (initiallyReady) {
+        session.debugHandleMessage(['EOSE', 'l-1']);
+        unsubscribe = await subscribe;
+      }
+      final valid = _signedEvent();
+      session.debugHandleMessage(['EVENT', 'l-1', valid.toJson()]);
+      await _waitUntil(() => verificationCalls == 1);
+      final large = {
+        ...valid.toJson(),
+        'content': List.filled(600000, 'x').join(),
+      };
+      for (var i = 0; i < 12; i++) {
+        session.debugHandleMessage(['EVENT', 'l-1', large]);
+      }
+
+      await _waitUntil(() => _closes(socket, 'l-1').isNotEmpty);
+      if (initiallyReady) {
+        expect(closed, hasLength(1));
+      } else {
+        await subscribeFailure;
+        expect(closed, isEmpty);
+      }
+      expect(_closes(socket, 'l-1'), hasLength(1));
+      expect(session.debugPendingRelayAdmissions, lessThanOrEqualTo(10));
+
+      firstVerification.complete([valid.toJson()]);
+      await _waitUntil(() => session.debugPendingRelayAdmissions == 0);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      session.debugFlushEventBuffer();
+      expect(delivered, isEmpty);
+      unsubscribe?.call();
+      expect(_closes(socket, 'l-1'), hasLength(1));
+    });
+  }
+
   test('disconnect immediately retires pending live verification', () async {
     final verification = Completer<List<Map<String, dynamic>?>>();
     var verificationStarted = false;
@@ -1160,6 +1258,104 @@ void main() {
     expect(delivered, isEmpty);
   });
 
+  for (final message in ['error: relay overloaded', 'error: query timed out']) {
+    test(
+      'pending EVENT and EOSE are fenced by retryable CLOSED: $message',
+      () async {
+        final verification = Completer<List<Map<String, dynamic>?>>();
+        var verificationCalls = 0;
+        final timers = <_ManualTimer>[];
+        final socket = _RecordingRelaySocket();
+        final delivered = <NostrEvent>[];
+        final statuses = <RelaySubscriptionStatus>[];
+        final session = RelaySessionNotifier(
+          verifyEventBatch: (events) {
+            verificationCalls++;
+            if (verificationCalls == 1) return verification.future;
+            return Future.value([
+              for (final event in events) event as Map<String, dynamic>,
+            ]);
+          },
+          retryTimerFactory: (duration, callback) {
+            final timer = _ManualTimer(duration, callback);
+            timers.add(timer);
+            return timer;
+          },
+        );
+        session.debugAttachSocketForTest(socket);
+        final subscribe = session.subscribeWithStatus(
+          _channelFilter,
+          delivered.add,
+          onStatusChanged: statuses.add,
+        );
+        session.debugHandleMessage(['EOSE', 'l-1']);
+        final unsubscribe = await subscribe;
+        final stale = _signedEvent(createdAt: 30, content: 'stale');
+
+        session.debugHandleMessage(['EVENT', 'l-1', stale.toJson()]);
+        session.debugHandleMessage(['EOSE', 'l-1']);
+        await _waitUntil(() => verificationCalls == 1);
+        session.debugHandleMessage(['CLOSED', 'l-1', message]);
+        expect(statuses, [
+          RelaySubscriptionStatus.ready,
+          RelaySubscriptionStatus.retrying,
+        ]);
+        session.debugHandleMessage(['EOSE', 'l-1']);
+        expect(statuses, hasLength(2));
+
+        verification.complete([stale.toJson()]);
+        await _waitUntil(() => session.debugPendingRelayAdmissions == 0);
+        await Future<void>.delayed(Duration.zero);
+        expect(delivered, isEmpty);
+        expect(statuses, hasLength(2));
+        expect(timers.single.isActive, isTrue);
+
+        timers.single.fire();
+        await Future<void>.delayed(Duration.zero);
+        final replayReq = _reqs(socket).where((req) => req[1] == 'l-1').last;
+        expect(replayReq[2], isNot(contains('since')));
+
+        final replay = _signedEvent(createdAt: 40, content: 'replay');
+        session.debugHandleMessage(['EVENT', 'l-1', replay.toJson()]);
+        session.debugHandleMessage(['EOSE', 'l-1']);
+        await _waitUntil(() => statuses.length == 3);
+        expect(delivered, [replay]);
+        expect(statuses.last, RelaySubscriptionStatus.ready);
+        unsubscribe();
+      },
+    );
+  }
+
+  test('retryable CLOSED drops an already verified buffered event', () async {
+    final verification = Completer<List<Map<String, dynamic>?>>();
+    final timers = <_ManualTimer>[];
+    final socket = _RecordingRelaySocket();
+    final delivered = <NostrEvent>[];
+    final session = RelaySessionNotifier(
+      verifyEventBatch: (_) => verification.future,
+      retryTimerFactory: (duration, callback) {
+        final timer = _ManualTimer(duration, callback);
+        timers.add(timer);
+        return timer;
+      },
+    );
+    session.debugAttachSocketForTest(socket);
+    final subscribe = session.subscribe(_channelFilter, delivered.add);
+    session.debugHandleMessage(['EOSE', 'l-1']);
+    final unsubscribe = await subscribe;
+    final stale = _signedEvent(createdAt: 30);
+
+    session.debugHandleMessage(['EVENT', 'l-1', stale.toJson()]);
+    verification.complete([stale.toJson()]);
+    await _waitUntil(() => session.debugPendingRelayAdmissions == 0);
+    session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    expect(delivered, isEmpty);
+    expect(timers.single.isActive, isTrue);
+    unsubscribe();
+  });
+
   test('local OK acknowledgment bypasses pending verification', () async {
     final verification = Completer<List<Map<String, dynamic>?>>();
     var verificationStarted = false;
@@ -1240,6 +1436,8 @@ void main() {
 
   test('terminal CLOSED fails a live subscribe before ready', () async {
     final session = RelaySessionNotifier();
+    final socket = _RecordingRelaySocket();
+    session.debugAttachSocketForTest(socket);
     const filter = NostrFilter(kinds: [EventKind.agentObserverFrame], limit: 0);
 
     final subscribe = session.subscribe(filter, (_) {});
@@ -1259,6 +1457,7 @@ void main() {
         ),
       ),
     );
+    expect(_closes(socket, 'l-1'), isEmpty);
   });
 
   test(
@@ -1366,6 +1565,8 @@ void main() {
     session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
     expect(timers.last.duration, const Duration(seconds: 2));
 
+    timers.last.fire();
+    await Future<void>.delayed(Duration.zero);
     session.debugHandleMessage(['EOSE', 'l-1']);
     session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
     expect(timers.last.duration, const Duration(seconds: 1));
@@ -1424,6 +1625,8 @@ void main() {
     session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
     expect(timers.last.duration, const Duration(seconds: 2));
 
+    timers.last.fire();
+    await Future<void>.delayed(Duration.zero);
     session.debugHandleMessage([
       'EVENT',
       'l-1',
@@ -1459,6 +1662,7 @@ void main() {
     session.debugResetClosedRetriesForDisconnect();
     expect(timers.last.isActive, isFalse);
     session.debugSetSessionStatus(SessionStatus.connected);
+    await session.debugReplayLiveSubscriptions();
     session.debugHandleMessage(['CLOSED', 'l-1', 'error: transient']);
     expect(timers.last.duration, const Duration(seconds: 1));
     unsubscribe();
@@ -1930,7 +2134,16 @@ void main() {
   );
 
   test('live onClosed callback runs only for a terminal CLOSED', () async {
-    final session = RelaySessionNotifier();
+    final timers = <_ManualTimer>[];
+    final socket = _RecordingRelaySocket();
+    final session = RelaySessionNotifier(
+      retryTimerFactory: (duration, callback) {
+        final timer = _ManualTimer(duration, callback);
+        timers.add(timer);
+        return timer;
+      },
+    );
+    session.debugAttachSocketForTest(socket);
     final closedMessages = <String>[];
     const filter = NostrFilter(kinds: [EventKind.agentObserverFrame], limit: 0);
 
@@ -1947,6 +2160,8 @@ void main() {
       'error: temporarily unavailable',
     ]);
     expect(closedMessages, isEmpty);
+    timers.single.fire();
+    await Future<void>.delayed(Duration.zero);
     session.debugHandleMessage([
       'CLOSED',
       'l-1',
@@ -2315,6 +2530,16 @@ List<String> _replayedChannelIds(_RecordingRelaySocket socket) => _reqs(socket)
 
 List<List<dynamic>> _reqs(_RecordingRelaySocket socket) =>
     socket.messages.where((message) => message.first == 'REQ').toList();
+
+List<List<dynamic>> _closes(_RecordingRelaySocket socket, String subId) =>
+    socket.messages
+        .where(
+          (message) =>
+              message.length >= 2 &&
+              message.first == 'CLOSE' &&
+              message[1] == subId,
+        )
+        .toList();
 
 class _RecordingRelaySocket extends RelaySocket {
   _RecordingRelaySocket()
