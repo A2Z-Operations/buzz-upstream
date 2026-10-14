@@ -4,6 +4,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 import '../../shared/identity_names/identity_names_provider.dart';
+import '../../shared/me/me_sync.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/mentions/mention_tags.dart';
 import '../../shared/theme/theme.dart';
@@ -13,7 +14,6 @@ import '../../shared/widgets/buzz_search_field.dart';
 import '../../shared/widgets/filter_chip_bar.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
-import '../../shared/widgets/ios_navigation_metrics.dart';
 import '../../shared/widgets/message_author_meta.dart';
 import '../channels/channel.dart';
 import '../channels/channel_detail_page.dart';
@@ -34,14 +34,11 @@ part 'search_page/message_tile.dart';
 
 enum _SearchFilter { all, messages, channels, people }
 
-const _searchFieldMinHeight = 36.0;
 const _searchIdleFieldHeight = 45.0;
 const _searchIdleTextSize = 15.0;
 const _searchFieldVerticalPadding = Grid.xxs;
 const _searchFieldMoveDuration = Duration(milliseconds: 160);
-const _searchTitleReturnDuration = Duration(milliseconds: 80);
 const _searchCancelEnterDuration = Duration(milliseconds: 80);
-const _searchCancelExitDuration = Duration(milliseconds: 60);
 const _searchIdleFieldTopInset = Grid.half;
 const _searchControlsToFiltersGap = Grid.xxs;
 const _searchFilterChipVerticalPadding = Grid.xxs;
@@ -64,18 +61,6 @@ double _searchActiveFieldRightInset(BuildContext context) {
   return cancelWidth > _searchActiveFieldRightInsetMin
       ? cancelWidth
       : _searchActiveFieldRightInsetMin;
-}
-
-double _searchFieldHeight(BuildContext context) {
-  const style = searchInputTextStyle;
-  final scaledFontSize = MediaQuery.textScalerOf(
-    context,
-  ).scale(style.fontSize ?? 15);
-  final contentHeight =
-      scaledFontSize * (style.height ?? 1) + _searchFieldVerticalPadding * 2;
-  return contentHeight > _searchFieldMinHeight
-      ? contentHeight
-      : _searchFieldMinHeight;
 }
 
 double _idleSearchFieldHeight(BuildContext context) {
@@ -119,7 +104,6 @@ class SearchPage extends HookConsumerWidget {
     final textController = useTextEditingController();
     final focusNode = useFocusNode();
     final isSearchEditing = useState(false);
-    final showSearchTitle = useState(true);
     final isTabActivationInFlight = useRef(false);
     final reduceMotion = MediaQuery.disableAnimationsOf(context);
     final searchSurfaceColor = navigationSearchSurface(context);
@@ -129,37 +113,18 @@ class SearchPage extends HookConsumerWidget {
       fontSize: 22,
       fontWeight: FontWeight.w600,
     );
-    final compactSearchFieldHeight = _searchFieldHeight(context);
     final idleSearchFieldHeight = _idleSearchFieldHeight(context);
     final searchHeaderFiltersHeight = _searchHeaderFiltersHeight(context);
     final searchActiveFieldRightInset = _searchActiveFieldRightInset(context);
     final nativeIos = defaultTargetPlatform == TargetPlatform.iOS;
-    final searchBottomOverlap = nativeIos
-        ? IosNavigationMetrics.of(context).compactHeight
-        : _searchIdleFieldTopInset +
-              compactSearchFieldHeight +
-              _searchControlsToFiltersGap;
-    final activeFieldTop = nativeIos
-        ? ((searchBottomOverlap - compactSearchFieldHeight) / 2).clamp(
-            0.0,
-            double.infinity,
-          )
-        : _searchIdleFieldTopInset;
-    final filtersTop = nativeIos
-        ? activeFieldTop +
-              compactSearchFieldHeight +
-              _searchControlsToFiltersGap
-        : searchBottomOverlap;
-    // Cancel remains an accessible target without giving the text action a
-    // visual button treatment.
-    final searchControlHeight = compactSearchFieldHeight > Grid.xl
-        ? compactSearchFieldHeight
+    const activeFieldTop = _searchIdleFieldTopInset;
+    final filtersTop =
+        activeFieldTop + idleSearchFieldHeight + _searchControlsToFiltersGap;
+    final searchControlHeight = idleSearchFieldHeight > Grid.xl
+        ? idleSearchFieldHeight
         : Grid.xl;
     final searchHeaderBottomHeight = isSearchEditing.value
-        ? filtersTop -
-              searchBottomOverlap +
-              searchHeaderFiltersHeight +
-              _searchControlsToFiltersGap
+        ? filtersTop + searchHeaderFiltersHeight + _searchControlsToFiltersGap
         : idleSearchFieldHeight + _searchIdleFieldTopInset + Grid.xxs;
     final topSectionHeight = frostedAppBarHeight(
       context,
@@ -168,7 +133,6 @@ class SearchPage extends HookConsumerWidget {
     );
 
     void activateSearch() {
-      showSearchTitle.value = false;
       isSearchEditing.value = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (context.mounted && isSearchEditing.value) {
@@ -179,10 +143,6 @@ class SearchPage extends HookConsumerWidget {
 
     void deactivateSearch() {
       if (!isSearchEditing.value) return;
-      // The field is painted above the title while it returns to its idle
-      // position. Start this fade now so the title is already there beneath it
-      // and is revealed by the field's motion instead of arriving afterward.
-      showSearchTitle.value = true;
       isSearchEditing.value = false;
     }
 
@@ -233,113 +193,35 @@ class SearchPage extends HookConsumerWidget {
       // above the keyboard.
       resizeToAvoidBottomInset: false,
       appBar: FrostedAppBar(
-        nativeTitle: isSearchEditing.value ? '' : 'Search',
-        nativeLayoutDuration: reduceMotion
-            ? Duration.zero
-            : _searchFieldMoveDuration,
-        nativeLargeTitle: !isSearchEditing.value,
+        nativeTitle: 'Search',
+        nativeLayoutDuration: Duration.zero,
+        nativeLargeTitle: true,
         nativeActions: const [],
-        automaticallyImplyLeading: false,
+        automaticallyImplyLeading: true,
         horizontalInset: Grid.twelve,
         showBottomDivider: true,
         bottomDividerOpacity: 0.07,
         titleStyle: headerTitleStyle,
-        // Keep this mounted through the search-field morph so it can fade in
-        // beneath the returning field rather than popping in afterward.
-        title: IgnorePointer(
-          child: AnimatedOpacity(
-            key: const Key('search-header-title-opacity'),
-            duration: reduceMotion ? Duration.zero : _searchTitleReturnDuration,
-            curve: Curves.easeOutCubic,
-            opacity: showSearchTitle.value ? 1 : 0,
-            child: Text(
-              'Search',
-              key: const ValueKey('search-header-title'),
-              style: headerTitleStyle,
-            ),
-          ),
+        title: Text(
+          'Search',
+          key: const ValueKey('search-header-title'),
+          style: headerTitleStyle,
         ),
-        actions: [
-          AnimatedSwitcher(
-            duration: reduceMotion ? Duration.zero : _searchCancelEnterDuration,
-            reverseDuration: reduceMotion
-                ? Duration.zero
-                : _searchCancelExitDuration,
-            transitionBuilder: (child, animation) {
-              final curvedAnimation = CurvedAnimation(
-                parent: animation,
-                curve: Curves.easeOutCubic,
-                reverseCurve: Curves.easeInCubic,
-              );
-              return SizeTransition(
-                sizeFactor: curvedAnimation,
-                axis: Axis.horizontal,
-                axisAlignment: 1,
-                child: FadeTransition(
-                  opacity: curvedAnimation,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: const Offset(0.35, 0),
-                      end: Offset.zero,
-                    ).animate(curvedAnimation),
-                    child: child,
-                  ),
-                ),
-              );
-            },
-            child: isSearchEditing.value
-                ? Semantics(
-                    key: const Key('search-cancel'),
-                    button: true,
-                    label: 'Cancel search',
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () {
-                        textController.clear();
-                        ref.read(searchProvider.notifier).clear();
-                        deactivateSearch();
-                        focusNode.unfocus();
-                      },
-                      child: SizedBox(
-                        height: searchControlHeight,
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: Grid.half,
-                          ),
-                          child: Center(
-                            child: Text(
-                              'Cancel',
-                              style: filterChipTextStyle.copyWith(
-                                color: context.colors.primary,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  )
-                : const SizedBox.shrink(key: ValueKey('search-cancel-hidden')),
-          ),
-        ],
+        actions: const [],
         bottomHeight: searchHeaderBottomHeight,
-        bottomOverlap: searchBottomOverlap,
+        bottomOverlap: 0,
         bottom: Stack(
           clipBehavior: Clip.none,
           children: [
             AnimatedPositioned(
-              duration: reduceMotion ? Duration.zero : _searchFieldMoveDuration,
+              duration: Duration.zero,
               curve: Curves.easeInOutCubic,
               left: Grid.gutter,
               right: isSearchEditing.value
                   ? searchActiveFieldRightInset
                   : Grid.gutter,
-              top: isSearchEditing.value
-                  ? activeFieldTop
-                  : searchBottomOverlap + _searchIdleFieldTopInset,
-              height: isSearchEditing.value
-                  ? compactSearchFieldHeight
-                  : idleSearchFieldHeight,
+              top: activeFieldTop,
+              height: idleSearchFieldHeight,
               // Do not key this subtree by the visual state: replacing the
               // TextField immediately after its first tap can detach its
               // native input connection before the keyboard is shown.
@@ -367,7 +249,7 @@ class SearchPage extends HookConsumerWidget {
                 ),
               ),
             ),
-            if (nativeIos && isSearchEditing.value)
+            if (isSearchEditing.value)
               Positioned(
                 top: activeFieldTop,
                 right: Grid.gutter,
@@ -377,7 +259,7 @@ class SearchPage extends HookConsumerWidget {
                   button: true,
                   label: 'Cancel search',
                   child: GestureDetector(
-                    key: const Key('search-ios-cancel'),
+                    key: Key(nativeIos ? 'search-ios-cancel' : 'search-cancel'),
                     behavior: HitTestBehavior.opaque,
                     onTap: () {
                       textController.clear();
@@ -388,7 +270,7 @@ class SearchPage extends HookConsumerWidget {
                     child: Align(
                       alignment: Alignment.topRight,
                       child: SizedBox(
-                        height: compactSearchFieldHeight,
+                        height: idleSearchFieldHeight,
                         child: Align(
                           alignment: Alignment.centerRight,
                           child: Text(
@@ -411,16 +293,8 @@ class SearchPage extends HookConsumerWidget {
                     : _searchCancelEnterDuration,
                 switchInCurve: Curves.easeOutCubic,
                 switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) => FadeTransition(
-                  opacity: animation,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: const Offset(0, 0.2),
-                      end: Offset.zero,
-                    ).animate(animation),
-                    child: child,
-                  ),
-                ),
+                transitionBuilder: (child, animation) =>
+                    FadeTransition(opacity: animation, child: child),
                 child: isSearchEditing.value
                     ? Align(
                         alignment: Alignment.topCenter,
@@ -706,7 +580,7 @@ class _RecentSearches extends StatelessWidget {
   }
 }
 
-class _ChannelsSection extends StatelessWidget {
+class _ChannelsSection extends ConsumerWidget {
   final List<Channel> channels;
   final VoidCallback onResultSelected;
   const _ChannelsSection({
@@ -714,7 +588,7 @@ class _ChannelsSection extends StatelessWidget {
     required this.onResultSelected,
   });
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -762,11 +636,7 @@ class _ChannelsSection extends StatelessWidget {
                 : null,
             onTap: () {
               onResultSelected();
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => ChannelDetailPage(channel: channel),
-                ),
-              );
+              _openSearchChannel(context, ref, channel);
             },
           ),
       ],
@@ -888,4 +758,32 @@ extension on _SearchFilter {
     _SearchFilter.channels => 'Channels',
     _SearchFilter.people => 'People',
   };
+}
+
+/// Resolve personal placement before opening a result so sessions retain their
+/// flat conversation and assistant controls, including on a fresh app launch.
+Future<void> _openSearchChannel(
+  BuildContext context,
+  WidgetRef ref,
+  Channel channel,
+) async {
+  try {
+    final groups = await ref.read(meGroupsProvider.future);
+    if (!context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ChannelDetailPage(
+          channel: channel,
+          personalChat: groups.channels.contains(channel.id),
+        ),
+      ),
+    );
+  } catch (_) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Couldn’t open this conversation. Try again.'),
+      ),
+    );
+  }
 }

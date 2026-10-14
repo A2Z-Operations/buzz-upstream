@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:buzz/features/channels/me/me_messages_provider.dart';
 import 'dart:collection';
 import 'dart:convert';
 
@@ -11,6 +12,28 @@ import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
 void main() {
+  test(
+    'Me reads channel replies without the top-level window filter',
+    () async {
+      final relay = _RecordingRelaySessionNotifier(
+        historyResults: [
+          [_event(id: 'history', createdAt: 10)],
+        ],
+      );
+      final container = _buildContainer(relay);
+      addTearDown(container.dispose);
+      container.read(meMessagesProvider(_channelId));
+      await relay.subscribed;
+      await _pumpEventQueue();
+      expect(relay.queryFilters, isEmpty);
+      expect(relay.historyFilters.single.extensions['top_level'], isNot(true));
+      expect(
+        container.read(meMessagesProvider(_channelId)).value!.map((e) => e.id),
+        ['history'],
+      );
+    },
+  );
+
   test('live window without deep links does not rescan flattened ids', () async {
     var historyIdReads = 0;
     final history = _IdReadTrackingEvent(

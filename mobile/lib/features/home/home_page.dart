@@ -20,12 +20,16 @@ class HomePage extends HookConsumerWidget {
   const HomePage({
     required this.settingsPageBuilder,
     this.communityInvitePageBuilder,
+    this.mePageBuilder,
     this.communityAppearancePageBuilder,
     required this.hasUnreadInbox,
     super.key,
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Personal chat workspace supplied by the app composition root.
+  final WidgetBuilder? mePageBuilder;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -65,9 +69,9 @@ class HomePage extends HookConsumerWidget {
       label: 'Activity',
     ),
     _HomeDestination(
-      icon: BuzzIcons.search300,
-      selectedIcon: BuzzIcons.search500,
-      label: 'Search',
+      icon: Icons.chat_bubble_outline,
+      selectedIcon: Icons.chat_bubble,
+      label: 'Me',
     ),
   ];
 
@@ -85,7 +89,6 @@ class HomePage extends HookConsumerWidget {
     );
     final homeReselection = useValueNotifier(0);
     final activityReselection = useValueNotifier(0);
-    final searchReselection = useValueNotifier(0);
     final settingsTransitionProgress = useValueNotifier(0.0);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
@@ -96,10 +99,33 @@ class HomePage extends HookConsumerWidget {
       MediaQuery.sizeOf(context).width,
       _destinations.length,
     );
-
     final pages = [
       ChannelsPage(
         settingsPageBuilder: settingsPageBuilder,
+        onSearch: () => Navigator.of(context).push(
+          PageRouteBuilder<void>(
+            allowSnapshotting: false,
+            transitionDuration: reducedMotion
+                ? Duration.zero
+                : _tabContentTransitionDuration,
+            reverseTransitionDuration: reducedMotion
+                ? Duration.zero
+                : _tabContentTransitionDuration,
+            pageBuilder: (_, animation, secondaryAnimation) =>
+                const SearchPage(),
+            transitionsBuilder: (_, animation, secondaryAnimation, child) {
+              final progress = reducedMotion
+                  ? 1.0
+                  : _tabContentTransitionCurve.transform(animation.value);
+              return DirectionalTransitionScope(
+                horizontalOffset:
+                    _tabContentTransitionDistance * (1 - progress),
+                opacity: progress,
+                child: child,
+              );
+            },
+          ),
+        ),
         communityInvitePageBuilder: communityInvitePageBuilder,
         communityAppearancePageBuilder: communityAppearancePageBuilder,
         tabReselection: homeReselection,
@@ -114,7 +140,7 @@ class HomePage extends HookConsumerWidget {
       else
         const SizedBox.shrink(),
       if (visitedTabs.value.contains(2))
-        SearchPage(tabReselection: searchReselection)
+        mePageBuilder?.call(context) ?? const SizedBox.shrink()
       else
         const SizedBox.shrink(),
     ];
@@ -209,8 +235,6 @@ class HomePage extends HookConsumerWidget {
                       homeReselection.value++;
                     case 1:
                       activityReselection.value++;
-                    case 2:
-                      searchReselection.value++;
                   }
                   return;
                 }

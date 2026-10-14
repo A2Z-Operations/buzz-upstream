@@ -1,3 +1,5 @@
+import '../../shared/widgets/collapsible_section_body.dart';
+import '../../shared/me/me_sync.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max, min, pi;
@@ -72,6 +74,7 @@ part 'channels_page/community_switcher.dart';
 part 'channels_page/community_switcher_action.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
+part 'channels_page/header_actions.dart';
 
 enum _QuickAction { createChannel, newDm, browseChannels }
 
@@ -106,11 +109,6 @@ const double _kTopSectionBottomPadding = Grid.xxs;
 /// looking pushed outward, so the bar is pulled in to sit the avatar's centre
 /// near the channel-icon column.
 const double _kTopSectionInset = Grid.twelve;
-const Duration _kSectionExpandDuration = Duration(milliseconds: 220);
-const Duration _kSectionCollapseDuration = Duration(milliseconds: 170);
-const Curve _kSectionExpandCurve = Cubic(0.23, 1, 0.32, 1);
-const Curve _kSectionCollapseCurve = Curves.easeInCubic;
-const double _kSectionCollapsedScaleY = 0.98;
 const double _kHeaderFrostScrollDistance = Grid.xxl;
 const double _kHeaderFrostMaxBlurSigma = 23.12;
 
@@ -169,6 +167,7 @@ _UnreadChannelState _computeUnreadChannelState({
 class ChannelsPage extends HookConsumerWidget {
   const ChannelsPage({
     required this.settingsPageBuilder,
+    this.onSearch,
     this.communityInvitePageBuilder,
     this.communityAppearancePageBuilder,
     required this.onSettingsTransitionProgress,
@@ -177,6 +176,9 @@ class ChannelsPage extends HookConsumerWidget {
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Opens global search from the header.
+  final VoidCallback? onSearch;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -281,7 +283,11 @@ class ChannelsPage extends HookConsumerWidget {
     if (channelsAsync.asData?.value case final data?) {
       cachedChannels.value = data;
     }
-    final channels = cachedChannels.value;
+    final personalIds =
+        ref.watch(meGroupsProvider).asData?.value.channels ?? const <String>[];
+    final channels = cachedChannels.value
+        ?.where((channel) => !personalIds.contains(channel.id))
+        .toList();
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
       await Navigator.of(context).push(
@@ -501,6 +507,12 @@ class ChannelsPage extends HookConsumerWidget {
           onPressed: openCommunitySwitcher,
         ),
         nativeActions: [
+          if (onSearch != null)
+            IosNavigationAction(
+              label: 'Search',
+              symbol: 'magnifyingglass',
+              onPressed: onSearch,
+            ),
           IosNavigationAction(
             label: 'Settings',
             avatarIdentity: '${activeCommunity?.id}:${activeCommunity?.pubkey}',
@@ -539,23 +551,17 @@ class ChannelsPage extends HookConsumerWidget {
           onTap: openCommunitySwitcher,
         ),
         actions: [
-          SizedBox(
-            width: Grid.xl,
-            height: Grid.xl,
-            child: Center(
-              child: ProfileAvatar(
-                size: _kTopSectionProfileAvatarSize,
-                showPresence: false,
-                onTap: () {
-                  unawaited(HapticFeedback.lightImpact());
-                  final route = _SettingsPageRoute(
-                    builder: settingsPageBuilder,
-                    onTransitionProgress: onSettingsTransitionProgress,
-                  );
-                  Navigator.of(context).push(route);
-                },
-              ),
-            ),
+          _ChannelHeaderActions(
+            onSearch: onSearch,
+            onSettings: () {
+              unawaited(HapticFeedback.lightImpact());
+              Navigator.of(context).push(
+                _SettingsPageRoute(
+                  builder: settingsPageBuilder,
+                  onTransitionProgress: onSettingsTransitionProgress,
+                ),
+              );
+            },
           ),
         ],
         bottomHeight: _kTopSectionBottomPadding,

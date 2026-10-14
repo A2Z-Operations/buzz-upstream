@@ -20,6 +20,7 @@ import 'features/channels/channel_management_provider.dart';
 import 'features/channels/channels_provider.dart';
 import 'features/channels/unread_badge/unread_badge_provider.dart';
 import 'features/home/home_page.dart';
+import 'features/channels/me/me_page.dart';
 import 'features/invites/invite_create_page.dart';
 import 'features/invites/invite_join_provider.dart';
 import 'features/pairing/pairing_page.dart';
@@ -442,6 +443,7 @@ class App extends HookConsumerWidget {
         data: (state) => switch (state.status) {
           AuthStatus.authenticated => DeepLinkDispatcher(
             child: HomePage(
+              mePageBuilder: (_) => const MePage(),
               settingsPageBuilder: _buildSettingsPage,
               communityInvitePageBuilder: (_) => const CommunityInvitePage(),
               communityAppearancePageBuilder: (_) => const ThemePickerPage(),

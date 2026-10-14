@@ -3,6 +3,7 @@ part of '../channel_detail_page.dart';
 class _MessageList extends HookConsumerWidget {
   final ValueNotifier<StickyDateHeaderState> stickyDateHeaderState;
   final List<MainTimelineEntry> entries;
+  final List<TypingEntry> inlineTyping;
   final List<TimelineMessage> allMessages;
   final String? initialMessageId;
   final String? initialThreadRootId;
@@ -22,6 +23,7 @@ class _MessageList extends HookConsumerWidget {
 
   const _MessageList({
     required this.entries,
+    this.inlineTyping = const [],
     required this.stickyDateHeaderState,
     required this.allMessages,
     required this.initialMessageId,
@@ -43,6 +45,8 @@ class _MessageList extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final handoff = useAgentReplyHandoffs(channelId, inlineTyping, allMessages);
+    final displayedTyping = handoff.typing;
     final appView = View.of(context);
     final localSendAnimations = ref.watch(
       localMessageSendAnimationProvider(channelId),
@@ -710,34 +714,24 @@ class _MessageList extends HookConsumerWidget {
       },
     );
 
-    if (entries.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              BuzzIcons.messageSquare,
-              size: Grid.xl,
-              color: context.colors.onSurfaceVariant,
-            ),
-            const SizedBox(height: Grid.xxs),
-            Text(
-              'No messages yet',
-              style: context.textTheme.bodyLarge?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: Grid.half),
-            Text(
-              'Be the first to say something!',
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
-          ],
+    if (entries.isEmpty && displayedTyping.isNotEmpty) {
+      return Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            Grid.gutter,
+            0,
+            Grid.gutter,
+            composerBottomInset,
+          ),
+          child: InlineAgentTyping(
+            channelId: channelId,
+            entries: displayedTyping,
+          ),
         ),
       );
     }
+    if (entries.isEmpty) return const _EmptyMessages();
 
     // Build channel names map once for all message bubbles.
     final channelsAsync = ref.watch(channelsProvider);
@@ -906,7 +900,16 @@ class _MessageList extends HookConsumerWidget {
                         else ...[
                           _MessageBubble(
                             message: message,
-                            showAuthor: showAuthor,
+                            showAuthor:
+                                showAuthor ||
+                                isRecentAgentReplyHandoff(
+                                  handoff.messageIds,
+                                  message.id,
+                                ),
+                            typingHandoff: isRecentAgentReplyHandoff(
+                              handoff.messageIds,
+                              message.id,
+                            ),
                             showAvatar: showAvatar,
                             hasReplies: entry.summary != null,
                             replyFooter: entry.summary == null
@@ -930,6 +933,11 @@ class _MessageList extends HookConsumerWidget {
                             restoreComposerFocus: restoreComposerFocus,
                           ),
                         ],
+                        if (index == 0 && displayedTyping.isNotEmpty)
+                          InlineAgentTyping(
+                            channelId: channelId,
+                            entries: displayedTyping,
+                          ),
                       ],
                     ),
                   ),

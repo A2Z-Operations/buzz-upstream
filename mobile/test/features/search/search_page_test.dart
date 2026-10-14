@@ -22,7 +22,7 @@ import '../../helpers/widget_helpers.dart';
 void main() {
   for (final reducedMotion in [false, true]) {
     testWidgets(
-      'iOS search field rises above tappable chips, reduced motion=$reducedMotion',
+      'iOS search field stays in place above tappable chips, reduced motion=$reducedMotion',
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
         addTearDown(() => debugDefaultTargetPlatformOverride = null);
@@ -65,12 +65,12 @@ void main() {
           tester.getRect(find.byType(FrostedAppBar)).right - cancelRect.right,
           closeTo(Grid.gutter, 0.01),
         );
-        expect(active.top, lessThan(idle.top));
+        expect(active.top, closeTo(idle.top, 0.01));
+        expect(active.height, closeTo(idle.height, 0.01));
         expect(active.width, lessThan(idle.width));
         expect(active.top, greaterThanOrEqualTo(59));
         if (!reducedMotion) {
-          expect(middle.top, greaterThan(active.top));
-          expect(middle.top, lessThan(idle.top));
+          expect(middle.top, closeTo(idle.top, 0.01));
         }
         expect(tester.element(find.byType(TextField)), same(input));
         expect(
@@ -180,15 +180,7 @@ void main() {
 
     expect(find.byKey(const Key('search-cancel')), findsOneWidget);
     expect(focusNode.hasFocus, isTrue);
-    expect(
-      tester
-          .widget<AnimatedOpacity>(
-            find.byKey(const Key('search-header-title-opacity')),
-          )
-          .opacity,
-      0,
-      reason: 'The tab gesture must not paint a close-and-reopen flicker.',
-    );
+    expect(find.byKey(const Key('search-header-title')), findsOneWidget);
   });
 
   testWidgets('uses the shared frosted navigation surface', (tester) async {
@@ -376,7 +368,9 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('focus slides Cancel in beside the search field', (tester) async {
+  testWidgets('focus shows Cancel and chips without moving the search field', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       WidgetHelpers.testable(
         overrides: [
@@ -419,19 +413,14 @@ void main() {
       isTrue,
       reason: 'Tapping the idle search field opens the native keyboard.',
     );
-    final enteringSlide = tester.widget<SlideTransition>(
-      find.ancestor(of: cancel, matching: find.byType(SlideTransition)).first,
-    );
-    expect(enteringSlide.position.value.dx, greaterThan(0));
-
     await tester.pump(const Duration(milliseconds: 160));
     final focusedWidth = tester.getSize(searchFieldContainer).width;
     final focusedRect = tester.getRect(searchFieldContainer);
     expect(focusedWidth, lessThan(unfocusedWidth));
     expect(
       focusedRect.top,
-      lessThan(unfocusedTop),
-      reason: 'The active field translates upward into the title row.',
+      closeTo(unfocusedTop, 0.01),
+      reason: 'The active field stays below the header.',
     );
     expect(find.byKey(const Key('search-header-filters')), findsOneWidget);
     final filtersRect = tester.getRect(
@@ -442,10 +431,6 @@ void main() {
       Grid.xxs,
       reason: 'Filters keep one compact spacing token below the controls.',
     );
-    final settledSlide = tester.widget<SlideTransition>(
-      find.ancestor(of: cancel, matching: find.byType(SlideTransition)).first,
-    );
-    expect(settledSlide.position.value, Offset.zero);
     final movingIcon = find.byKey(const Key('search-moving-icon'));
     final iconScale = tester.widget<AnimatedScale>(
       find.ancestor(of: movingIcon, matching: find.byType(AnimatedScale)),
@@ -465,31 +450,14 @@ void main() {
     expect(
       appBarRect.contains(focusedRect.center),
       isTrue,
-      reason: 'The translated field remains inside the app bar hit-test box.',
+      reason: 'The field remains inside the app bar hit-test box.',
     );
 
     await tester.enterText(editingField, 'design');
     await tester.tap(cancel);
     await tester.pump();
 
-    final titleOpacity = tester.widget<AnimatedOpacity>(
-      find.byKey(const Key('search-header-title-opacity')),
-    );
-    expect(
-      titleOpacity.opacity,
-      1,
-      reason:
-          'The title fades beneath the returning field instead of appearing after it.',
-    );
-    await tester.pump(const Duration(milliseconds: 159));
-    expect(
-      tester
-          .widget<AnimatedOpacity>(
-            find.byKey(const Key('search-header-title-opacity')),
-          )
-          .opacity,
-      1,
-    );
+    expect(find.byKey(const Key('search-header-title')), findsOneWidget);
     await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('search-cancel')), findsNothing);
@@ -566,7 +534,11 @@ void main() {
     await tester.pumpAndSettle();
     await tester.enterText(searchField, 'design systems');
     await tester.testTextInput.receiveAction(TextInputAction.search);
-    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('search-cancel')), findsNothing);
+    // Submission dismisses editing immediately. Reopen before clearing.
+    await tester.tap(searchField);
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('search-cancel')));
     await tester.pumpAndSettle();
 

@@ -1,3 +1,8 @@
+import 'package:buzz/features/channels/agent_reply_handoff.dart';
+import 'package:buzz/features/channels/me/me_messages_provider.dart';
+import 'package:buzz/shared/me/me_assistants.dart';
+import 'package:buzz/shared/me/me_sync.dart';
+import 'package:buzz/shared/me/me_groups.dart';
 import 'dart:async';
 import 'package:buzz/shared/push/push_bridge.dart';
 import 'package:buzz/features/channels/channel_actions_sheet.dart';
@@ -224,6 +229,7 @@ Widget _buildTestable({
   ProfileNotifier? profileNotifier,
   String? signingPubkey,
   bool darkTheme = false,
+  bool personalChat = false,
   required List<NostrEvent> messages,
   PresenceCacheNotifier? presenceCache,
   List<TypingEntry> typing = const [],
@@ -283,6 +289,26 @@ Widget _buildTestable({
   return ProviderScope(
     retry: providerRetry ?? (disableRetries ? (_, _) => null : null),
     overrides: [
+      if (personalChat) ...[
+        meSyncProvider.overrideWithValue(
+          MeSync(
+            RelaySessionNotifier(),
+            RelayConfig(
+              baseUrl: 'https://relay.test',
+              nsec: nostr.Nip19.encode(
+                prefix: nostr.Nip19Prefix.nsec,
+                data:
+                    '0000000000000000000000000000000000000000000000000000000000000001',
+              ),
+            ),
+          ),
+        ),
+        meMessagesProvider(
+          _channelId,
+        ).overrideWith(() => _FakeMessagesNotifier(messages)),
+        meAssistantsProvider.overrideWith((ref) async => []),
+        meGroupsProvider.overrideWith((ref) => Stream.value(const MeGroups())),
+      ],
       if (videoPreviewLoader != null)
         videoPreviewFrameLoaderProvider.overrideWithValue(videoPreviewLoader),
       channelMessagesProvider(
@@ -426,6 +452,7 @@ Widget _buildTestable({
           home ??
           ChannelDetailPage(
             channel: resolvedChannel,
+            personalChat: personalChat,
             initialMessageId: initialMessageId,
             initialThreadRootId: initialThreadRootId,
             initialThreadRouteBehavior: initialThreadRouteBehavior,
@@ -9510,6 +9537,111 @@ void main() {
   });
 
   group('Typing indicator', () {
+    testWidgets('Me reply consumes typing and grows its pending bubble', (
+      tester,
+    ) async {
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final prompt = _textMsg(
+        id: 'prompt',
+        pubkey: 'self',
+        content: 'Hello',
+        createdAt: now - 3,
+      );
+      final typing = _FakeTypingNotifier(const []);
+      await tester.pumpWidget(
+        _buildTestable(
+          personalChat: true,
+          messages: [prompt],
+          typingNotifier: typing,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+      typing.setEntries([
+        TypingEntry(
+          pubkey: 'alice',
+          threadHeadId: 'prompt',
+          expiresAtMs: (now - 1) * 1000 + 8000,
+        ),
+      ]);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.byKey(const ValueKey('agent-typing-bubble')), findsOneWidget);
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(ChannelDetailPage)),
+      );
+      final messages =
+          container.read(meMessagesProvider(_channelId).notifier)
+              as _FakeMessagesNotifier;
+      messages.setMessages([
+        prompt,
+        _textMsg(
+          id: 'reply',
+          pubkey: 'alice',
+          content: 'Here is the reply',
+          createdAt: now,
+          extraTags: [
+            ['e', 'prompt', '', 'reply'],
+          ],
+        ),
+      ]);
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('inline-agent-typing-alice')),
+        findsNothing,
+      );
+      final handoff = tester.widget<AgentReplyHandoff>(
+        find.byKey(const ValueKey('reply-handoff-reply')),
+      );
+      expect(handoff.animate, isTrue);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('agent-typing-bubble')), findsNothing);
+      expect(findRichText('Here is the reply'), findsOneWidget);
+    });
+
+    for (final personal in [true, false]) {
+      testWidgets('reply-scoped typing is visible only in flat Me: $personal', (
+        tester,
+      ) async {
+        final typing = _FakeTypingNotifier(const []);
+        await tester.pumpWidget(
+          _buildTestable(
+            personalChat: personal,
+            messages: [
+              _textMsg(id: 'prompt', pubkey: 'self', content: 'Hello'),
+            ],
+            typingNotifier: typing,
+            disableAnimations: true,
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
+          ),
+        );
+        await tester.pumpAndSettle();
+        typing.setEntries(const [
+          TypingEntry(
+            pubkey: 'alice',
+            threadHeadId: 'prompt',
+            expiresAtMs: 9999999999999,
+          ),
+        ]);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('inline-agent-typing-alice')),
+          personal ? findsOneWidget : findsNothing,
+        );
+        expect(find.text('Alice is typing…'), findsNothing);
+        typing.setEntries(const []);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('inline-agent-typing-alice')),
+          findsNothing,
+        );
+      });
+    }
+
     testWidgets('shows single typer', (tester) async {
       await tester.pumpWidget(
         _buildTestable(

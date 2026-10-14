@@ -21,7 +21,7 @@ class TypingEntry {
 
 /// Tracks who is currently typing in a specific channel.
 ///
-/// Subscribes to kind:20002 (typing indicator) events via websocket.
+/// Subscribes to typing and message events so a reply ends its typing signal.
 /// Entries expire after 8 seconds (matching the desktop TTL).
 class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
   static const _ttlMs = 8000;
@@ -30,14 +30,20 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
   final String channelId;
   void Function()? _unsubscribe;
   Timer? _pruneTimer;
+  int _generation = 0;
+  final _activity = <(String, String?), _TypingActivity>{};
 
   ChannelTypingNotifier(this.channelId);
 
   @override
   List<TypingEntry> build() {
     final sessionState = ref.watch(relaySessionProvider);
+    final generation = ++_generation;
+    _activity.clear();
 
     ref.onDispose(() {
+      _generation++;
+      _activity.clear();
       _unsubscribe?.call();
       _unsubscribe = null;
       _pruneTimer?.cancel();
@@ -45,46 +51,58 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
     });
 
     if (sessionState.status == SessionStatus.connected) {
-      _subscribeLive();
+      _subscribeLive(generation);
     }
 
     return [];
   }
 
-  void _subscribeLive() async {
+  void _subscribeLive(int generation) async {
     final session = ref.read(relaySessionProvider.notifier);
-    _unsubscribe = await session.subscribe(
+    final unsubscribe = await session.subscribe(
       NostrFilter(
-        kinds: [EventKind.typingIndicator],
+        kinds: [
+          EventKind.typingIndicator,
+          ...EventKind.channelMessageEventKinds,
+          EventKind.streamMessageDiff,
+        ],
         tags: {
           '#h': [channelId],
         },
         limit: 10,
       ),
-      _handleTypingEvent,
+      (event) {
+        if (generation == _generation) _handleTypingEvent(event);
+      },
     );
+    if (generation != _generation) {
+      unsubscribe();
+    } else {
+      _unsubscribe = unsubscribe;
+    }
   }
 
   void _handleTypingEvent(NostrEvent event) {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final entry = TypingEntry(
-      pubkey: event.pubkey,
-      threadHeadId: event.getTagValue('e'),
-      expiresAtMs: now + _ttlMs,
-    );
-
-    // Upsert: replace existing entry for same pubkey+thread, or add.
-    final updated =
-        state
-            .where(
-              (e) =>
-                  !(e.pubkey == entry.pubkey &&
-                      e.threadHeadId == entry.threadHeadId),
-            )
-            .toList()
-          ..add(entry);
-
-    state = updated;
+    final at = event.createdAt * 1000;
+    if (event.channelId != channelId || at > now || at + _ttlMs <= now) return;
+    final scope = (event.pubkey.toLowerCase(), event.threadReference.rootId);
+    _activity.removeWhere((_, value) => value.retainUntil <= now);
+    if (!_activity.containsKey(scope) && _activity.length >= 1024) return;
+    final record = _activity.putIfAbsent(scope, _TypingActivity.new);
+    if (event.kind == EventKind.typingIndicator) {
+      if (at <= record.lastActivity || at <= record.lastMessage) return;
+      record.lastActivity = at;
+      if (now >= record.quietUntil) record.visibleUntil = at + _ttlMs;
+    } else {
+      if (at <= record.lastMessage) return;
+      record.lastMessage = at;
+      if (at >= record.lastActivity) {
+        record.visibleUntil = 0;
+        record.quietUntil = now + 2000;
+      }
+    }
+    _prune();
     _ensurePruneTimer();
   }
 
@@ -97,10 +115,17 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
 
   void _prune() {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final pruned = state.where((e) => e.expiresAtMs > now).toList();
-    state = pruned;
-
-    if (pruned.isEmpty) {
+    _activity.removeWhere((_, value) => value.retainUntil <= now);
+    state = [
+      for (final entry in _activity.entries)
+        if (entry.value.visibleUntil > now)
+          TypingEntry(
+            pubkey: entry.key.$1,
+            threadHeadId: entry.key.$2,
+            expiresAtMs: entry.value.visibleUntil,
+          ),
+    ];
+    if (_activity.isEmpty) {
       _pruneTimer?.cancel();
       _pruneTimer = null;
     }
@@ -111,3 +136,15 @@ final channelTypingProvider =
     NotifierProvider.family<ChannelTypingNotifier, List<TypingEntry>, String>(
       ChannelTypingNotifier.new,
     );
+
+class _TypingActivity {
+  int lastActivity = -1;
+  int lastMessage = -1;
+  int visibleUntil = 0;
+  int quietUntil = 0;
+  int get retainUntil {
+    final expiry =
+        (lastActivity > lastMessage ? lastActivity : lastMessage) + 8000;
+    return expiry > quietUntil ? expiry : quietUntil;
+  }
+}

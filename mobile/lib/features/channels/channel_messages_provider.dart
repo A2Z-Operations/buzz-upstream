@@ -27,6 +27,7 @@ const _channelLiveEventKinds = [
 /// relay does not return a valid NIP-CW bounds overlay.
 class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   final String channelId;
+  final bool flatTimeline;
   void Function()? _unsubscribe;
   bool _reachedOldest = false;
   bool _initInFlight = false;
@@ -68,7 +69,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     },
   );
 
-  ChannelMessagesNotifier(this.channelId);
+  ChannelMessagesNotifier(this.channelId, {this.flatTimeline = false});
 
   bool get _summaryMounted => ref.mounted;
   RelaySessionNotifier get _summarySession =>
@@ -228,6 +229,14 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   Future<List<NostrEvent>> _fetchNewestHistory(
     RelaySessionNotifier session,
   ) async {
+    if (flatTimeline) {
+      _usingChannelWindow = false;
+      final history = await session.fetchHistory(
+        NostrFilters.messages(channelId),
+      );
+      history.sort(compareChannelTimelineEventsChronologically);
+      return history;
+    }
     try {
       _initialWindowQueryInFlight = true;
       final pageVersion = ++_threadQuerySerial;
@@ -460,6 +469,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   }
 
   List<NostrEvent> _boundEventReplies(List<NostrEvent> events) {
+    if (flatTimeline) return events;
     final replies = events.where(
       (event) =>
           EventKind.channelTimelineContentKinds.contains(event.kind) &&
