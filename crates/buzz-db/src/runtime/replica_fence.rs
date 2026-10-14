@@ -52,9 +52,9 @@
 //! mismatch, or an observed token below every retained entry all route the
 //! request back to the writer — degraded capacity, never holes.
 //!
-//! Raw SQL without the armed GUC and `session_replication_role = replica`
-//! restores bypass the supported app writers. These operational bypasses are
-//! outside the proof and require holding the fence closed; see `migrations/0021`.
+//! Raw SQL and `session_replication_role = replica` restores bypass the
+//! application floor check. These operational bypasses are outside the proof
+//! and require holding the fence closed.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
