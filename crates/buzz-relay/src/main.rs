@@ -1031,7 +1031,7 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         Err(error) => {
             error!(%error, "IFC policy catalog validation failed");
             return Err(anyhow::anyhow!(
-                "IFC policy catalog is unsafe; apply or repair migrations through 0062 before starting this relay: {error}"
+                "IFC policy catalog is unsafe; apply or repair migrations through 0063 before starting this relay: {error}"
             ));
         }
     }

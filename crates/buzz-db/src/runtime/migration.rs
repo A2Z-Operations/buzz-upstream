@@ -705,7 +705,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 62);
+        assert_eq!(migrations.len(), 63);
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
@@ -714,12 +714,14 @@ mod postgres_tests {
             .as_str()
             .contains("ALTER TABLE push_leases DROP COLUMN app_profile"));
         assert_eq!(migrations[60].version, 61);
-        let ifc = migrations[60].sql.as_str();
+        assert!(migrations[60].sql.as_str().contains("ADD COLUMN labels"));
+        assert_eq!(migrations[61].version, 62);
+        let ifc = migrations[61].sql.as_str();
         assert!(ifc.contains("CREATE TABLE channel_policy_generations"));
         assert!(ifc.contains("CREATE TABLE ifc_event_acceptances"));
         assert!(ifc.contains("CREATE FUNCTION prune_ifc_acceptances_after_insert"));
-        assert_eq!(migrations[61].version, 62);
-        let origin = migrations[61].sql.as_str();
+        assert_eq!(migrations[62].version, 63);
+        let origin = migrations[62].sql.as_str();
         assert!(origin.contains("ADD COLUMN origin_generation BIGINT"));
         assert!(origin.contains("CREATE FUNCTION guard_event_origin_generation"));
         let desired = crate::test_support::desired_state_schema_sql();

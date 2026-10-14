@@ -777,6 +777,7 @@ mod postgres_tests {
             None,
             &keys.public_key().to_bytes(),
             None,
+            &[],
         )
         .await
         .expect("create channel");
@@ -960,7 +961,7 @@ mod postgres_tests {
         assert_eq!(generation(db.pool(), community, channel).await, 1);
 
         sqlx::query(
-            "UPDATE channels SET name=name, topic='new topic' WHERE community_id=$1 AND id=$2",
+            "UPDATE channels SET name=name, topic='new topic', labels=ARRAY['ifc-test'] WHERE community_id=$1 AND id=$2",
         )
         .bind(community.as_uuid())
         .bind(channel)
@@ -1706,6 +1707,7 @@ mod postgres_tests {
             None,
             &keys.public_key().to_bytes(),
             None,
+            &[],
         )
         .await
         .expect("create destination")
