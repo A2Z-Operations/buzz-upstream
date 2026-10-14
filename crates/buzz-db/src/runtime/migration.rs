@@ -2588,8 +2588,10 @@ mod postgres_tests {
     ///
     /// This bootstraps one probe database from `schema.sql` **through the real
     /// `bin/pgschema apply` binary** — the exact path CI (`ci.yml`) and both
-    /// test-relay launchers take — and migrates another through 1–38, then
-    /// asserts the three admin tables have identical column definitions (name,
+    /// test-relay launchers take — including partition reconciliation — and
+    /// migrates another through the current version. It verifies both IFC
+    /// startup catalogs and column parity, then asserts the three admin tables
+    /// have identical column definitions (name,
     /// type, nullability, default) and identical index shapes, including each
     /// key's catalog sort/null options (`pg_index.indoption`). Columns are keyed
     /// by name, not ordinal, because migrations append via `ALTER TABLE` while
@@ -2719,13 +2721,43 @@ mod postgres_tests {
         let desired = PgPool::connect(&format!("{base_prefix}/{desired_db}"))
             .await
             .expect("connect desired-state probe database");
+        sqlx::raw_sql(include_str!(
+            "../../../../scripts/reconcile-schema-after-pgschema.sql"
+        ))
+        .execute(&desired)
+        .await
+        .expect("reconcile standalone partitions and inherited IFC origin triggers");
         let migrated = PgPool::connect(&format!("{base_prefix}/{migrated_db}"))
             .await
             .expect("connect migrated probe database");
-        MIGRATOR
-            .run_to(55, &migrated)
+        run_migrations(&migrated)
             .await
-            .expect("apply migrations 1-55");
+            .expect("apply all current migrations");
+
+        for table in [
+            "channels",
+            "events",
+            "channel_policy_generations",
+            "ifc_event_acceptances",
+        ] {
+            assert_eq!(
+                columns(&desired, table).await,
+                columns(&migrated, table).await,
+                "IFC column parity mismatch for {table}"
+            );
+        }
+        for database in [&desired_db, &migrated_db] {
+            let db = crate::Db::new(&crate::DbConfig {
+                database_url: format!("{base_prefix}/{database}"),
+                ..crate::DbConfig::default()
+            })
+            .await
+            .expect("connect IFC catalog probe");
+            db.verify_ifc_policy_catalog()
+                .await
+                .expect("both schema paths must satisfy the startup IFC gate");
+            db.pool().close().await;
+        }
 
         for table in [
             "relay_admin_actions",
