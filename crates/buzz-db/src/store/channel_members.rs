@@ -396,6 +396,12 @@ impl LockedMemberSnapshot {
                 ));
             }
         }
+        crate::replica_fence::guard_event_created_at_floor(
+            &mut self.tx,
+            created_at,
+            Some(channel_id),
+        )
+        .await?;
         sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND channel_id = $4 AND deleted_at IS NULL")
             .bind(community_id.as_uuid()).bind(kind).bind(pubkey.as_slice()).bind(channel_id)
             .execute(self.tx.conn()).await?;

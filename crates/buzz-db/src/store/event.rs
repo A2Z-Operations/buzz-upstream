@@ -480,6 +480,7 @@ async fn insert_event_on(
     let received_at = Utc::now();
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
+    crate::replica_fence::guard_event_created_at_floor(tx, created_at, channel_id).await?;
     let result = sqlx::query(
         r#"
         INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before)
@@ -1731,6 +1732,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
 
+    crate::replica_fence::guard_event_created_at_floor(tx, created_at, channel_id).await?;
     let result = sqlx::query(
         r#"
         INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before)
@@ -3872,7 +3874,15 @@ mod postgres_tests {
     // ─── canvas CAS tests ─────────────────────────────────────────────────────
 
     fn make_canvas_event_at(content: &str, created_at: u64) -> nostr::Event {
-        make_event_at(buzz_core::kind::KIND_CANVAS as u16, content, created_at)
+        // Keep the CAS fixtures' logical seconds and ties, anchored at a fresh
+        // timestamp so they exercise the serving writer's floor admission.
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let base = BASE.get_or_init(|| nostr::Timestamp::now().as_secs() - 1000);
+        make_event_at(
+            buzz_core::kind::KIND_CANVAS as u16,
+            content,
+            base + created_at,
+        )
     }
 
     /// Build two canvas events sharing `created_at`, returned `(lower, higher)`
