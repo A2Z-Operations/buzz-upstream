@@ -667,7 +667,7 @@ impl Db {
         }
         let row = sqlx::query(
             "UPDATE communities SET archived_at = COALESCE(archived_at, now()) \
-             WHERE id = $1 RETURNING id, host, archived_at",
+             WHERE id = $1 AND deletion_state = 'active' RETURNING id, host, archived_at",
         )
         .bind(community_id)
         .fetch_one(&mut *tx)
@@ -734,10 +734,12 @@ impl Db {
             tx.rollback().await?;
             return Ok(UnarchiveCommunityResult::DeletionPending);
         }
-        sqlx::query("UPDATE communities SET archived_at = NULL WHERE id = $1")
-            .bind(community_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE communities SET archived_at = NULL WHERE id = $1 AND deletion_state = 'active'",
+        )
+        .bind(community_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(UnarchiveCommunityResult::Unarchived(
             UnarchivedCommunityRecord {
