@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, RawQuery, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
@@ -644,13 +644,55 @@ pub async fn list_owned_communities(
     })))
 }
 
+/// Read one community by id, regardless of lifecycle state.
+///
+/// `GET /operator/communities/{community_id}`, NIP-98 signed by a pubkey in
+/// `RELAY_OPERATOR_PUBKEYS`. Returns `404` when no community has that id.
+/// `active` is false once deletion is executing or complete; archival alone
+/// does not clear it.
+pub async fn get_community(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(community_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    authorize_operator_request(
+        &state,
+        &headers,
+        "GET",
+        &format!("/operator/communities/{community_id}"),
+        None,
+        None,
+    )
+    .await?;
+
+    let community_uuid = Uuid::parse_str(&community_id).map_err(|e| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid community_id: {e}"),
+        )
+    })?;
+
+    let record = state
+        .db
+        .get_community_by_id(CommunityId::from_uuid(community_uuid))
+        .await
+        .map_err(|e| internal_error(&format!("get community: {e}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "community not found"))?;
+
+    Ok(Json(serde_json::json!({
+        "community_id": record.id.to_string(),
+        "host": record.host,
+        "active": record.active,
+    })))
+}
+
 /// Transfer ownership of a community to a new owner pubkey.
 ///
 /// `POST /operator/communities/transfer`, NIP-98 signed by a pubkey in
 /// `RELAY_OPERATOR_PUBKEYS`, body:
 ///
 /// ```json
-/// { "community_id": "<uuid>", "new_owner_pubkey": "<hex>" }
+/// { "community_id": "<uuid>", "new_owner_pubkey": "<hex>", "expected_owner_pubkey": "<hex>" }
 /// ```
 ///
 /// The previous owner is demoted to `member` (not `admin`). The transfer is
@@ -3540,6 +3582,72 @@ mod postgres_tests {
         )
         .await;
 
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Reading a community by id returns its lifecycle snapshot without the
+    /// owner, including after archival, and binds the NIP-98 signature to the
+    /// id path.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_community_returns_lifecycle_for_any_state() {
+        let operator = Keys::generate();
+        let owner = Keys::generate();
+        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+            return;
+        };
+        let host = format!("community-{}.example", Uuid::new_v4().simple());
+        let create_response = provision_community(state.clone(), &operator, &host, &owner).await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let community_id = read_json(create_response).await["community_id"]
+            .as_str()
+            .expect("community_id")
+            .to_string();
+        let path = format!("/operator/communities/{community_id}");
+
+        let response = signed_operator_request(state.clone(), &operator, "GET", &path, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = read_json(response).await;
+        assert_eq!(json["community_id"], community_id.as_str());
+        assert_eq!(json["host"], host.as_str());
+        assert_eq!(json["active"], true);
+        assert!(json.get("owner_pubkey").is_none());
+        assert!(json.get("created_at").is_none());
+
+        archive_for_owner_deletion(&state, &host, &owner).await;
+        let response = signed_operator_request(state.clone(), &operator, "GET", &path, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(read_json(response).await["active"], true);
+
+        let other_url = format!(
+            "http://{INGRESS_HOST}/operator/communities/{}",
+            Uuid::new_v4()
+        );
+        let other_auth = nip98_auth_header(&operator, &other_url, "GET", None);
+        let response = operator_request_with_auth(state, "GET", &path, None, other_auth).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_community_rejects_unknown_and_malformed_ids() {
+        let operator = Keys::generate();
+        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+            return;
+        };
+        let unknown = format!("/operator/communities/{}", Uuid::new_v4());
+        let response =
+            signed_operator_request(state.clone(), &operator, "GET", &unknown, None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = signed_operator_request(
+            state,
+            &operator,
+            "GET",
+            "/operator/communities/not-a-uuid",
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 

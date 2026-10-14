@@ -74,6 +74,18 @@ pub struct OwnedCommunitiesPage {
     pub can_create: bool,
 }
 
+/// Community row returned by [`Db::get_community_by_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommunityLifecycleRecord {
+    /// Stable server-resolved community id.
+    pub id: CommunityId,
+    /// Normalized host that maps to this community.
+    pub host: String,
+    /// Whether `deletion_state` is `active`, i.e. no deletion is executing or
+    /// complete. Archival alone does not clear it.
+    pub active: bool,
+}
+
 /// Community row returned by an owner-authorized archive operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedCommunityRecord {
@@ -286,6 +298,38 @@ impl Db {
             Ok(CommunityRecord {
                 id: CommunityId::from_uuid(row.try_get("id")?),
                 host: row.try_get("host")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Returns a community by id regardless of lifecycle state.
+    /// Operator-plane only.
+    #[datastore_span(name = "get_community_by_id", system = "postgresql")]
+    pub async fn get_community_by_id(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<Option<CommunityLifecycleRecord>> {
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Authorization,
+        )
+        .await?;
+        let row = sqlx::query(
+            r#"
+            SELECT id, host, deletion_state = 'active' AS active
+            FROM communities
+            WHERE id = $1
+            "#,
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *connection)
+        .await?;
+        row.map(|row| {
+            Ok(CommunityLifecycleRecord {
+                id: CommunityId::from_uuid(row.try_get("id")?),
+                host: row.try_get("host")?,
+                active: row.try_get("active")?,
             })
         })
         .transpose()
@@ -885,6 +929,7 @@ mod postgres_tests {
             "with_community_archive_fence",
             "with_inactive_community_fence",
             "lookup_community_by_host_for_management",
+            "get_community_by_id",
             "list_communities_owned_by",
             "lookup_community_host",
             "get_community_icon",
@@ -928,6 +973,7 @@ mod postgres_tests {
             "CreatedCommunityRecord",
             "OwnedCommunityRecord",
             "OwnedCommunitiesPage",
+            "CommunityLifecycleRecord",
             "ArchivedCommunityRecord",
             "UnarchivedCommunityRecord",
         ];
@@ -949,6 +995,7 @@ mod postgres_tests {
             "concurrent_same_owner_create_returns_the_winning_row_to_both_callers",
             "ensure_configured_community_reports_insert_winner",
             "list_communities_owned_by_returns_only_owner_rows",
+            "get_community_by_id_reads_any_lifecycle",
             "communities_of_channels_present_for_existing_absent_for_missing",
         ];
         for test in moved_tests {
@@ -1541,6 +1588,48 @@ mod postgres_tests {
             crate::relay_members::max_communities_per_owner()
         );
         assert!(owned.can_create);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_community_by_id_reads_any_lifecycle() {
+        let db = setup_db().await;
+        assert_eq!(
+            db.get_community_by_id(CommunityId::from_uuid(Uuid::new_v4()))
+                .await
+                .expect("read missing community"),
+            None
+        );
+
+        async fn is_active(db: &Db, community: CommunityId) -> bool {
+            db.get_community_by_id(community)
+                .await
+                .expect("read community")
+                .expect("community still readable")
+                .active
+        }
+
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let record = db
+            .get_community_by_id(community)
+            .await
+            .expect("read active community")
+            .expect("community exists");
+        assert_eq!(record.id, community);
+        assert!(record.active);
+
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+            .bind(community.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("archive community");
+        assert!(is_active(&db, community).await, "archived");
+
+        for label in ["quiescing", "tombstone"] {
+            let community = CommunityId::from_uuid(make_community(&db.pool).await);
+            crate::test_support::set_deletion_state(&db.pool, *community.as_uuid(), label).await;
+            assert!(!is_active(&db, community).await, "{label}");
+        }
     }
 
     #[tokio::test]

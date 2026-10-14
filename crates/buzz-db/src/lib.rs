@@ -75,9 +75,9 @@ pub use store::{
 pub use allowlist::AllowlistEntry;
 pub use api_token::{ApiTokenRecord, TokenSummary};
 pub use community::{
-    ArchivedCommunityRecord, CommunityRecord, CreateCommunityWithOwnerResult,
-    CreatedCommunityRecord, EnsuredCommunityRecord, OwnedCommunityRecord, UnarchiveCommunityResult,
-    UnarchivedCommunityRecord,
+    ArchivedCommunityRecord, CommunityLifecycleRecord, CommunityRecord,
+    CreateCommunityWithOwnerResult, CreatedCommunityRecord, EnsuredCommunityRecord,
+    OwnedCommunityRecord, UnarchiveCommunityResult, UnarchivedCommunityRecord,
 };
 pub use error::{DbError, Result};
 pub use event::{ChannelHeadPrecondition, ChannelHeadWriteStatus};
