@@ -2096,6 +2096,12 @@ pub async fn insert_canvas_head_checked(
     channel_id: Uuid,
     precondition: ChannelHeadPrecondition<'_>,
 ) -> Result<(StoredEvent, ChannelHeadWriteStatus)> {
+    let kind_i32 = buzz_core::kind::event_kind_i32(event);
+    if kind_i32 != KIND_CANVAS as i32 {
+        return Err(DbError::InvalidData(format!(
+            "insert_canvas_head_checked requires kind {KIND_CANVAS}, got {kind_i32}"
+        )));
+    }
     let mut tx = crate::begin_community_event_write_transaction(
         pool,
         community_id,

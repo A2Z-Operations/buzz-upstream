@@ -2292,6 +2292,15 @@ mod postgres_tests {
         }
         expected_fences.extend(personal.fence_attachments);
         expected_fences.extend(["artifact_heads", "artifact_revisions"].map(str::to_owned));
+        let ifc = surface(
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 62)
+                .expect("IFC policy migration")
+                .sql
+                .as_ref(),
+        );
+        expected_fences.extend(ifc.fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
