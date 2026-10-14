@@ -47,7 +47,7 @@ pub(crate) async fn quiesce_community_for_tests(
 }
 
 /// Whether `error` is the community-admission rejection taken at transaction
-/// entry, as opposed to a later commit-time trigger rejection.
+/// entry, as opposed to a later database constraint rejection.
 pub(crate) fn is_admission_rejection(error: &crate::DbError) -> bool {
     matches!(error, crate::DbError::AccessDenied(message) if message.contains("write-fenced (quiescing)"))
 }

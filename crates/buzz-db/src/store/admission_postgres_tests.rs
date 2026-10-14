@@ -29,8 +29,8 @@ async fn fixture() -> (Db, [CommunityId; 3]) {
     crate::test_support::set_deletion_state(pool, *communities[2].as_uuid(), "fenced").await;
 
     // One physical session serves every test API call. PostgreSQL's replica
-    // role skips the 32 community-write triggers as well as other ordinary
-    // triggers; the application precheck remains fully active.
+    // role skips ordinary triggers; application admission remains the only
+    // community write fence after migration 0061.
     sqlx::query("SET session_replication_role = replica")
         .execute(pool)
         .await
@@ -40,14 +40,6 @@ async fn fixture() -> (Db, [CommunityId; 3]) {
         .await
         .expect("read replication role");
     assert_eq!(role, "replica");
-    // Witness that the database backstop is truly bypassed: this raw fenced
-    // insert would be rejected with the community-write trigger enabled.
-    sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
-        .bind(communities[2].as_uuid())
-        .bind(vec![0xfe_u8; 32])
-        .execute(pool)
-        .await
-        .expect("raw fenced insert succeeds with triggers disabled");
     (db, communities)
 }
 
