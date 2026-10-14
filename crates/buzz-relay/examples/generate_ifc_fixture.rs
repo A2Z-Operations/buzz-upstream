@@ -111,6 +111,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(memory_fields["format"] == "buzz-ifc-managed-memory-golden-fields");
     anyhow::ensure!(memory_fields["version"] == 1);
     anyhow::ensure!(memory_fields["envelope_version"] == 2);
+    anyhow::ensure!(memory_fields["provenance_version"] == 1);
     anyhow::ensure!(memory_fields["community"] == community);
     anyhow::ensure!(memory_fields["source_conversation"] == source);
     anyhow::ensure!(memory_fields["source_generation"] == "17");
@@ -165,6 +166,22 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         protected_memory["ifc"]["derivation_event_ids"] == json!([resource.id.to_hex()])
     );
+    let provenance: Value = serde_json::from_str(required_string(
+        &protected_memory["ifc"],
+        "provenance_json",
+    )?)?;
+    anyhow::ensure!(provenance["version"] == memory_fields["provenance_version"]);
+    anyhow::ensure!(provenance["sources"]
+        .as_array()
+        .is_some_and(|sources| sources.len() == 1));
+    anyhow::ensure!(provenance["sources"][0]["community"] == community);
+    anyhow::ensure!(provenance["sources"][0]["conversation"] == source);
+    anyhow::ensure!(provenance["sources"][0]["effective_generation"] == "17");
+    anyhow::ensure!(provenance["sources"][0]["origin_generation"] == "9");
+    anyhow::ensure!(
+        provenance["sources"][0]["audience"] == json!({"public": false, "readers": [owner]})
+    );
+    anyhow::ensure!(provenance["parent_memory_event_ids"] == json!([resource.id.to_hex()]));
     let memory_payload = v2::encrypt_to_bytes_with_rng(
         &mut FixedNonce(0x44),
         &memory_key,
@@ -234,7 +251,7 @@ fn main() -> anyhow::Result<()> {
             "plaintext_utf8": MANAGED_MEMORY_PLAINTEXT,
             "plaintext_sha256": plaintext_sha256,
             "application_fields": memory_fields,
-            "application_metadata_status": "actual interim Kotlin version-two export; immutable contributing-source provenance is not yet frozen"
+            "application_metadata_status": "actual Kotlin provenance-bearing version-two export"
         },
         "owner_telemetry": {
             "event": owner_telemetry,

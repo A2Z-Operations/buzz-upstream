@@ -513,11 +513,11 @@ mod tests {
             include_str!("../tests/fixtures/ifc-managed-memory-v2-fields.json");
         assert_eq!(
             hex::encode(Sha256::digest(managed_plaintext.as_bytes())),
-            "531b1a1093050826f6f7556c344d3d4b6bf1464c2281d8c9fdf5ae8c6e2148b7"
+            "a2c4ffcd22acac2ab98f8372dc0776ea9680af9251d6c960a299f3c41bf2fed0"
         );
         assert_eq!(
             hex::encode(Sha256::digest(managed_fields_text.as_bytes())),
-            "7b1e786fe7407b910c1b53995613b61d59f6465a56feb342b39ce57e31004397"
+            "6c1a9e49740e7a6eee579a5e0dc8bba1a17c93d5371352ec790571ef65f54e01"
         );
         let managed_fields: Value =
             serde_json::from_str(managed_fields_text).expect("managed-memory fields");
@@ -723,6 +723,32 @@ mod tests {
         );
         assert_eq!(
             protected_memory["ifc"]["derivation_event_ids"],
+            serde_json::json!([resource.id.to_hex()])
+        );
+        assert_eq!(managed_fields["provenance_version"], 1);
+        let provenance: Value = serde_json::from_str(
+            protected_memory["ifc"]["provenance_json"]
+                .as_str()
+                .expect("protected provenance JSON"),
+        )
+        .expect("protected provenance");
+        assert_eq!(provenance["version"], managed_fields["provenance_version"]);
+        assert_eq!(
+            provenance["sources"],
+            serde_json::json!([{
+                "event_id": "8d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67225",
+                "community": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "conversation": "11111111-1111-4111-8111-111111111111",
+                "audience": {
+                    "public": false,
+                    "readers": [human.public_key().to_hex()]
+                },
+                "effective_generation": "17",
+                "origin_generation": "9"
+            }])
+        );
+        assert_eq!(
+            provenance["parent_memory_event_ids"],
             serde_json::json!([resource.id.to_hex()])
         );
         let owner_key = conversation_key(human.secret_key(), &broker.public_key());
