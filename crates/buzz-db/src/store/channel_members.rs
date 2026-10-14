@@ -200,55 +200,43 @@ async fn acquire_channel_membership_lock(
 /// Check the same p-tag shape and canonical active membership as migration 0032.
 /// The caller holds this channel's membership advisory lock on the admitted
 /// transaction before calling. Membership writers take that key before reading
-/// roles or changing rows; roster replacement takes its replacement key first,
-/// then this key, matching legacy writers followed by the retained trigger.
+/// roles or changing rows. Legacy replacement takes the replacement key, locks
+/// old-head rows in its UPDATE, then takes the membership key at trigger INSERT.
+/// The app path takes replacement key -> membership key -> old-head row locks,
+/// removing the row-lock/membership-key cycle rather than preserving it.
+///
+/// On failure, DO raises the trigger's exact PostgreSQL error during mixed-version
+/// rollout. Phase 2 can replace this with a typed DbError once legacy pods retire.
 pub(crate) async fn validate_channel_roster_snapshot(
     tx: &mut AdmittedTx,
     channel_id: Uuid,
     tags: &serde_json::Value,
 ) -> Result<()> {
-    let invalid: bool = sqlx::query_scalar(
+    let verdict: i32 = sqlx::query_scalar(
         r#"
-        SELECT EXISTS (
-            SELECT 1 FROM jsonb_array_elements($1::jsonb) AS roster_tag(tag_json)
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM jsonb_array_elements($3::jsonb) AS roster_tag(tag_json)
             WHERE roster_tag.tag_json->>0 = 'p'
               AND (jsonb_array_length(roster_tag.tag_json) <> 4
                    OR COALESCE(roster_tag.tag_json->>1, '') !~ '^[0-9a-fA-F]{64}$'
                    OR roster_tag.tag_json->>2 <> ''
                    OR COALESCE(roster_tag.tag_json->>3, '')
                       NOT IN ('owner', 'admin', 'bot', 'member', 'guest'))
-        )
-        "#,
-    )
-    .bind(tags)
-    .fetch_one(tx.conn())
-    .await?;
-    if invalid {
-        sqlx::query(
-            "DO $$ BEGIN RAISE EXCEPTION 'kind 39002 roster contains an invalid p tag' USING ERRCODE = '23514'; END $$",
-        )
-        .execute(tx.conn())
-        .await?;
-        return Err(DbError::InvalidData(
-            "roster check did not reject invalid p tag".into(),
-        ));
-    }
-
-    let matches: bool = sqlx::query_scalar(
-        r#"
-        SELECT
+        ) THEN 1
+        WHEN
             (SELECT COALESCE(array_agg(encode(cm.pubkey, 'hex') || ':' || cm.role::text
                                         ORDER BY cm.pubkey), ARRAY[]::text[])
              FROM channel_members cm
              WHERE cm.community_id = $1 AND cm.channel_id = $2
                AND cm.removed_at IS NULL)
-            IS NOT DISTINCT FROM
+            IS DISTINCT FROM
             (SELECT COALESCE(array_agg(lower(roster_tag.tag_json->>1) || ':' ||
                                         (roster_tag.tag_json->>3)
                                         ORDER BY decode(roster_tag.tag_json->>1, 'hex')),
                              ARRAY[]::text[])
              FROM jsonb_array_elements($3::jsonb) AS roster_tag(tag_json)
              WHERE roster_tag.tag_json->>0 = 'p')
+        THEN 2 ELSE 0 END
         "#,
     )
     .bind(tx.community().as_uuid())
@@ -256,17 +244,20 @@ pub(crate) async fn validate_channel_roster_snapshot(
     .bind(tags)
     .fetch_one(tx.conn())
     .await?;
-    if !matches {
-        sqlx::query(
+    match verdict {
+        0 => return Ok(()),
+        1 => sqlx::query(
+            "DO $$ BEGIN RAISE EXCEPTION 'kind 39002 roster contains an invalid p tag' USING ERRCODE = '23514'; END $$",
+        ),
+        _ => sqlx::query(
             "DO $$ BEGIN RAISE EXCEPTION 'kind 39002 roster does not match canonical channel membership' USING ERRCODE = '23514'; END $$",
-        )
-        .execute(tx.conn())
-        .await?;
-        return Err(DbError::InvalidData(
-            "roster check did not reject stale membership".into(),
-        ));
+        ),
     }
-    Ok(())
+    .execute(tx.conn())
+    .await?;
+    Err(DbError::InvalidData(
+        "roster check did not reject invalid snapshot".into(),
+    ))
 }
 
 /// Apply the app-side roster fence to a general event writer. The trigger
@@ -3101,6 +3092,10 @@ mod postgres_tests {
         .execute(pool)
         .await
         .expect("disable only the roster trigger on parent");
+        assert!(
+            verify_channel_roster_fence_catalog(pool).await.is_err(),
+            "app-only tests must run without the catalog-verified roster fence"
+        );
     }
 
     fn signed_roster(
@@ -3182,36 +3177,208 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn app_roster_guard_addressable_rejects_invalid_p_tag_without_trigger() {
+    async fn app_roster_guard_matches_trigger_for_roster_input_table() {
+        use nostr::{EventBuilder, Kind, Tag};
+        use serde_json::json;
+
         let pool = setup_pool().await;
-        disable_roster_trigger(&pool).await;
-        let community_uuid = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_uuid);
-        let owner = random_pubkey();
-        let channel = create_test_channel(
-            &pool,
-            community_uuid,
-            "app-roster-shape",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &owner,
-            None,
-        )
-        .await
-        .expect("create channel");
-        let invalid = signed_roster(
-            &Keys::generate(),
-            channel.id,
-            &[(&owner, "wss://relay.invalid", "owner")],
-        );
-        let error = Db::from_pool(pool.clone())
-            .replace_addressable_event(community, &invalid, Some(channel.id))
+        verify_channel_roster_fence_catalog(&pool)
             .await
-            .expect_err("app must reject invalid p tag without trigger");
-        assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(ref db))
-            if db.code().as_deref() == Some("23514")
-            && db.message() == "kind 39002 roster contains an invalid p tag"));
+            .expect("trigger side must start with the real fence enabled");
+        let owner = random_pubkey();
+        let owner_hex = hex::encode(&owner);
+        let extra_hex = hex::encode(random_pubkey());
+        let invalid = "kind 39002 roster contains an invalid p tag";
+        let mismatch = "kind 39002 roster does not match canonical channel membership";
+        let mut cases = vec![
+            (
+                "three-field p",
+                json!([["p", owner_hex, ""]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "five-field p",
+                json!([["p", owner_hex, "", "owner", "extra"]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "63-char pubkey",
+                json!([["p", &owner_hex[..63], "", "owner"]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "non-hex pubkey",
+                json!([["p", "z".repeat(64), "", "owner"]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "nonempty relay",
+                json!([["p", owner_hex, "wss://relay.invalid", "owner"]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "unknown role",
+                json!([["p", owner_hex, "", "moderator"]]),
+                Some("owner"),
+                Some(invalid),
+            ),
+            (
+                "duplicate member",
+                json!([["p", owner_hex, "", "owner"], ["p", owner_hex, "", "owner"]]),
+                Some("owner"),
+                Some(mismatch),
+            ),
+            (
+                "role mismatch",
+                json!([["p", owner_hex, "", "admin"]]),
+                Some("owner"),
+                Some(mismatch),
+            ),
+            ("missing member", json!([]), Some("owner"), Some(mismatch)),
+            (
+                "extra member",
+                json!([
+                    ["p", owner_hex, "", "owner"],
+                    ["p", extra_hex, "", "member"]
+                ]),
+                Some("owner"),
+                Some(mismatch),
+            ),
+            (
+                "uppercase real member",
+                json!([["p", owner_hex.to_uppercase(), "", "owner"]]),
+                Some("owner"),
+                None,
+            ),
+            (
+                "non-p tags ignored",
+                json!([
+                    ["p", owner_hex, "", "owner"],
+                    ["name", "ignored"],
+                    ["x"],
+                    ["P", "not a p tag"]
+                ]),
+                Some("owner"),
+                None,
+            ),
+            ("empty roster and membership", json!([]), None, None),
+            (
+                "nonempty roster and empty membership",
+                json!([["p", owner_hex, "", "owner"]]),
+                None,
+                Some(mismatch),
+            ),
+        ];
+        for role in ["owner", "admin", "bot", "member", "guest"] {
+            cases.push((role, json!([["p", owner_hex, "", role]]), Some(role), None));
+        }
+        assert_ne!(
+            owner_hex,
+            owner_hex.to_uppercase(),
+            "uppercase case must change the input"
+        );
+
+        let database_error = |error: sqlx::Error| match error {
+            sqlx::Error::Database(error) => (
+                error.code().expect("SQLSTATE").into_owned(),
+                error.message().to_owned(),
+            ),
+            error => panic!("expected a database verdict, got {error:?}"),
+        };
+        let keys = Keys::generate();
+        let mut measured = Vec::new();
+        // Measure all trigger verdicts first with raw inserts, bypassing every
+        // app guard. Each savepoint and transaction is rolled back so the app
+        // later sees exactly the same canonical membership and no event head.
+        for (name, tags, role, expected_error) in cases {
+            let community_uuid = make_test_community(&pool).await;
+            let community = CommunityId::from_uuid(community_uuid);
+            let channel = create_test_channel(
+                &pool,
+                community_uuid,
+                name,
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner,
+                None,
+            )
+            .await
+            .expect("create case channel");
+            if let Some(role) = role {
+                sqlx::query("UPDATE channel_members SET role=$3::member_role WHERE community_id=$1 AND channel_id=$2")
+                    .bind(community_uuid)
+                    .bind(channel.id)
+                    .bind(role)
+                    .execute(&pool)
+                    .await
+                    .expect("set canonical case role");
+            } else {
+                sqlx::query("UPDATE channel_members SET removed_at=NOW() WHERE community_id=$1 AND channel_id=$2")
+                    .bind(community_uuid)
+                    .bind(channel.id)
+                    .execute(&pool)
+                    .await
+                    .expect("empty active membership");
+            }
+            let mut tags: Vec<Vec<String>> = serde_json::from_value(tags).expect("case tag arrays");
+            tags.insert(0, vec!["d".into(), channel.id.to_string()]);
+            let event = EventBuilder::new(Kind::Custom(39002), "")
+                .tags(tags.iter().map(|tag| Tag::parse(tag).expect("case tag")))
+                .sign_with_keys(&keys)
+                .expect("sign case");
+            let mut tx = pool.begin().await.expect("trigger transaction");
+            sqlx::query("SAVEPOINT roster_case")
+                .execute(&mut *tx)
+                .await
+                .expect("case savepoint");
+            let trigger = sqlx::query(
+                "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
+                 VALUES ($1, $2, $3, $4, 39002, $5, '', $6, NOW(), $7, $8)",
+            )
+            .bind(community_uuid)
+            .bind(event.id.as_bytes().as_slice())
+            .bind(event.pubkey.to_bytes().as_slice())
+            .bind(DateTime::from_timestamp(event.created_at.as_secs() as i64, 0).expect("timestamp"))
+            .bind(serde_json::to_value(&event.tags).expect("tags"))
+            .bind(event.sig.serialize().as_slice())
+            .bind(channel.id)
+            .bind(channel.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(database_error);
+            sqlx::query("ROLLBACK TO SAVEPOINT roster_case")
+                .execute(&mut *tx)
+                .await
+                .expect("undo trigger case");
+            tx.rollback().await.expect("undo trigger transaction");
+            let expected =
+                expected_error.map_or(Ok(true), |message| Err(("23514".into(), message.into())));
+            assert_eq!(trigger, expected, "trigger contract: {name}");
+            measured.push((name, community, channel.id, event, trigger));
+        }
+
+        // Only the app side runs with the trigger disabled; this helper also
+        // asserts that the retained catalog check now rejects the database.
+        disable_roster_trigger(&pool).await;
+        let db = Db::from_pool(pool.clone());
+        for (name, community, channel, event, trigger) in measured {
+            let app = db
+                .replace_addressable_event(community, &event, Some(channel))
+                .await
+                .map(|(_, inserted)| inserted)
+                .map_err(|error| match error {
+                    DbError::Sqlx(error) => database_error(error),
+                    error => panic!("expected app database verdict for {name}, got {error:?}"),
+                });
+            assert_eq!(app, trigger, "app/trigger parity: {name}");
+        }
     }
 
     #[tokio::test]
@@ -4061,15 +4228,61 @@ mod postgres_tests {
                 .1
         );
         let stale = roster("member", base + 1);
-        let error = db
-            .replace_addressable_event(community, &stale, Some(channel))
+        // Reproduce the old binary on one connection: replacement key ->
+        // old-head UPDATE -> raw INSERT. Do not use the app API, whose guard
+        // rejects before the retained trigger can exercise this legacy fence.
+        let error = async {
+            let mut tx = pool.begin().await.expect("begin legacy replacement");
+            let relay_pubkey = relay_keys.public_key().to_bytes();
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(crate::store::replaceable::event_replacement_lock_key(
+                    community,
+                    39002,
+                    &relay_pubkey,
+                    Some(channel.as_bytes().as_slice()),
+                ))
+                .execute(&mut *tx)
+                .await
+                .expect("legacy replacement key");
+            let deleted = sqlx::query(
+                "UPDATE events SET deleted_at = NOW() \
+                 WHERE community_id=$1 AND kind=39002 AND pubkey=$2 \
+                 AND channel_id=$3 AND deleted_at IS NULL",
+            )
+            .bind(community_uuid)
+            .bind(relay_pubkey.as_slice())
+            .bind(channel)
+            .execute(&mut *tx)
             .await
-            .expect_err("desired-state fence must reject stale role");
-        assert!(matches!(
-            error,
-            DbError::Sqlx(sqlx::Error::Database(ref db_error))
+            .expect("legacy soft-delete of current head");
+            assert_eq!(deleted.rows_affected(), 1, "legacy path must delete the live head");
+            let result = sqlx::query(
+                "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
+                 VALUES ($1, $2, $3, $4, 39002, $5, $6, $7, NOW(), $8, $9)",
+            )
+            .bind(community_uuid)
+            .bind(stale.id.as_bytes().as_slice())
+            .bind(relay_pubkey.as_slice())
+            .bind(chrono::DateTime::from_timestamp(stale.created_at.as_secs() as i64, 0).expect("timestamp"))
+            .bind(serde_json::to_value(&stale.tags).expect("tags"))
+            .bind(&stale.content)
+            .bind(stale.sig.serialize().as_slice())
+            .bind(channel)
+            .bind(channel.to_string())
+            .execute(&mut *tx)
+            .await;
+            tx.rollback().await.expect("restore live head after legacy attempt");
+            result
+        }
+        .await
+        .expect_err("desired-state fence must reject stale role");
+        assert!(
+            matches!(error, sqlx::Error::Database(ref db_error)
                 if db_error.code().as_deref() == Some("23514")
-        ));
+                && db_error.message() == "kind 39002 roster does not match canonical channel membership"),
+            "expected trigger roster fence check violation, got {error:?}"
+        );
+
         let live_id: Vec<u8> = sqlx::query_scalar(
             "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
              AND kind=39002 AND deleted_at IS NULL",
@@ -4080,6 +4293,14 @@ mod postgres_tests {
         .await
         .expect("load desired-state live roster");
         assert_eq!(live_id, fresh.id.as_bytes().to_vec());
+        let stale_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community_uuid)
+                .bind(stale.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count rejected stale roster");
+        assert_eq!(stale_rows, 0, "legacy stale insert must roll back");
 
         drop_scratch_db(&admin, pool, &scratch_name).await;
     }

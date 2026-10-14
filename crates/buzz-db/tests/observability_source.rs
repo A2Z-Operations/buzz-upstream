@@ -1877,8 +1877,7 @@ mod tests {
     );
 }
 
-#[test]
-fn every_production_event_insert_runs_the_follow_up_hook() {
+fn production_event_writer_source_files() -> Vec<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
 
     fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1903,6 +1902,12 @@ fn every_production_event_insert_runs_the_follow_up_hook() {
         }
     }
 
+    files
+}
+
+#[test]
+fn every_production_event_insert_runs_the_follow_up_hook() {
+    let files = production_event_writer_source_files();
     let mut hooked_writers = 0usize;
     let mut violations = Vec::new();
     for path in files {
@@ -1933,5 +1938,119 @@ fn every_production_event_insert_runs_the_follow_up_hook() {
     assert!(
         hooked_writers >= 7,
         "expected at least seven hooked event writers, found {hooked_writers}"
+    );
+}
+
+// Fixed channel-less kinds cannot be channel rosters. The startup probes must
+// exercise the retained DB backstops directly and roll back all their writes.
+const EVENT_INSERT_ROSTER_GUARD_EXCEPTIONS: [&str; 4] = [
+    // NIP-43 membership is kind 13534 with channel_id NULL.
+    "pub async fn publish_nip43_membership_locked(",
+    // Push leases are kind 30350 with channel_id NULL.
+    "pub async fn accept_lease_event(",
+    // Rolled-back replica-floor startup probe.
+    "pub async fn verify_floor_guard_behavior(",
+    // Rolled-back roster-fence startup probe.
+    "pub async fn verify_channel_roster_fence_behavior(",
+];
+
+fn event_insert_roster_guard_violations(production_source: &str) -> Vec<String> {
+    function_slices(production_source)
+        .into_iter()
+        .filter(|function_source| {
+            let header = function_header(function_source);
+            let code = mask_comments_and_literals(function_source);
+            inserts_events_row(function_source)
+                && !EVENT_INSERT_ROSTER_GUARD_EXCEPTIONS
+                    .iter()
+                    .any(|exception| header.starts_with(exception))
+                && !code.contains("guard_channel_roster_event(")
+                && !code.contains("validate_channel_roster_snapshot(")
+        })
+        .map(|function_source| function_header(function_source).to_owned())
+        .collect()
+}
+
+#[test]
+fn event_insert_roster_guard_policy_rejects_writers_without_the_guard() {
+    let source = r#"
+pub(crate) async fn unguarded_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn guarded_writer(tx: &mut AdmittedTx) {
+    guard_channel_roster_event(tx, kind, channel, tags).await?;
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn locked_writer(tx: &mut AdmittedTx) {
+    validate_channel_roster_snapshot(tx, channel, tags).await?;
+    sqlx::query("insert into public.events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn mention_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO event_mentions (community_id, event_id) VALUES ($1, $2)");
+}
+pub(crate) async fn commented_guard_writer(tx: &mut AdmittedTx) {
+    // guard_channel_roster_event(tx, kind, channel, tags).await?;
+    /* validate_channel_roster_snapshot(tx, channel, tags).await?; */
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn quoted_guard_writer(tx: &mut AdmittedTx) {
+    tracing::debug!("guard_channel_roster_event(");
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn publish_nip43_membership_locked(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn accept_lease_event(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn verify_floor_guard_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn verify_channel_roster_fence_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+    }
+}
+"#;
+    assert_eq!(
+        event_insert_roster_guard_violations(&strip_cfg_test_items(source)),
+        [
+            "pub(crate) async fn unguarded_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn commented_guard_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn quoted_guard_writer(tx: &mut AdmittedTx) {",
+        ],
+        "only real roster-guard calls in production writers count"
+    );
+}
+
+#[test]
+fn every_production_event_insert_runs_the_roster_guard() {
+    let mut checked_writers = 0;
+    let mut violations = Vec::new();
+    for path in production_event_writer_source_files() {
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        let production = strip_cfg_test_items(&source);
+        checked_writers += function_slices(&production)
+            .into_iter()
+            .filter(|function| inserts_events_row(function))
+            .count();
+        violations.extend(
+            event_insert_roster_guard_violations(&production)
+                .into_iter()
+                .map(|header| format!("{}: {header}", path.display())),
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "production `INSERT INTO events` writers must run the app-side roster guard: {violations:?}"
+    );
+    // Five guarded writers plus the four explicitly exempt writers/probes.
+    assert!(
+        checked_writers >= 9,
+        "expected at least nine event writers, found {checked_writers}"
     );
 }
