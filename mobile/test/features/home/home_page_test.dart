@@ -147,7 +147,8 @@ void main() {
     expect(find.byType(SearchPage), findsOneWidget);
     final searchRoute = ModalRoute.of(tester.element(find.byType(SearchPage)))!;
     expect(searchRoute.allowSnapshotting, isFalse);
-    expect(searchRoute.transitionDuration, const Duration(milliseconds: 240));
+    expect(searchRoute.transitionDuration, Duration.zero);
+    expect(searchRoute.reverseTransitionDuration, Duration.zero);
     Navigator.of(tester.element(find.byType(SearchPage))).pop();
     await tester.pumpAndSettle();
     expect(find.byType(SearchPage), findsNothing);

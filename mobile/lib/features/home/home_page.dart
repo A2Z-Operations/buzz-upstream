@@ -105,25 +105,10 @@ class HomePage extends HookConsumerWidget {
         onSearch: () => Navigator.of(context).push(
           PageRouteBuilder<void>(
             allowSnapshotting: false,
-            transitionDuration: reducedMotion
-                ? Duration.zero
-                : _tabContentTransitionDuration,
-            reverseTransitionDuration: reducedMotion
-                ? Duration.zero
-                : _tabContentTransitionDuration,
+            transitionDuration: Duration.zero,
+            reverseTransitionDuration: Duration.zero,
             pageBuilder: (_, animation, secondaryAnimation) =>
                 const SearchPage(),
-            transitionsBuilder: (_, animation, secondaryAnimation, child) {
-              final progress = reducedMotion
-                  ? 1.0
-                  : _tabContentTransitionCurve.transform(animation.value);
-              return DirectionalTransitionScope(
-                horizontalOffset:
-                    _tabContentTransitionDistance * (1 - progress),
-                opacity: progress,
-                child: child,
-              );
-            },
           ),
         ),
         communityInvitePageBuilder: communityInvitePageBuilder,
