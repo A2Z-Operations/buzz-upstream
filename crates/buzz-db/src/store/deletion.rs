@@ -7841,10 +7841,7 @@ mod postgres_tests {
         .await
         .expect("seed read frontier");
         writer.commit().await.expect("commit seeded children");
-        store
-            .begin_quiescing(&claim.lease)
-            .await
-            .expect("quiesce");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
 
         let generation = store.fence(&claim.lease).await.expect("fence");
         let token = LeaseToken {
