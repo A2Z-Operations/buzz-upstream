@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 
@@ -24,11 +25,18 @@ import 'relay_socket.dart';
 export 'relay_session_types.dart';
 
 part 'relay_session_auth.dart';
+part 'relay_event_verifier.dart';
+part 'relay_session_event_admission.dart';
 
 class _HistorySubscription {
   final List<NostrEvent> events = [];
   final Completer<List<NostrEvent>> completer;
   final Timer timeout;
+  Future<void> verificationTail = Future.value();
+  int pendingVerifications = 0;
+  int receivedEventFrames = 0;
+  Object? verificationError;
+  StackTrace? verificationStackTrace;
 
   _HistorySubscription({required this.completer, required this.timeout});
 }
@@ -42,6 +50,11 @@ class _LiveSubscription {
   int? lastSeenCreatedAt;
   int closedRetryAttempt = 0;
   Timer? closedRetryTimer;
+  Future<void> verificationTail = Future.value();
+  int pendingVerifications = 0;
+  int receivedEventFrames = 0;
+  int validEventFrames = 0;
+  int verificationEpoch = 0;
 
   _LiveSubscription({
     required this.filter,
@@ -73,6 +86,12 @@ class _BufferedEvent {
 }
 
 class RelaySessionNotifier extends Notifier<SessionState> {
+  static const _maxQueryResponseBytes = 8 * 1024 * 1024;
+
+  /// Creates a relay session.
+  ///
+  /// [verifyEventBatch] is a test seam for controlling asynchronous event
+  /// admission. Production callers must use the default background verifier.
   RelaySessionNotifier({
     http.Client? httpClient,
     http.Client Function()? httpClientFactory,
@@ -81,6 +100,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     RelayRateLimitGate? rateLimitGate,
     RelayTimerFactory retryTimerFactory = Timer.new,
     Future<void> Function(Duration) replayDelay = Future.delayed,
+    Future<List<Map<String, dynamic>?>> Function(List<Object?>)?
+    verifyEventBatch,
   }) : _httpQueryClient = RelayHttpQueryClient(
          client: httpClient,
          clientFactory: httpClientFactory,
@@ -89,7 +110,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
        _now = now ?? DateTime.now,
        _rateLimitGate = rateLimitGate ?? RelayRateLimitGate(),
        _retryTimerFactory = retryTimerFactory,
-       _replayDelay = replayDelay;
+       _replayDelay = replayDelay,
+       _verifyEventBatch =
+           verifyEventBatch ?? _verifyRelayEventBatchInBackground;
 
   final RelayHttpQueryClient _httpQueryClient;
   final RelaySocketFactory _socketFactory;
@@ -97,6 +120,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   final RelayRateLimitGate _rateLimitGate;
   final RelayTimerFactory _retryTimerFactory;
   final Future<void> Function(Duration) _replayDelay;
+  final Future<List<Map<String, dynamic>?>> Function(List<Object?>)
+  _verifyEventBatch;
 
   static const _baseReconnectDelayMs = 1000;
   static const _maxReconnectDelayMs = 30000;
@@ -130,6 +155,10 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   final Map<Object, Future<void> Function()> _beforePauseCallbacks = {};
   bool _socketConnected = false;
   bool _closedRetryReplayScheduled = false;
+  _RelayEventVerifier? _eventVerifier;
+
+  _RelayEventVerifier get _verifier =>
+      _eventVerifier ??= _RelayEventVerifier(verifyBatch: _verifyEventBatch);
 
   @override
   SessionState build() {
@@ -190,22 +219,30 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       _activateRateLimitGateFromHttpError(response.body);
       throw RelayException(response.statusCode, response.body);
     }
+    if (response.bodyBytes.length > _maxQueryResponseBytes) {
+      throw const FormatException('relay query response exceeds size limit');
+    }
     final decoded = jsonDecode(response.body);
     if (decoded is! List) {
       throw const FormatException('relay returned malformed query response');
     }
-    try {
-      return [
-        for (final eventJson in decoded)
-          if (eventJson is Map<String, dynamic>)
-            NostrEvent.fromJson(eventJson)
-          else
-            throw const FormatException('relay returned malformed query event'),
-      ];
-    } catch (error) {
-      if (error is FormatException) rethrow;
-      throw FormatException('relay returned malformed query event: $error');
+    final verified = await _verifier.verifyAll(decoded.cast<Object?>());
+    if (_disposed || _ageRestricted || generation != _contextGeneration) {
+      throw StateError('Relay query belongs to a retired session');
     }
+    final events = [
+      for (final event in verified)
+        if (event != null) event,
+    ];
+    // A mixed response can still contribute its independently verified events.
+    // A non-empty response with no valid events is not authoritative absence:
+    // surface it as a failure so callers cannot wipe caches with forged data.
+    if (decoded.isNotEmpty && events.isEmpty) {
+      throw const FormatException(
+        'relay query returned no valid signed events',
+      );
+    }
+    return events;
   }
 
   void _activateRateLimitGateFromHttpError(String body) {
@@ -373,7 +410,10 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   void debugDispose() => _dispose();
 
   @visibleForTesting
-  void debugSupersedeConnection() => _connectionGeneration++;
+  void debugSupersedeConnection() {
+    _connectionGeneration++;
+    _retireLiveVerification();
+  }
 
   @visibleForTesting
   void debugHandleDisconnected([Object? error]) {
@@ -417,6 +457,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   /// Force a reconnect (e.g., returning from background).
   Future<void> reconnect() async {
     _socketConnected = false;
+    _retireLiveVerification();
     await _socket?.disconnect();
     _reconnectDelayMs = _baseReconnectDelayMs;
     final config = ref.read(relayConfigProvider);
@@ -452,6 +493,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   void _pauseNow() {
     _paused = true;
     _socketConnected = false;
+    _retireLiveVerification();
     _reconnectTimer?.cancel();
     _cancelAllHistory(Exception('App moved to background'));
     _rejectAllPending(Exception('App moved to background'));
@@ -487,6 +529,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     if (_disposed || _ageRestricted) return;
 
     final generation = ++_connectionGeneration;
+    _retireLiveVerification();
     state = SessionState(
       status: _hasConnectedOnce
           ? SessionStatus.reconnecting
@@ -521,6 +564,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   void _handleDisconnected(int generation, Object? error) {
     if (_disposed || generation != _connectionGeneration) return;
     _socketConnected = false;
+    _retireLiveVerification();
     _cancelAllHistory(error);
     _rejectAllPending(error);
     _resetAllClosedRetries();
@@ -633,7 +677,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
   void _handleMessage(List<dynamic> data) {
     if (data.isEmpty) return;
-    final type = data[0] as String;
+    final type = data[0];
+    if (type is! String) return;
 
     switch (type) {
       case 'EVENT':
@@ -644,66 +689,6 @@ class RelaySessionNotifier extends Notifier<SessionState> {
         _handleClosed(data);
       case 'OK':
         _handleOk(data);
-    }
-  }
-
-  void _handleEvent(List<dynamic> data) {
-    if (data.length < 3) return;
-    final subId = data[1] as String;
-    final eventJson = data[2] as Map<String, dynamic>;
-    final event = NostrEvent.fromJson(eventJson);
-
-    // History subscriptions accumulate immediately.
-    final historySub = _historySubscriptions[subId];
-    if (historySub != null) {
-      historySub.events.add(event);
-      return;
-    }
-
-    // Live subscriptions get batched. An EVENT proves the stream is active,
-    // but not that a retry replay is complete; only EOSE is that boundary.
-    final liveSub = _liveSubscriptions[subId];
-    if (liveSub != null) {
-      _resetClosedRetry(liveSub);
-      // Track last seen timestamp for reconnect replay.
-      if (liveSub.lastSeenCreatedAt == null ||
-          event.createdAt > liveSub.lastSeenCreatedAt!) {
-        liveSub.lastSeenCreatedAt = event.createdAt;
-      }
-      _eventBuffer.add(_BufferedEvent(subId, event));
-      _scheduleFlush();
-    }
-  }
-
-  void _handleEose(List<dynamic> data) {
-    if (data.length < 2) return;
-    final subId = data[1] as String;
-
-    // History subscription: resolve with collected events.
-    final historySub = _historySubscriptions.remove(subId);
-    if (historySub != null) {
-      historySub.timeout.cancel();
-      if (!historySub.completer.isCompleted) {
-        historySub.completer.complete(historySub.events);
-      }
-      _sendClose(subId);
-      return;
-    }
-
-    // Live subscription: flush replay callbacks before signaling ready. This
-    // ordering matters for retry replays, whose original ready completer has
-    // already been released.
-    final liveSub = _liveSubscriptions[subId];
-    if (liveSub != null) {
-      _resetClosedRetry(liveSub);
-      _flushBufferedEventsNow();
-      liveSub.onStatusChanged?.call(RelaySubscriptionStatus.ready);
-    }
-    if (liveSub != null &&
-        liveSub.readyCompleter != null &&
-        !liveSub.readyCompleter!.isCompleted) {
-      liveSub.readyCompleter!.complete();
-      liveSub.readyCompleter = null;
     }
   }
 
@@ -925,6 +910,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   void _removeLiveSubscription(String subId, _LiveSubscription subscription) {
     if (_liveSubscriptions[subId] != subscription) return;
     _liveSubscriptions.remove(subId);
+    _retireLiveSubscriptionVerification(subscription);
     _pendingClosedRetries.remove(subId);
     subscription.closedRetryTimer?.cancel();
     subscription.closedRetryTimer = null;
@@ -994,6 +980,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       subscription.closedRetryTimer = null;
     }
     _recentDeliveryKeys.clear();
+    _eventBuffer.clear();
+    _eventVerifier?.close();
+    _eventVerifier = null;
     _socket?.dispose();
     _socket = null;
     _httpQueryClient.close();
