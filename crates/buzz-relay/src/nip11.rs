@@ -557,7 +557,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ifc_descriptor_requires_stable_key_and_advertises_closed_owner_memory() {
+    fn ifc_descriptor_requires_stable_key_and_advertises_closed_targets() {
         assert!(ifc_descriptor(false).is_none());
         let descriptor = ifc_descriptor(true).expect("stable relay key advertises IFC");
         assert_eq!(descriptor["version"], 1);
@@ -568,6 +568,10 @@ mod tests {
         assert_eq!(
             descriptor["fenced_kinds"],
             serde_json::json!(buzz_core::ifc::IFC_PUBLICATION_KINDS)
+        );
+        assert_eq!(
+            descriptor["fenced_kinds"],
+            serde_json::json!([9, 24200, 30174, 40002, 40100])
         );
         assert!(descriptor.to_string().contains("30174"));
         assert!(!descriptor.to_string().contains("30078"));

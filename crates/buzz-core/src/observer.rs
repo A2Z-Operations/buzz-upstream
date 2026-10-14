@@ -49,9 +49,36 @@ pub enum ObserverPayloadError {
     InvalidPayload(String),
 }
 
-/// Returns true when `content` fits the NIP-44 v2 ciphertext length envelope.
+/// Returns true when `content` is a bounded base64 NIP-44 v2 envelope.
 pub fn content_looks_like_nip44(content: &str) -> bool {
-    (NIP44_MIN_CONTENT_LEN..=NIP44_MAX_CONTENT_LEN).contains(&content.len())
+    let bytes = content.as_bytes();
+    if !(NIP44_MIN_CONTENT_LEN..=NIP44_MAX_CONTENT_LEN).contains(&bytes.len())
+        || !bytes.len().is_multiple_of(4)
+    {
+        return false;
+    }
+    let mut padding = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if padding == 0 => {}
+            b'=' if index >= bytes.len() - 2 && padding < 2 => padding += 1,
+            _ => return false,
+        }
+    }
+    let decoded_len = (bytes.len() / 4) * 3 - padding;
+    decoded_len >= 99 && decode_base64_prefix(bytes[0], bytes[1]) == Some(0x02)
+}
+
+fn decode_base64_prefix(first: u8, second: u8) -> Option<u8> {
+    let value = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    Some((value(first)? << 2) | (value(second)? >> 4))
 }
 
 /// Serialize and NIP-44 encrypt an observer payload for `recipient`.
@@ -155,5 +182,15 @@ mod tests {
             decrypt_observer_payload::<serde_json::Value>(&recipient, &event),
             Err(ObserverPayloadError::InvalidCiphertextLength(_))
         ));
+    }
+
+    #[test]
+    fn observer_payload_rejects_malformed_or_wrong_version_envelopes() {
+        assert!(!content_looks_like_nip44(
+            &"!".repeat(NIP44_MIN_CONTENT_LEN)
+        ));
+        let mut wrong_version = "A".repeat(NIP44_MIN_CONTENT_LEN);
+        wrong_version.replace_range(..4, "AQAA");
+        assert!(!content_looks_like_nip44(&wrong_version));
     }
 }

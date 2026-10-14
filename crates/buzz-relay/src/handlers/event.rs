@@ -6,6 +6,7 @@ use axum::body::Bytes;
 use tracing::{debug, error, info, warn};
 
 use buzz_core::event::StoredEvent;
+use buzz_core::ifc::{parse_publication_fence, IfcPublicationFence, IfcPublicationTarget};
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, KIND_AGENT_OBSERVER_FRAME,
     KIND_AGENT_PRESENCE, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE, KIND_TYPING_INDICATOR,
@@ -1247,9 +1248,10 @@ fn observer_frame_rate_limited(
 
 /// Handle encrypted agent observer frames (kind 24200).
 ///
-/// These frames bypass storage and are routed as global ephemeral events. The
-/// relay gates publication by the existing `agent_owner_pubkey` mapping and
-/// gates subscription in the REQ handler via the cleartext `p` tag.
+/// These frames remain global ephemeral events. Fenced telemetry commits only
+/// a durable acceptance receipt under its canonical source locks before the
+/// first dispatch. The relay also gates publication by the existing
+/// `agent_owner_pubkey` mapping and subscriptions via the cleartext `p` tag.
 async fn handle_agent_observer_event(
     event: Event,
     conn_id: uuid::Uuid,
@@ -1279,7 +1281,48 @@ async fn handle_agent_observer_event(
         }
     }
 
-    // Freshness check: reject observer frames with stale/future timestamps
+    // Reserved tags are parsed before the legacy observer route. A malformed
+    // fenced frame can never fall through to the unfenced ephemeral path.
+    let ifc_fence = match parse_publication_fence(&event) {
+        Ok(Some(fence)) => {
+            if fence.community_id != *conn.tenant.community().as_uuid()
+                || !matches!(&fence.target, IfcPublicationTarget::OwnerTelemetry { .. })
+            {
+                conn.send(RelayMessage::ok(event_id_hex, false, "ifc-invalid"));
+                return;
+            }
+            match state
+                .db
+                .ifc_event_was_accepted(conn.tenant.community(), event.id.as_bytes())
+                .await
+            {
+                Ok(true) => {
+                    conn.send(RelayMessage::ok(event_id_hex, true, "duplicate:"));
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(conn_id = %conn_id, event_id = %event_id_hex, "observer receipt lookup failed: {error}");
+                    conn.send(RelayMessage::ok(
+                        event_id_hex,
+                        false,
+                        "error: internal server error",
+                    ));
+                    return;
+                }
+            }
+            Some(fence)
+        }
+        Ok(None) => None,
+        Err(_) => {
+            reject("invalid");
+            conn.send(RelayMessage::ok(event_id_hex, false, "ifc-invalid"));
+            return;
+        }
+    };
+
+    // Freshness check: reject new observer frames with stale/future timestamps.
+    // Historic fenced retries returned above from their durable receipt.
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
     if (event_ts - now).unsigned_abs() > 300 {
@@ -1289,6 +1332,24 @@ async fn handle_agent_observer_event(
             "invalid: observer frame timestamp outside ±5 minute freshness window",
         ));
         return;
+    }
+
+    if let Some(fence) = &ifc_fence {
+        if let crate::connection::AuthState::Authenticated(ctx) = conn.auth_state_snapshot() {
+            if ctx.channel_ids.as_ref().is_some_and(|allowed| {
+                fence
+                    .sources
+                    .iter()
+                    .any(|source| !allowed.contains(&source.channel_id))
+            }) {
+                conn.send(RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "restricted: token does not grant access to an IFC source channel",
+                ));
+                return;
+            }
+        }
     }
 
     let route = match agent_observer_route(&event) {
@@ -1304,6 +1365,18 @@ async fn handle_agent_observer_event(
             return;
         }
     };
+    if let Some(IfcPublicationFence {
+        target: IfcPublicationTarget::OwnerTelemetry { owner_pubkey },
+        ..
+    }) = &ifc_fence
+    {
+        if route.direction != AgentObserverDirection::Telemetry
+            || route.owner.to_hex() != *owner_pubkey
+        {
+            conn.send(RelayMessage::ok(event_id_hex, false, "ifc-invalid"));
+            return;
+        }
+    }
 
     // Fast path: if this connection authenticated via NIP-OA and the verified
     // owner matches the observer frame's target owner, skip the DB lookup entirely.
@@ -1375,7 +1448,57 @@ async fn handle_agent_observer_event(
         }
     }
 
+    if let Some(fence) = &ifc_fence {
+        match state
+            .db
+            .accept_ifc_ephemeral(
+                conn.tenant.community(),
+                &event,
+                fence,
+                &event.pubkey.to_hex(),
+            )
+            .await
+        {
+            Ok(buzz_db::ifc::IfcEphemeralOutcome::Accepted) => {}
+            Ok(buzz_db::ifc::IfcEphemeralOutcome::HistoricDuplicate) => {
+                conn.send(RelayMessage::ok(event_id_hex, true, "duplicate:"));
+                return;
+            }
+            Err(buzz_db::ifc::IfcError::PolicyChanged) => {
+                conn.send(RelayMessage::ok(event_id_hex, false, "ifc-policy-changed"));
+                return;
+            }
+            Err(buzz_db::ifc::IfcError::Expired) => {
+                conn.send(RelayMessage::ok(event_id_hex, false, "ifc-expired"));
+                return;
+            }
+            Err(buzz_db::ifc::IfcError::Invalid) => {
+                conn.send(RelayMessage::ok(event_id_hex, false, "ifc-invalid"));
+                return;
+            }
+            Err(buzz_db::ifc::IfcError::AccessDenied) => {
+                conn.send(RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "restricted: channel access denied",
+                ));
+                return;
+            }
+            Err(buzz_db::ifc::IfcError::Database(error)) => {
+                warn!(conn_id = %conn_id, event_id = %event_id_hex, "observer acceptance failed: {error}");
+                conn.send(RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "error: internal server error",
+                ));
+                return;
+            }
+        }
+    }
+
     state.mark_local_event(conn.tenant.community(), &event.id);
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_event_publish(conn.tenant.community());
     if let Err(e) = state
         .pubsub
         .publish_event(&conn.tenant, EventTopic::Global, &event)
@@ -1785,6 +1908,358 @@ mod tests {
             frame[3],
             "restricted: observer frame is not authorized for this agent owner"
         );
+    }
+
+    mod ifc_observer_postgres_tests {
+        use std::sync::atomic::Ordering;
+
+        use super::*;
+        use buzz_core::kind::KIND_AGENT_OBSERVER_FRAME;
+        use buzz_core::observer::{
+            encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG,
+            OBSERVER_FRAME_TELEMETRY,
+        };
+        use buzz_core::{CommunityId, TenantContext};
+        use buzz_db::channel::{ChannelType, ChannelUpdate, ChannelVisibility};
+        use nostr::{Event, EventBuilder, Kind, Tag};
+
+        use super::super::handle_event;
+
+        fn telemetry_event(
+            agent: &Keys,
+            owner: &Keys,
+            community: CommunityId,
+            source: (Uuid, i64),
+            expires_at: i64,
+            label: &str,
+            extra_tags: &[Tag],
+        ) -> Event {
+            let owner_hex = owner.public_key().to_hex();
+            let agent_hex = agent.public_key().to_hex();
+            let community_text = community.to_string();
+            let source_text = source.0.to_string();
+            let generation_text = source.1.to_string();
+            let expiry_text = expires_at.to_string();
+            let ciphertext = encrypt_observer_payload(
+                agent,
+                &owner.public_key(),
+                &serde_json::json!({"type": "tool_result", "label": label}),
+            )
+            .expect("encrypt telemetry");
+            let mut tags = vec![
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, agent_hex.as_str()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry_text.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse(["ifc-source", source_text.as_str(), generation_text.as_str()])
+                    .expect("source tag"),
+                Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()])
+                    .expect("owner-telemetry tag"),
+            ];
+            tags.extend_from_slice(extra_tags);
+            EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), ciphertext)
+                .tags(tags)
+                .sign_with_keys(agent)
+                .expect("sign telemetry")
+        }
+
+        fn connection(
+            tenant: TenantContext,
+            agent: &Keys,
+            owner: &Keys,
+        ) -> (
+            Arc<crate::connection::ConnectionState>,
+            mpsc::Receiver<axum::extract::ws::Message>,
+        ) {
+            let (send_tx, send_rx) = mpsc::channel(32);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            (
+                Arc::new(crate::connection::ConnectionState {
+                    conn_id: Uuid::new_v4(),
+                    tenant,
+                    remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
+                    auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
+                        buzz_auth::AuthContext {
+                            pubkey: agent.public_key(),
+                            scopes: vec![buzz_auth::Scope::MessagesWrite],
+                            channel_ids: None,
+                            auth_method: buzz_auth::AuthMethod::Nip42,
+                            agent_owner_pubkey: Some(owner.public_key()),
+                        },
+                    )),
+                    subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                    send_tx,
+                    ctrl_tx,
+                    terminal_ctrl_tx,
+                    cancel: cancel.clone(),
+                    backpressure_count: Arc::new(AtomicU8::new(0)),
+                    grace_limit: 3,
+                    nip_fi_assertion: None,
+                    session_deadline: None,
+                    nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+                    community_control: crate::state::CommunityConnectionControl::new(cancel),
+                }),
+                send_rx,
+            )
+        }
+
+        async fn response(
+            receiver: &mut mpsc::Receiver<axum::extract::ws::Message>,
+        ) -> serde_json::Value {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("observer response timeout")
+                .expect("observer response");
+            let axum::extract::ws::Message::Text(text) = message else {
+                panic!("expected text response");
+            };
+            serde_json::from_str(&text).expect("response JSON")
+        }
+
+        fn replace_route_tag(
+            template: &Event,
+            author: &Keys,
+            tag_name: &str,
+            replacement: &str,
+        ) -> Event {
+            let tags = template
+                .tags
+                .iter()
+                .map(|tag| {
+                    if tag.kind().to_string() == tag_name {
+                        Tag::parse([tag_name, replacement]).expect("replacement tag")
+                    } else {
+                        tag.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            EventBuilder::new(template.kind, template.content.clone())
+                .tags(tags)
+                .sign_with_keys(author)
+                .expect("sign replaced telemetry")
+        }
+
+        #[tokio::test]
+        #[ignore = "requires isolated Postgres"]
+        async fn fenced_observer_websocket_commits_once_and_rejects_invalid_frames() {
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .expect("isolated Postgres URL");
+            let state = crate::state::tests::test_state_with_database_url(&database_url).await;
+            let host = format!("ifc-observer-{}.test", Uuid::new_v4().simple());
+            let community = state
+                .db
+                .ensure_configured_community(&host)
+                .await
+                .expect("ensure community")
+                .id;
+            let tenant = TenantContext::resolved(community, &host);
+            let agent = Keys::generate();
+            let owner = Keys::generate();
+            let other = Keys::generate();
+            for keys in [&agent, &owner, &other] {
+                state
+                    .db
+                    .ensure_user(community, keys.public_key().as_bytes())
+                    .await
+                    .expect("ensure principal");
+            }
+            let source = Uuid::new_v4();
+            state
+                .db
+                .create_channel_with_id(
+                    community,
+                    source,
+                    &format!("ifc-observer-{}", source.simple()),
+                    ChannelType::Stream,
+                    ChannelVisibility::Private,
+                    None,
+                    agent.public_key().as_bytes(),
+                    None,
+                )
+                .await
+                .expect("create source channel");
+            let (conn, mut receiver) = connection(tenant, &agent, &owner);
+            let dispatches = crate::nip_fi_test_hooks::event_publish_counter::register(community);
+            let expiry = chrono::Utc::now().timestamp() + 120;
+            let accepted = telemetry_event(
+                &agent,
+                &owner,
+                community,
+                (source, 1),
+                expiry,
+                "accepted",
+                &[],
+            );
+            handle_event(accepted.clone(), Arc::clone(&conn), Arc::clone(&state)).await;
+            let first = response(&mut receiver).await;
+            assert_eq!(first[2], true, "{first}");
+            assert_eq!(dispatches.load(Ordering::Relaxed), 1);
+            let stored: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                    .bind(community.as_uuid())
+                    .bind(accepted.id.as_bytes().as_slice())
+                    .fetch_one(state.db.pool())
+                    .await
+                    .expect("count ephemeral event rows");
+            assert_eq!(stored, 0);
+
+            state
+                .db
+                .update_channel(
+                    community,
+                    source,
+                    ChannelUpdate {
+                        visibility: Some("open".to_owned()),
+                        ..ChannelUpdate::default()
+                    },
+                )
+                .await
+                .expect("advance policy");
+            handle_event(accepted.clone(), Arc::clone(&conn), Arc::clone(&state)).await;
+            let retry = response(&mut receiver).await;
+            assert_eq!(retry[2], true, "{retry}");
+            assert_eq!(retry[3], "duplicate:");
+            assert_eq!(dispatches.load(Ordering::Relaxed), 1);
+
+            let stale =
+                telemetry_event(&agent, &owner, community, (source, 1), expiry, "stale", &[]);
+            handle_event(stale, Arc::clone(&conn), Arc::clone(&state)).await;
+            let stale_response = response(&mut receiver).await;
+            assert_eq!(stale_response[2], false, "{stale_response}");
+            assert_eq!(stale_response[3], "ifc-policy-changed");
+
+            let expired = telemetry_event(
+                &agent,
+                &owner,
+                community,
+                (source, 2),
+                chrono::Utc::now().timestamp() - 1,
+                "expired",
+                &[],
+            );
+            handle_event(expired, Arc::clone(&conn), Arc::clone(&state)).await;
+            let expired_response = response(&mut receiver).await;
+            assert_eq!(expired_response[2], false, "{expired_response}");
+            assert_eq!(expired_response[3], "ifc-expired");
+
+            let owner_hex = owner.public_key().to_hex();
+            let source_text = source.to_string();
+            let invalid_extras = [
+                Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()]).expect("duplicate target"),
+                Tag::parse(["ifc-unknown", "value"]).expect("unknown tag"),
+                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                Tag::parse(["ifc-destination", source_text.as_str(), "2"])
+                    .expect("destination tag"),
+            ];
+            for (index, extra) in invalid_extras.into_iter().enumerate() {
+                let invalid = telemetry_event(
+                    &agent,
+                    &owner,
+                    community,
+                    (source, 2),
+                    expiry,
+                    &format!("invalid-{index}"),
+                    &[extra],
+                );
+                handle_event(invalid, Arc::clone(&conn), Arc::clone(&state)).await;
+                let invalid_response = response(&mut receiver).await;
+                assert_eq!(invalid_response[2], false, "{invalid_response}");
+                assert_eq!(invalid_response[3], "ifc-invalid");
+            }
+
+            let route_template = telemetry_event(
+                &agent,
+                &owner,
+                community,
+                (source, 2),
+                expiry,
+                "route-mismatch",
+                &[],
+            );
+            for invalid in [
+                replace_route_tag(
+                    &route_template,
+                    &agent,
+                    "ifc-owner-telemetry",
+                    &other.public_key().to_hex(),
+                ),
+                replace_route_tag(&route_template, &agent, "p", &other.public_key().to_hex()),
+                replace_route_tag(
+                    &route_template,
+                    &agent,
+                    OBSERVER_AGENT_TAG,
+                    &other.public_key().to_hex(),
+                ),
+                replace_route_tag(
+                    &route_template,
+                    &agent,
+                    OBSERVER_FRAME_TAG,
+                    buzz_core::observer::OBSERVER_FRAME_CONTROL,
+                ),
+            ] {
+                handle_event(invalid, Arc::clone(&conn), Arc::clone(&state)).await;
+                assert_eq!(response(&mut receiver).await[3], "ifc-invalid");
+            }
+
+            let partial = EventBuilder::new(
+                Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
+                route_template.content.clone(),
+            )
+            .tags([
+                Tag::parse(["p", owner.public_key().to_hex().as_str()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, agent.public_key().to_hex().as_str()])
+                    .expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+                Tag::parse(["ifc-source", source_text.as_str(), "2"]).expect("source tag"),
+                Tag::parse(["ifc-owner-telemetry", owner.public_key().to_hex().as_str()])
+                    .expect("owner target"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign partial telemetry");
+            handle_event(partial, Arc::clone(&conn), Arc::clone(&state)).await;
+            assert_eq!(response(&mut receiver).await[3], "ifc-invalid");
+
+            let template = telemetry_event(
+                &agent,
+                &owner,
+                community,
+                (source, 2),
+                expiry,
+                "bad-cipher",
+                &[],
+            );
+            let bad_cipher = EventBuilder::new(
+                Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
+                "not encrypted",
+            )
+            .tags(template.tags)
+            .sign_with_keys(&agent)
+            .expect("sign bad ciphertext");
+            handle_event(bad_cipher, Arc::clone(&conn), Arc::clone(&state)).await;
+            assert_eq!(response(&mut receiver).await[3], "ifc-invalid");
+
+            let concurrent = telemetry_event(
+                &agent,
+                &owner,
+                community,
+                (source, 2),
+                expiry,
+                "concurrent",
+                &[],
+            );
+            let left = handle_event(concurrent.clone(), Arc::clone(&conn), Arc::clone(&state));
+            let right = handle_event(concurrent, Arc::clone(&conn), Arc::clone(&state));
+            tokio::join!(left, right);
+            let concurrent_responses =
+                [response(&mut receiver).await, response(&mut receiver).await];
+            assert!(concurrent_responses.iter().all(|item| item[2] == true));
+            assert_eq!(dispatches.load(Ordering::Relaxed), 2);
+            crate::nip_fi_test_hooks::event_publish_counter::deregister(community);
+        }
     }
 
     // PostgreSQL/Redis tests are discovered by the isolated postgres-ci lane.

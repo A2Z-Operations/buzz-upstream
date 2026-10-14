@@ -7,7 +7,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::kind::{
-    event_kind_u32, KIND_AGENT_ENGRAM, KIND_CANVAS, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
+    event_kind_u32, KIND_AGENT_ENGRAM, KIND_AGENT_OBSERVER_FRAME, KIND_CANVAS, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_V2,
+};
+use crate::observer::{
+    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
 };
 
 /// Version carried by all supported information-flow fence tags.
@@ -23,12 +27,15 @@ pub const IFC_CHANNEL_PUBLICATION_KINDS: [u32; 3] =
     [KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2, KIND_CANVAS];
 /// Nonchannel event kind admitted by the closed owner-memory grammar.
 pub const IFC_OWNER_MEMORY_KIND: u32 = KIND_AGENT_ENGRAM;
+/// Ephemeral event kind admitted by the closed owner-telemetry grammar.
+pub const IFC_OWNER_TELEMETRY_KIND: u32 = KIND_AGENT_OBSERVER_FRAME;
 /// Every event kind admitted by version-one fenced publication.
-pub const IFC_PUBLICATION_KINDS: [u32; 4] = [
+pub const IFC_PUBLICATION_KINDS: [u32; 5] = [
     KIND_STREAM_MESSAGE,
+    KIND_AGENT_OBSERVER_FRAME,
+    KIND_AGENT_ENGRAM,
     KIND_STREAM_MESSAGE_V2,
     KIND_CANVAS,
-    KIND_AGENT_ENGRAM,
 ];
 
 /// One channel policy coordinate asserted by the trusted broker.
@@ -51,6 +58,11 @@ pub enum IfcPublicationTarget {
         owner_pubkey: String,
         /// Opaque HMAC address used by the existing memory protocol.
         d_tag: String,
+    },
+    /// Existing owner-encrypted ephemeral telemetry route.
+    OwnerTelemetry {
+        /// Saved owner asserted by the trusted broker.
+        owner_pubkey: String,
     },
 }
 
@@ -92,13 +104,14 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
         return Ok(None);
     }
     let kind = event_kind_u32(event);
-    if !IFC_CHANNEL_PUBLICATION_KINDS.contains(&kind) && kind != IFC_OWNER_MEMORY_KIND {
+    if !IFC_PUBLICATION_KINDS.contains(&kind) {
         return Err(invalid("event kind is not enabled for fenced publication"));
     }
 
     let mut common = None;
     let mut destination = None;
     let mut owner_memory = None;
+    let mut owner_telemetry = None;
     let mut sources = Vec::new();
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
@@ -141,6 +154,12 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
                 }
                 owner_memory = Some(parts[1].clone());
             }
+            "ifc-owner-telemetry" => {
+                if owner_telemetry.is_some() || parts.len() != 2 || !lowercase_hex_32(&parts[1]) {
+                    return Err(invalid("invalid or duplicate ifc-owner-telemetry tag"));
+                }
+                owner_telemetry = Some(parts[1].clone());
+            }
             _ => return Err(invalid("unknown reserved ifc tag")),
         }
     }
@@ -165,8 +184,8 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
     }
 
     let target = if IFC_CHANNEL_PUBLICATION_KINDS.contains(&kind) {
-        if owner_memory.is_some() {
-            return Err(invalid("channel publication cannot use ifc-owner-memory"));
+        if owner_memory.is_some() || owner_telemetry.is_some() {
+            return Err(invalid("channel publication cannot use an owner target"));
         }
         let destination = destination.ok_or_else(|| invalid("missing ifc-destination tag"))?;
         let h_tags: Vec<_> = event
@@ -185,9 +204,9 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
             return Err(invalid("ifc destination does not match the h channel"));
         }
         IfcPublicationTarget::Channel(destination)
-    } else {
-        if destination.is_some() {
-            return Err(invalid("owner memory cannot use ifc-destination"));
+    } else if kind == IFC_OWNER_MEMORY_KIND {
+        if destination.is_some() || owner_telemetry.is_some() {
+            return Err(invalid("owner memory cannot use another target"));
         }
         let owner_pubkey = owner_memory.ok_or_else(|| invalid("missing ifc-owner-memory tag"))?;
         let mut d_tag = None;
@@ -217,6 +236,58 @@ pub fn parse_publication_fence(event: &Event) -> Result<Option<IfcPublicationFen
             owner_pubkey,
             d_tag,
         }
+    } else {
+        if destination.is_some() || owner_memory.is_some() {
+            return Err(invalid("owner telemetry cannot use another target"));
+        }
+        if !content_looks_like_nip44(&event.content) {
+            return Err(invalid("owner telemetry content must be NIP-44 encrypted"));
+        }
+        let owner_pubkey =
+            owner_telemetry.ok_or_else(|| invalid("missing ifc-owner-telemetry tag"))?;
+        let mut p_tag = None;
+        let mut agent_tag = None;
+        let mut frame_tag = None;
+        for tag in event.tags.iter() {
+            let parts = tag.as_slice();
+            let Some(name) = parts.first().map(String::as_str) else {
+                return Err(invalid("owner telemetry contains an empty tag"));
+            };
+            match name {
+                "p" if p_tag.is_none() && parts.len() == 2 && lowercase_hex_32(&parts[1]) => {
+                    p_tag = Some(parts[1].clone());
+                }
+                OBSERVER_AGENT_TAG
+                    if agent_tag.is_none() && parts.len() == 2 && lowercase_hex_32(&parts[1]) =>
+                {
+                    agent_tag = Some(parts[1].clone());
+                }
+                OBSERVER_FRAME_TAG if frame_tag.is_none() && parts.len() == 2 => {
+                    frame_tag = Some(parts[1].clone());
+                }
+                "ifc" | "ifc-source" | "ifc-owner-telemetry" => {}
+                _ => return Err(invalid("owner telemetry contains an unsupported tag")),
+            }
+        }
+        let p_tag = p_tag.ok_or_else(|| invalid("owner telemetry requires one owner p tag"))?;
+        let agent_tag =
+            agent_tag.ok_or_else(|| invalid("owner telemetry requires one agent tag"))?;
+        let frame_tag =
+            frame_tag.ok_or_else(|| invalid("owner telemetry requires one frame tag"))?;
+        if p_tag != owner_pubkey {
+            return Err(invalid(
+                "owner telemetry p tag does not match its fixed owner",
+            ));
+        }
+        if agent_tag != event.pubkey.to_hex() || agent_tag == owner_pubkey {
+            return Err(invalid(
+                "owner telemetry agent tag does not match its author",
+            ));
+        }
+        if frame_tag != OBSERVER_FRAME_TELEMETRY {
+            return Err(invalid("owner telemetry frame must be telemetry"));
+        }
+        IfcPublicationTarget::OwnerTelemetry { owner_pubkey }
     };
 
     Ok(Some(IfcPublicationFence {
@@ -346,6 +417,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_closed_owner_telemetry_fence() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let encrypted = crate::observer::encrypt_observer_payload(
+            &agent,
+            &owner.public_key(),
+            &serde_json::json!({"type": "tool_result"}),
+        )
+        .expect("encrypt telemetry");
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let telemetry = EventBuilder::new(Kind::Custom(IFC_OWNER_TELEMETRY_KIND as u16), encrypted)
+            .tags([
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, agent_hex.as_str()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+                Tag::parse([
+                    "ifc",
+                    "1",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "1792000000",
+                ])
+                .expect("ifc tag"),
+                Tag::parse(["ifc-source", "11111111-1111-4111-8111-111111111111", "17"])
+                    .expect("source tag"),
+                Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()])
+                    .expect("owner-telemetry tag"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign telemetry");
+        let parsed = parse_publication_fence(&telemetry)
+            .expect("parse")
+            .expect("fence");
+        assert_eq!(
+            parsed.target,
+            IfcPublicationTarget::OwnerTelemetry {
+                owner_pubkey: owner_hex
+            }
+        );
+    }
+
+    #[test]
     fn any_reserved_tag_requires_complete_supported_grammar() {
         let owner = "1111111111111111111111111111111111111111111111111111111111111111";
         for tags in [
@@ -355,6 +468,7 @@ mod tests {
                 "1",
             ]],
             vec![vec!["ifc-owner-memory", owner]],
+            vec![vec!["ifc-owner-telemetry", owner]],
             vec![vec![
                 "ifc",
                 "2",
@@ -401,6 +515,95 @@ mod tests {
             ],
         ] {
             assert!(parse_publication_fence(&event(KIND_AGENT_ENGRAM, &tags)).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_owner_telemetry_fences_fail_closed() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let other = Keys::generate();
+        let encrypted = crate::observer::encrypt_observer_payload(
+            &agent,
+            &owner.public_key(),
+            &serde_json::json!({"type": "tool_result"}),
+        )
+        .expect("encrypt telemetry");
+        let agent_hex = agent.public_key().to_hex();
+        let owner_hex = owner.public_key().to_hex();
+        let other_hex = other.public_key().to_hex();
+        let common = [
+            "ifc",
+            "1",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "1792000000",
+        ];
+        let source = ["ifc-source", "11111111-1111-4111-8111-111111111111", "17"];
+        for tags in [
+            vec![
+                vec!["p", owner_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, agent_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY],
+                common.to_vec(),
+                source.to_vec(),
+            ],
+            vec![
+                vec!["p", other_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, agent_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY],
+                common.to_vec(),
+                source.to_vec(),
+                vec!["ifc-owner-telemetry", owner_hex.as_str()],
+            ],
+            vec![
+                vec!["p", owner_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, other_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY],
+                common.to_vec(),
+                source.to_vec(),
+                vec!["ifc-owner-telemetry", owner_hex.as_str()],
+            ],
+            vec![
+                vec!["p", owner_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, agent_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, crate::observer::OBSERVER_FRAME_CONTROL],
+                common.to_vec(),
+                source.to_vec(),
+                vec!["ifc-owner-telemetry", owner_hex.as_str()],
+            ],
+            vec![
+                vec!["p", owner_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, agent_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY],
+                vec![
+                    "d",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                common.to_vec(),
+                source.to_vec(),
+                vec!["ifc-owner-telemetry", owner_hex.as_str()],
+            ],
+            vec![
+                vec!["p", owner_hex.as_str()],
+                vec![OBSERVER_AGENT_TAG, agent_hex.as_str()],
+                vec![OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY],
+                common.to_vec(),
+                source.to_vec(),
+                vec!["ifc-owner-memory", owner_hex.as_str()],
+            ],
+        ] {
+            let parsed_tags = tags
+                .iter()
+                .map(|parts| Tag::parse(parts.clone()).expect("test tag"))
+                .collect::<Vec<_>>();
+            let candidate = EventBuilder::new(
+                Kind::Custom(IFC_OWNER_TELEMETRY_KIND as u16),
+                encrypted.clone(),
+            )
+            .tags(parsed_tags)
+            .sign_with_keys(&agent)
+            .expect("sign malformed telemetry");
+            assert!(parse_publication_fence(&candidate).is_err());
         }
     }
 }

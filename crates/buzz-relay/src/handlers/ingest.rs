@@ -2470,6 +2470,9 @@ async fn ingest_event_inner(
         if fence.community_id != *tenant.community().as_uuid() {
             return Err(IngestError::Rejected("ifc-invalid".into()));
         }
+        if matches!(&fence.target, IfcPublicationTarget::OwnerTelemetry { .. }) {
+            return Err(IngestError::Rejected("ifc-invalid".into()));
+        }
         if state
             .db
             .ifc_event_was_accepted(tenant.community(), event.id.as_bytes())
@@ -2484,6 +2487,10 @@ async fn ingest_event_inner(
                     claimed_community: claimed,
                 },
                 IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                    msg_id: msg_id_label(event.id.as_bytes()),
+                    claimed_community: claimed,
+                },
+                IfcPublicationTarget::OwnerTelemetry { .. } => TraceAction::WriteInsertGlobal {
                     msg_id: msg_id_label(event.id.as_bytes()),
                     claimed_community: claimed,
                 },
@@ -3475,6 +3482,10 @@ async fn ingest_event_inner(
                         claimed_community: claimed,
                     },
                     IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                        msg_id: msg_id_label(event.id.as_bytes()),
+                        claimed_community: claimed,
+                    },
+                    IfcPublicationTarget::OwnerTelemetry { .. } => TraceAction::WriteInsertGlobal {
                         msg_id: msg_id_label(event.id.as_bytes()),
                         claimed_community: claimed,
                     },
@@ -6854,6 +6865,89 @@ mod postgres_tests {
         .await
         .expect("count production ingest rows");
         assert_eq!(stored, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn fenced_owner_telemetry_is_explicitly_rejected_by_http_ingest() {
+        use buzz_core::kind::KIND_AGENT_OBSERVER_FRAME;
+        use buzz_core::observer::{
+            encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG,
+            OBSERVER_FRAME_TELEMETRY,
+        };
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("isolated Postgres URL");
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("connect test Postgres");
+        let state = build_canvas_ingest_state(&db_url, &pool).await;
+        let host = format!("ifc-telemetry-http-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let source = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                source,
+                &format!("ifc-telemetry-http-{}", source.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                agent.public_key().as_bytes(),
+                None,
+            )
+            .await
+            .expect("create source channel");
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let source_text = source.to_string();
+        let community_text = community.to_string();
+        let expiry = (Utc::now().timestamp() + 120).to_string();
+        let ciphertext = encrypt_observer_payload(
+            &agent,
+            &owner.public_key(),
+            &serde_json::json!({"type": "tool_result"}),
+        )
+        .expect("encrypt telemetry");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), ciphertext)
+            .tags([
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, agent_hex.as_str()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
+                Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()]).expect("owner target"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign telemetry");
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+        let auth = IngestAuth::Http {
+            pubkey: agent.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, event.clone(), auth).await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        assert!(!state
+            .db
+            .ifc_event_was_accepted(community, event.id.as_bytes())
+            .await
+            .expect("query telemetry receipt"));
     }
 
     /// Owner memory retains the existing encrypted 30174 envelope and LWW

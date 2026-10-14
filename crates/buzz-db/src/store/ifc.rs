@@ -63,6 +63,15 @@ pub enum IfcPublishOutcome {
     MemoryConflict(ParameterizedReplaceStatus),
 }
 
+/// Result of committing a fenced ephemeral acceptance receipt.
+#[derive(Debug, Eq, PartialEq)]
+pub enum IfcEphemeralOutcome {
+    /// This transaction committed acceptance and owns the first dispatch.
+    Accepted,
+    /// The exact event was accepted by an earlier committed transaction.
+    HistoricDuplicate,
+}
+
 /// Stable fenced-read and publication failures.
 #[derive(Debug, Error)]
 pub enum IfcError {
@@ -262,6 +271,99 @@ impl Db {
         Ok(row.is_some())
     }
 
+    /// Atomically validate canonical sources and accept one ephemeral telemetry event.
+    ///
+    /// The event itself remains ephemeral. Its durable receipt is the commit point;
+    /// only the caller receiving [`IfcEphemeralOutcome::Accepted`] may dispatch it.
+    pub async fn accept_ifc_ephemeral(
+        &self,
+        community_id: CommunityId,
+        event: &Event,
+        fence: &IfcPublicationFence,
+        principal_hex: &str,
+    ) -> Result<IfcEphemeralOutcome, IfcError> {
+        if fence.community_id != *community_id.as_uuid()
+            || u32::from(event.kind.as_u16()) != buzz_core::ifc::IFC_OWNER_TELEMETRY_KIND
+            || !matches!(&fence.target, IfcPublicationTarget::OwnerTelemetry { .. })
+        {
+            return Err(IfcError::Invalid);
+        }
+        let mut tx = crate::begin_community_event_write_transaction(
+            &self.pool,
+            community_id,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
+        lock_event_receipt(&mut tx, event.id.as_bytes()).await?;
+        let accepted: Option<(bool,)> = sqlx::query_as(
+            "SELECT TRUE FROM ifc_event_acceptances WHERE community_id = $1 AND event_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(event.id.as_bytes().as_slice())
+        .fetch_optional(tx.conn())
+        .await
+        .map_err(DbError::from)?;
+        if accepted.is_some() {
+            tx.rollback().await?;
+            return Ok(IfcEphemeralOutcome::HistoricDuplicate);
+        }
+
+        let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(tx.conn())
+            .await
+            .map_err(DbError::from)?;
+        if fence.expires_at <= now || fence.expires_at > now + buzz_core::ifc::IFC_MAX_TTL_SECONDS {
+            return Err(IfcError::Expired);
+        }
+
+        let required = fence
+            .sources
+            .iter()
+            .map(|source| (source.channel_id, source.generation))
+            .collect::<BTreeMap<_, _>>();
+        lock_policies(&mut tx, required.keys().copied()).await?;
+        for (channel_id, generation) in required {
+            let policy = load_policy(&mut tx, channel_id).await?;
+            if policy.generation != generation {
+                return Err(IfcError::PolicyChanged);
+            }
+            if policy.archived || !has_ordinary_read(&policy, principal_hex) {
+                return Err(IfcError::AccessDenied);
+            }
+        }
+
+        let commit_check_now: i64 =
+            sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+                .fetch_one(tx.conn())
+                .await
+                .map_err(DbError::from)?;
+        if fence.expires_at <= commit_check_now {
+            return Err(IfcError::Expired);
+        }
+        let expires_at =
+            DateTime::<Utc>::from_timestamp(fence.expires_at, 0).ok_or(IfcError::Invalid)?;
+        sqlx::query(
+            "INSERT INTO ifc_event_acceptances \
+             (community_id, event_id, event_kind, fence_expires_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(event.id.as_bytes().as_slice())
+        .bind(i32::from(event.kind.as_u16()))
+        .bind(expires_at)
+        .execute(tx.conn())
+        .await
+        .map_err(DbError::from)?;
+        match tx.commit().await {
+            Ok(()) => Ok(IfcEphemeralOutcome::Accepted),
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if error.constraint() == Some("ifc_acceptance_unexpired") =>
+            {
+                Err(IfcError::Expired)
+            }
+            Err(error) => Err(IfcError::Database(error)),
+        }
+    }
+
     /// Atomically validate canonical policies, insert an event, and record acceptance.
     pub async fn publish_ifc_event(
         &self,
@@ -273,6 +375,9 @@ impl Db {
         canvas_precondition: Option<ChannelHeadPrecondition<'_>>,
     ) -> Result<IfcPublishOutcome, IfcError> {
         if fence.community_id != *community_id.as_uuid() {
+            return Err(IfcError::Invalid);
+        }
+        if matches!(&fence.target, IfcPublicationTarget::OwnerTelemetry { .. }) {
             return Err(IfcError::Invalid);
         }
         let mut tx = crate::begin_community_event_write_transaction(
@@ -336,6 +441,7 @@ impl Db {
                     .await?;
                 validate_known_memory_owner(&mut tx, event, owner_pubkey).await?;
             }
+            IfcPublicationTarget::OwnerTelemetry { .. } => return Err(IfcError::Invalid),
         }
 
         let mut required = BTreeMap::new();
@@ -432,6 +538,7 @@ impl Db {
                     ParameterizedReplaceStatus::Duplicate => return Err(IfcError::Invalid),
                 }
             }
+            IfcPublicationTarget::OwnerTelemetry { .. } => return Err(IfcError::Invalid),
         };
 
         let expires_at =
@@ -516,7 +623,10 @@ mod postgres_tests {
     use super::*;
     use crate::{migration, DbConfig};
     use buzz_core::ifc::parse_publication_fence;
-    use buzz_core::kind::{KIND_AGENT_ENGRAM, KIND_STREAM_MESSAGE};
+    use buzz_core::kind::{KIND_AGENT_ENGRAM, KIND_AGENT_OBSERVER_FRAME, KIND_STREAM_MESSAGE};
+    use buzz_core::observer::{
+        encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
+    };
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
@@ -677,6 +787,46 @@ mod postgres_tests {
             .custom_created_at(Timestamp::from(timing.0))
             .sign_with_keys(keys)
             .expect("sign owner memory")
+    }
+
+    fn fenced_telemetry_event(
+        agent: &Keys,
+        owner: &Keys,
+        community: CommunityId,
+        source: (Uuid, i64),
+        expires_at: i64,
+        label: &str,
+    ) -> Event {
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let source_channel = source.0.to_string();
+        let source_generation = source.1.to_string();
+        let community_text = community.to_string();
+        let expiry = expires_at.to_string();
+        let ciphertext = encrypt_observer_payload(
+            agent,
+            &owner.public_key(),
+            &serde_json::json!({"type": "tool_result", "label": label}),
+        )
+        .expect("encrypt telemetry");
+        EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), ciphertext)
+            .tags([
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, agent_hex.as_str()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse([
+                    "ifc-source",
+                    source_channel.as_str(),
+                    source_generation.as_str(),
+                ])
+                .expect("source tag"),
+                Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()])
+                    .expect("owner-telemetry tag"),
+            ])
+            .sign_with_keys(agent)
+            .expect("sign telemetry")
     }
 
     #[tokio::test]
@@ -973,6 +1123,186 @@ mod postgres_tests {
                 .await
                 .expect("count receipts");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn ephemeral_telemetry_receipt_is_atomic_without_event_storage() {
+        let db = connect().await;
+        let (community, channel, agent) = fixture(db.pool()).await;
+        let owner = Keys::generate();
+        let event = fenced_telemetry_event(
+            &agent,
+            &owner,
+            community,
+            (channel, 1),
+            Utc::now().timestamp() + 120,
+            "accepted",
+        );
+        let fence = parse_publication_fence(&event)
+            .expect("parse")
+            .expect("fence");
+        assert_eq!(
+            db.accept_ifc_ephemeral(community, &event, &fence, &agent.public_key().to_hex(),)
+                .await
+                .expect("accept telemetry"),
+            IfcEphemeralOutcome::Accepted
+        );
+        let stored: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(event.id.as_bytes().as_slice())
+                .fetch_one(db.pool())
+                .await
+                .expect("count stored telemetry");
+        assert_eq!(stored, 0);
+
+        sqlx::query("UPDATE channels SET visibility='open' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(channel)
+            .execute(db.pool())
+            .await
+            .expect("advance policy");
+        assert_eq!(
+            db.accept_ifc_ephemeral(community, &event, &fence, &agent.public_key().to_hex(),)
+                .await
+                .expect("historic telemetry retry"),
+            IfcEphemeralOutcome::HistoricDuplicate
+        );
+
+        let stale = fenced_telemetry_event(
+            &agent,
+            &owner,
+            community,
+            (channel, 1),
+            Utc::now().timestamp() + 120,
+            "stale",
+        );
+        let stale_fence = parse_publication_fence(&stale)
+            .expect("parse stale")
+            .expect("stale fence");
+        assert!(matches!(
+            db.accept_ifc_ephemeral(
+                community,
+                &stale,
+                &stale_fence,
+                &agent.public_key().to_hex(),
+            )
+            .await,
+            Err(IfcError::PolicyChanged)
+        ));
+        let expired = fenced_telemetry_event(
+            &agent,
+            &owner,
+            community,
+            (channel, 2),
+            Utc::now().timestamp() - 1,
+            "expired",
+        );
+        let expired_fence = parse_publication_fence(&expired)
+            .expect("parse expired")
+            .expect("expired fence");
+        assert!(matches!(
+            db.accept_ifc_ephemeral(
+                community,
+                &expired,
+                &expired_fence,
+                &agent.public_key().to_hex(),
+            )
+            .await,
+            Err(IfcError::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn concurrent_ephemeral_duplicates_have_one_dispatch_owner() {
+        let db = connect().await;
+        let (community, channel, agent) = fixture(db.pool()).await;
+        let owner = Keys::generate();
+        let event = fenced_telemetry_event(
+            &agent,
+            &owner,
+            community,
+            (channel, 1),
+            Utc::now().timestamp() + 120,
+            "concurrent",
+        );
+        let fence = parse_publication_fence(&event)
+            .expect("parse")
+            .expect("fence");
+        let principal = agent.public_key().to_hex();
+        let (left, right) = tokio::join!(
+            db.accept_ifc_ephemeral(community, &event, &fence, &principal),
+            db.accept_ifc_ephemeral(community, &event, &fence, &principal),
+        );
+        let outcomes = [left, right];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(IfcEphemeralOutcome::Accepted)))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(IfcEphemeralOutcome::HistoricDuplicate)))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn queued_telemetry_serializes_after_source_membership_change() {
+        let db = connect().await;
+        let (community, channel, agent) = fixture(db.pool()).await;
+        let owner = Keys::generate();
+        let event = fenced_telemetry_event(
+            &agent,
+            &owner,
+            community,
+            (channel, 1),
+            Utc::now().timestamp() + 120,
+            "queued",
+        );
+        let fence = parse_publication_fence(&event)
+            .expect("parse")
+            .expect("fence");
+        let mut mutation = db.pool().begin().await.expect("begin membership change");
+        sqlx::query(
+            "UPDATE channel_members SET removed_at=NOW() \
+             WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(channel)
+        .bind(agent.public_key().to_bytes().as_slice())
+        .execute(&mut *mutation)
+        .await
+        .expect("hold membership change");
+        let queued_db = db.clone();
+        let principal = agent.public_key().to_hex();
+        let queued = tokio::spawn(async move {
+            queued_db
+                .accept_ifc_ephemeral(community, &event, &fence, &principal)
+                .await
+        });
+        tokio::task::yield_now().await;
+        mutation.commit().await.expect("commit membership change");
+        assert!(matches!(
+            queued.await.expect("queued task"),
+            Err(IfcError::PolicyChanged)
+        ));
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ifc_event_acceptances WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_one(db.pool())
+                .await
+                .expect("count receipts");
+        assert_eq!(receipts, 0);
     }
 
     #[tokio::test]

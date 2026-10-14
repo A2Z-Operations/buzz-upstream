@@ -69,6 +69,47 @@
     },
     "plaintext_utf8": "{\"slug\":\"mem/fixture\",\"value\":\"fixture protected memory\",\"ifc\":{\"version\":1,\"community_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"sources\":[{\"channel_id\":\"11111111-1111-4111-8111-111111111111\",\"generation\":\"17\"}],\"provenance\":[{\"event_id\":\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\"}]}}"
   },
+  "owner_telemetry": {
+    "application_payload_status": "deterministic wire example; backend preserves its existing encrypted telemetry envelope",
+    "event": {
+      "content": "AkVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRJ3u2GzLu+olZQviLpcV2Fz4SsQbwdprLE7Rbdf6cCDKLlvM/UutWkJLfP3V65zNu6M0BanhCa2Tfv58fzs96wfAU+4DOpg2I5UcQEyO/Tsfv7Fp3oahyYuHiivfZ9W4HsIU4n6WoFKNL/fEAsWwEE8c4jVUTOICNJVrZFKahxJfvg==",
+      "created_at": 1791999930,
+      "id": "d92612d94cd2330848b06fde4a23155f3f63e6219cb770b68d3737510d6854b4",
+      "kind": 24200,
+      "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "sig": "f9fec598d644cd42198f694e7b6f7f2badc212b4987a5612fd94901d8dfa83ae8254400ca7f5bbb4519e0dadb9a6f1ed5d8f5a8b6a48569284a39356b72d9546",
+      "tags": [
+        [
+          "p",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "agent",
+          "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+        ],
+        [
+          "frame",
+          "telemetry"
+        ],
+        [
+          "ifc",
+          "1",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "1792000000"
+        ],
+        [
+          "ifc-source",
+          "11111111-1111-4111-8111-111111111111",
+          "17"
+        ],
+        [
+          "ifc-owner-telemetry",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ]
+      ]
+    },
+    "plaintext_utf8": "{\"type\":\"tool_result\",\"rawInput\":\"fixture tool arguments\",\"resultText\":\"fixture tool result\"}"
+  },
   "request_body_utf8": "[{\"kinds\":[9,40002,40100],\"#h\":[\"11111111-1111-4111-8111-111111111111\"],\"limit\":13,\"ifc\":{\"version\":1,\"nonce\":\"0123456789abcdef0123456789abcdef\",\"expected_generation\":\"17\"}}]",
   "request_sha256": "6f1fbcbe47a1165230b8b9c622748af4c0a1fcc55374425e7b5688c5b0a6aa44",
   "response": {

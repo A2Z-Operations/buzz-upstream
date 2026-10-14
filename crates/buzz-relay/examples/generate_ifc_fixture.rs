@@ -123,6 +123,26 @@ fn main() -> anyhow::Result<()> {
         .custom_created_at(Timestamp::from(1_791_999_920u64))
         .build(broker.public_key())
         .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x24), &broker)?;
+    let telemetry_plaintext = r#"{"type":"tool_result","rawInput":"fixture tool arguments","resultText":"fixture tool result"}"#;
+    let telemetry_payload = v2::encrypt_to_bytes_with_rng(
+        &mut FixedNonce(0x45),
+        &memory_key,
+        telemetry_plaintext.as_bytes(),
+    )?;
+    let telemetry_ciphertext = base64::engine::general_purpose::STANDARD.encode(telemetry_payload);
+    let broker_pubkey = broker.public_key().to_hex();
+    let owner_telemetry = EventBuilder::new(Kind::Custom(24200), telemetry_ciphertext)
+        .tags([
+            Tag::parse(["p", owner.as_str()])?,
+            Tag::parse(["agent", broker_pubkey.as_str()])?,
+            Tag::parse(["frame", "telemetry"])?,
+            Tag::parse(["ifc", "1", community, "1792000000"])?,
+            Tag::parse(["ifc-source", source, "17"])?,
+            Tag::parse(["ifc-owner-telemetry", owner.as_str()])?,
+        ])
+        .custom_created_at(Timestamp::from(1_791_999_930u64))
+        .build(broker.public_key())
+        .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x25), &broker)?;
     let fixture = json!({
         "contract": "buzz-ifc-v1",
         "test_keys": {
@@ -144,6 +164,11 @@ fn main() -> anyhow::Result<()> {
             "d_tag": memory_d,
             "plaintext_utf8": memory_plaintext,
             "application_metadata_status": "illustrative until the Kotlin protected IFC object is frozen"
+        },
+        "owner_telemetry": {
+            "event": owner_telemetry,
+            "plaintext_utf8": telemetry_plaintext,
+            "application_payload_status": "deterministic wire example; backend preserves its existing encrypted telemetry envelope"
         }
     });
     println!("{}", serde_json::to_string_pretty(&fixture)?);

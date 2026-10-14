@@ -500,6 +500,7 @@ mod tests {
         assert!(ingest.contains(".publish_ifc_event("));
         assert!(http.contains("crate::handlers::ingest::ingest_event("));
         assert!(websocket.contains("super::ingest::ingest_event("));
+        assert!(websocket.contains(".accept_ifc_ephemeral("));
     }
 
     #[test]
@@ -603,6 +604,33 @@ mod tests {
             fixture["owner_memory"]["canonical_slug"]
                 .as_str()
                 .expect("memory slug")
+        );
+
+        let telemetry: Event = serde_json::from_value(fixture["owner_telemetry"]["event"].clone())
+            .expect("owner-telemetry event");
+        assert!(telemetry.verify_id());
+        assert!(telemetry.verify_signature());
+        assert_eq!(telemetry.pubkey, broker.public_key());
+        assert_ne!(telemetry.pubkey, human.public_key());
+        let telemetry_fence = parse_publication_fence(&telemetry)
+            .expect("parse owner-telemetry publication")
+            .expect("owner-telemetry fence");
+        assert!(matches!(
+            telemetry_fence.target,
+            IfcPublicationTarget::OwnerTelemetry { ref owner_pubkey }
+                if owner_pubkey == &human.public_key().to_hex()
+        ));
+        let telemetry_payload = base64::engine::general_purpose::STANDARD
+            .decode(telemetry.content.as_bytes())
+            .expect("telemetry base64");
+        let telemetry_plaintext =
+            v2::decrypt_to_bytes(&memory_key, &telemetry_payload).expect("telemetry decrypt");
+        assert_eq!(
+            telemetry_plaintext,
+            fixture["owner_telemetry"]["plaintext_utf8"]
+                .as_str()
+                .expect("telemetry plaintext")
+                .as_bytes()
         );
     }
 }
