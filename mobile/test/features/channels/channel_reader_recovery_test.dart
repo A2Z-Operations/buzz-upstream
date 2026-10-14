@@ -265,10 +265,8 @@ void main() {
       for (final priorHead in [false, true]) {
         fakeAsyncTest('OK before echo keeps a coherent cursor '
             '(${priorHead ? 'stale prior id' : 'no prior id'})', (clock) {
-          const low =
-              '0000000000000000000000000000000000000000000000000000000000000000';
           if (priorHead) {
-            relay.stored.add(relay.event(lane.dTag, blob({}), t + 30, id: low));
+            relay.stored.add(relay.event(lane.dTag, blob({}), t + 30));
           }
           start(clock).set('mine', true);
           clock.elapse(const Duration(seconds: 5));
@@ -281,18 +279,17 @@ void main() {
           // The OK beat the (never delivered) echo. A same-second peer that
           // the relay retains over our event must still be adopted.
           // A same-second peer with a higher ID must still lose.
-          final peerId = '${low.substring(1)}1';
-          expect(peerId.compareTo(own.id), lessThan(0));
-          for (final (name, id) in [
-            ('loser', ''.padLeft(64, 'f')),
-            ('peer', peerId),
+          for (final (name, sortsBefore) in [
+            ('loser', false),
+            ('peer', true),
           ]) {
             relay.emit(
-              relay.event(
+              relay.eventComparedTo(
                 lane.dTag,
                 blob({name: (true, own.createdAt)}),
                 own.createdAt,
-                id: id,
+                referenceId: own.id,
+                sortsBefore: sortsBefore,
               ),
             );
           }
@@ -357,6 +354,7 @@ void main() {
       fakeAsyncTest('resume adopts a head the healthy socket missed', (clock) {
         relay.stored.add(relay.event(lane.dTag, blob({'a': (true, t)}), t));
         start(clock);
+        clock.elapse(const Duration(milliseconds: 20));
         expect(subject.values(), {'a': true});
         relay.stored.add(
           relay.event(
@@ -366,7 +364,7 @@ void main() {
           ),
         );
         subject.refresh();
-        clock.flushMicrotasks();
+        clock.elapse(const Duration(milliseconds: 20));
         expect(subject.values(), {'a': true, 'b': true});
         expect(prefs.getString(prefs.getKeys().single), contains('"b"'));
         expect(relay.reqsFor(lane.dTag, 'l-'), hasLength(1));
@@ -443,7 +441,7 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       start(clock);
       relay.stored.add(relay.event('channel-sections', blob('later'), t));
       m.refreshFromRelay();
-      clock.flushMicrotasks();
+      clock.elapse(const Duration(milliseconds: 20));
       expect(names(), ['later']);
       expect(relay.reqsFor('channel-sections', 'l-'), hasLength(1));
     });
@@ -462,16 +460,17 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
       // A same-second higher ID loses to our own event; a lower one wins.
-      for (final (name, pad, want) in [
-        ('loser', 'f', 'mine'),
-        ('peer', '0', 'peer'),
+      for (final (name, sortsBefore, want) in [
+        ('loser', false, 'mine'),
+        ('peer', true, 'peer'),
       ]) {
         relay.emit(
-          relay.event(
+          relay.eventComparedTo(
             'channel-sections',
             blob(name),
             own.createdAt,
-            id: ''.padLeft(64, pad),
+            referenceId: own.id,
+            sortsBefore: sortsBefore,
           ),
         );
         clock.elapse(const Duration(milliseconds: 20));
@@ -486,11 +485,12 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       start(clock).createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
-      final loser = relay.event(
+      final loser = relay.eventComparedTo(
         'channel-sections',
         blob('loser'),
         own.createdAt,
-        id: ''.padLeft(64, 'f'),
+        referenceId: own.id,
+        sortsBefore: false,
       );
       relay
         ..stored.add(loser)
@@ -514,11 +514,12 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
       m.renameSection(m.store.sections.single.id, 'new-local');
-      final loser = relay.event(
+      final loser = relay.eventComparedTo(
         'channel-sections',
         blob('loser'),
         own.createdAt,
-        id: ''.padLeft(64, 'f'),
+        referenceId: own.id,
+        sortsBefore: false,
       );
       relay
         ..stored.add(loser)
@@ -597,11 +598,12 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       start(clock).createSection('mine');
       clock.elapse(const Duration(seconds: 5));
       final own = relay.published.single;
-      final loser = relay.event(
+      final loser = relay.eventComparedTo(
         'channel-sections',
         blob('loser'),
         own.createdAt,
-        id: ''.padLeft(64, 'f'),
+        referenceId: own.id,
+        sortsBefore: false,
       );
       relay
         ..stored.add(loser)
@@ -659,7 +661,7 @@ void wholeBlobLanes(SharedPreferences Function() prefs) {
       start(clock);
       relay.stored.add(recent(nowSeconds()));
       m.refreshFromRelay();
-      clock.flushMicrotasks();
+      clock.elapse(const Duration(milliseconds: 20));
       expect(m.sortModeFor('dms'), ChannelSortMode.recent);
       expect(relay.reqsFor('channel-sort', 'l-'), hasLength(1));
     });

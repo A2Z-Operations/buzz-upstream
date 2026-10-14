@@ -31,26 +31,50 @@ class SidebarRelay {
 
   String get pubkey => keys.public;
 
-  NostrEvent event(String dTag, Object payload, int createdAt, {String? id}) =>
-      NostrEvent(
-        id: id ?? 'e$createdAt'.padRight(64, 'f'),
-        pubkey: pubkey,
-        createdAt: createdAt,
+  NostrEvent event(String dTag, Object payload, int createdAt) {
+    final event = nostr.Event.from(
+      kind: EventKind.readState,
+      content: nip44Encrypt(_key, jsonEncode(payload)),
+      tags: [
+        ['d', dTag],
+      ],
+      createdAt: createdAt,
+      secretKey: _privateKey,
+    );
+    return NostrEvent.fromJson(event.toMap());
+  }
+
+  NostrEvent eventComparedTo(
+    String dTag,
+    Object payload,
+    int createdAt, {
+    required String referenceId,
+    required bool sortsBefore,
+  }) {
+    for (var attempt = 0; attempt < 4096; attempt++) {
+      final event = nostr.Event.from(
         kind: EventKind.readState,
+        content: nip44Encrypt(_key, jsonEncode(payload)),
         tags: [
           ['d', dTag],
+          ['nonce', '$attempt'],
         ],
-        content: nip44Encrypt(_key, jsonEncode(payload)),
-        sig: 'sig',
+        createdAt: createdAt,
+        secretKey: _privateKey,
       );
+      final candidate = NostrEvent.fromJson(event.toMap());
+      if ((candidate.id.compareTo(referenceId) < 0) == sortsBefore) {
+        return candidate;
+      }
+    }
+    throw StateError('Could not produce the requested signed event ordering');
+  }
 
   Object? decrypt(NostrEvent event) =>
       jsonDecode(nip44Decrypt(_key, event.content));
 
-  late final _key = getConversationKey(
-    nostr.Nip19.decode(payload: keys.nsec).data,
-    keys.public,
-  );
+  late final String _privateKey = nostr.Nip19.decode(payload: keys.nsec).data;
+  late final _key = getConversationKey(_privateKey, keys.public);
 
   List<List<dynamic>> reqsFor(String dTag, String prefix) => [
     for (final req in reqs)
@@ -117,8 +141,24 @@ class SidebarRelay {
 }
 
 class ConnectedRelaySession extends RelaySessionNotifier {
+  ConnectedRelaySession() : super(verifyEventBatch: _verifySignedBatchInline);
+
   @override
   SessionState build() => const SessionState(status: SessionStatus.connected);
+}
+
+Future<List<Map<String, dynamic>?>> _verifySignedBatchInline(
+  List<Object?> eventJsons,
+) async => [
+  for (final eventJson in eventJsons) _verifySignedEventInline(eventJson),
+];
+
+Map<String, dynamic>? _verifySignedEventInline(Object? eventJson) {
+  try {
+    return nostr.Event.fromJson(jsonEncode(eventJson)).toMap();
+  } catch (_) {
+    return null;
+  }
 }
 
 class _ScriptedSocket extends RelaySocket {

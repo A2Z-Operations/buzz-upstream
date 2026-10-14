@@ -230,10 +230,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     if (_disposed || _ageRestricted || generation != _contextGeneration) {
       throw StateError('Relay query belongs to a retired session');
     }
-    final events = [
-      for (final event in verified)
-        if (event != null) event,
-    ];
+    final events = [for (final event in verified) ?event];
     // A mixed response can still contribute its independently verified events.
     // A non-empty response with no valid events is not authoritative absence:
     // surface it as a failure so callers cannot wipe caches with forged data.
