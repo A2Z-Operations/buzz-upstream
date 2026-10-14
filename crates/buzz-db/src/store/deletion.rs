@@ -7741,11 +7741,12 @@ mod postgres_tests {
     }
 
     /// The whole-community purge is the only supported hard delete of channels,
-    /// personal-read accounts, and users. A child committed just before the
-    /// quiesce boundary must be included even with every FK action retired.
+    /// personal-read accounts, and users. With every FK action retired, each
+    /// child must still be deleted explicitly (the quiesce barrier itself is
+    /// pinned by `begin_quiescing_waits_for_open_admitted_writer_note_update`).
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn purge_removes_parent_children_after_concurrent_insert_without_fk_actions() {
+    async fn purge_removes_fk_children_explicitly_without_fk_actions() {
         let (db, store) = store().await;
         crate::test_support::retire_foreign_key_delete_actions(&db.pool).await;
         let (request, inventory) = inventoried_request(&db, &store).await;
@@ -7796,11 +7797,12 @@ mod postgres_tests {
         .execute(&db.pool)
         .await
         .expect("seed operator feedback");
+        let executor_id = format!("purge-test-{}", Uuid::new_v4());
         sqlx::query(
             "INSERT INTO community_deletion_executor_heartbeats \
              (executor_id, mode, request_id) VALUES ($1, 'worker', $2)",
         )
-        .bind(format!("purge-test-{}", Uuid::new_v4()))
+        .bind(&executor_id)
         .bind(request.id)
         .execute(&db.pool)
         .await
@@ -7818,7 +7820,7 @@ mod postgres_tests {
         let mut writer = db
             .begin_event_write_transaction(community)
             .await
-            .expect("admit child inserter");
+            .expect("admit child seed");
         sqlx::query(
             "INSERT INTO channel_members (community_id, channel_id, pubkey) VALUES ($1, $2, $3)",
         )
@@ -7827,7 +7829,7 @@ mod postgres_tests {
         .bind(&owner)
         .execute(writer.conn())
         .await
-        .expect("insert member before quiescing");
+        .expect("seed channel member");
         sqlx::query(
             "INSERT INTO personal_read_frontiers \
              (community_id, actor, channel_id, through_timestamp) VALUES ($1, $2, $3, now())",
@@ -7837,21 +7839,12 @@ mod postgres_tests {
         .bind(channel)
         .execute(writer.conn())
         .await
-        .expect("insert read frontier before quiescing");
-
-        let name = format!("purge-child-{}", Uuid::new_v4().simple());
-        let quiesce_store = DeletionStore::new(crate::test_support::named_pool(&name).await);
-        let lease = claim.lease.clone();
-        let quiescing = tokio::spawn(async move { quiesce_store.begin_quiescing(&lease).await });
-        crate::test_support::wait_for_lock_wait(&db.pool, &name).await;
-        writer
-            .commit()
+        .expect("seed read frontier");
+        writer.commit().await.expect("commit seeded children");
+        store
+            .begin_quiescing(&claim.lease)
             .await
-            .expect("commit child insert before quiesce");
-        quiescing
-            .await
-            .expect("join quiesce")
-            .expect("quiesce after child commit");
+            .expect("quiesce");
 
         let generation = store.fence(&claim.lease).await.expect("fence");
         let token = LeaseToken {
@@ -7892,9 +7885,9 @@ mod postgres_tests {
         );
         let heartbeat_request: Option<Uuid> = sqlx::query_scalar(
             "SELECT request_id FROM community_deletion_executor_heartbeats \
-             WHERE request_id = $1 LIMIT 1",
+             WHERE executor_id = $1",
         )
-        .bind(request.id)
+        .bind(&executor_id)
         .fetch_one(&db.pool)
         .await
         .expect("heartbeat survives with retained request");
