@@ -138,8 +138,8 @@ pub async fn handle_count(
         // or fenced 30174) that require a per-event check. When the fast SQL
         // path would count matching rows without calling reader_authorized_for_event, a
         // non-owner learns the existence of events they are not allowed to see.
-        // The only safe pushdown is when #p is pinned to the authenticated
-        // reader's own pubkey.
+        // #p pushdown is safe only for result-gated kinds other than managed
+        // memory, whose IFC records are author-only.
         let needs_result_gated_filtering = filter_can_match_result_gated_kinds(filter)
             && !result_gated_count_safe_for_pushdown(filter, &authed_pubkey_hex);
 

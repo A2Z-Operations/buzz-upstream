@@ -460,8 +460,9 @@ impl<'de> Visitor<'de> for NoDuplicateVisitor {
 mod tests {
     use super::*;
     use base64::Engine;
-    use buzz_core::engram::{conversation_key, d_tag, Body};
+    use buzz_core::engram::{conversation_key, d_tag};
     use buzz_core::ifc::{parse_publication_fence, IfcMemoryExpectedHead, IfcPublicationTarget};
+    use hmac::{Hmac, Mac};
     use nostr::nips::nip44::v2;
     use nostr::Keys;
 
@@ -550,27 +551,30 @@ mod tests {
             .expect("parse publication")
             .is_some());
 
-        let memory: Event = serde_json::from_value(fixture["owner_memory"]["event"].clone())
-            .expect("owner-memory event");
+        let memory: Event = serde_json::from_value(fixture["managed_memory"]["event"].clone())
+            .expect("managed-memory event");
         assert!(memory.verify_id());
         assert!(memory.verify_signature());
         let memory_fence = parse_publication_fence(&memory)
-            .expect("parse owner-memory publication")
-            .expect("owner-memory fence");
-        let expected_d = fixture["owner_memory"]["d_tag"]
+            .expect("parse managed-memory publication")
+            .expect("managed-memory fence");
+        let expected_d = fixture["managed_memory"]["d_tag"]
             .as_str()
             .expect("memory d tag");
-        let expected_namespace = fixture["owner_memory"]["namespace"]
+        let expected_namespace = fixture["managed_memory"]["namespace"]
             .as_str()
             .expect("memory namespace");
         assert!(matches!(
             memory_fence.target,
-            IfcPublicationTarget::OwnerMemory {
+            IfcPublicationTarget::ManagedMemory {
+                ref agent_pubkey,
                 ref d_tag,
                 ref namespace,
                 expected_head: IfcMemoryExpectedHead::Absent,
                 ..
-            } if d_tag == expected_d && namespace == expected_namespace
+            } if agent_pubkey == &memory.pubkey.to_hex()
+                && d_tag == expected_d
+                && namespace == expected_namespace
         ));
         let broker = Keys::parse(
             fixture["test_keys"]["broker_secret_hex"]
@@ -584,15 +588,46 @@ mod tests {
                 .expect("human secret"),
         )
         .expect("human keys");
-        let memory_key = conversation_key(broker.secret_key(), &human.public_key());
+        let memory_key = conversation_key(broker.secret_key(), &broker.public_key());
+        assert_eq!(
+            fixture["managed_memory"]["recipient"],
+            broker.public_key().to_hex()
+        );
+        assert_eq!(
+            fixture["managed_memory"]["saved_human_owner"],
+            human.public_key().to_hex()
+        );
+        assert_eq!(
+            memory
+                .tags
+                .public_keys()
+                .map(|key| key.to_hex())
+                .collect::<Vec<_>>(),
+            [broker.public_key().to_hex()]
+        );
         assert_eq!(
             d_tag(
                 &memory_key,
-                fixture["owner_memory"]["canonical_slug"]
+                fixture["managed_memory"]["canonical_slug"]
                     .as_str()
                     .expect("memory slug")
             ),
             expected_d
+        );
+        let mut namespace_hmac =
+            <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())
+                .expect("namespace HMAC key");
+        namespace_hmac.update(b"agent-memory/ifc/v1/scope");
+        namespace_hmac.update(&[0]);
+        namespace_hmac.update(
+            fixture["managed_memory"]["scope_canonical_json_utf8"]
+                .as_str()
+                .expect("canonical scope bytes")
+                .as_bytes(),
+        );
+        assert_eq!(
+            hex::encode(namespace_hmac.finalize().into_bytes()),
+            expected_namespace
         );
         let payload = base64::engine::general_purpose::STANDARD
             .decode(memory.content.as_bytes())
@@ -600,19 +635,13 @@ mod tests {
         let plaintext = v2::decrypt_to_bytes(&memory_key, &payload).expect("memory decrypt");
         assert_eq!(
             plaintext,
-            fixture["owner_memory"]["plaintext_utf8"]
+            fixture["managed_memory"]["plaintext_utf8"]
                 .as_str()
                 .expect("memory plaintext")
                 .as_bytes()
         );
-        assert_eq!(
-            Body::from_json_bytes(&plaintext)
-                .expect("compatible memory body")
-                .slug(),
-            fixture["owner_memory"]["canonical_slug"]
-                .as_str()
-                .expect("memory slug")
-        );
+        let owner_key = conversation_key(human.secret_key(), &broker.public_key());
+        assert!(v2::decrypt_to_bytes(&owner_key, &payload).is_err());
 
         let telemetry: Event = serde_json::from_value(fixture["owner_telemetry"]["event"].clone())
             .expect("owner-telemetry event");
@@ -632,7 +661,7 @@ mod tests {
             .decode(telemetry.content.as_bytes())
             .expect("telemetry base64");
         let telemetry_plaintext =
-            v2::decrypt_to_bytes(&memory_key, &telemetry_payload).expect("telemetry decrypt");
+            v2::decrypt_to_bytes(&owner_key, &telemetry_payload).expect("telemetry decrypt");
         assert_eq!(
             telemetry_plaintext,
             fixture["owner_telemetry"]["plaintext_utf8"]

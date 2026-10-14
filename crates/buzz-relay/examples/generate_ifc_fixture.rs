@@ -94,11 +94,16 @@ fn main() -> anyhow::Result<()> {
         .build(broker.public_key())
         .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x23), &broker)?;
     let memory_slug = "mem/fixture";
-    let memory_key = v2::ConversationKey::derive(broker.secret_key(), &human.public_key())?;
+    let memory_key = v2::ConversationKey::derive(broker.secret_key(), &broker.public_key())?;
     let mut audience_principals = [human.public_key().to_hex(), broker.public_key().to_hex()];
     audience_principals.sort();
-    let audience_bytes =
-        serde_json::to_vec(&json!([community, "restricted", audience_principals]))?;
+    let audience_bytes = serde_json::to_vec(&json!([
+        community,
+        broker.public_key().to_hex(),
+        human.public_key().to_hex(),
+        "restricted",
+        audience_principals
+    ]))?;
     let mut scope = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
     scope.update(b"agent-memory/ifc/v1/scope");
     scope.update(&[0]);
@@ -121,27 +126,29 @@ fn main() -> anyhow::Result<()> {
     )?;
     let memory_ciphertext = base64::engine::general_purpose::STANDARD.encode(memory_payload);
     let owner = human.public_key().to_hex();
-    let owner_memory = EventBuilder::new(Kind::Custom(30174), memory_ciphertext)
+    let broker_pubkey = broker.public_key().to_hex();
+    let managed_memory = EventBuilder::new(Kind::Custom(30174), memory_ciphertext)
         .tags([
             Tag::parse(["d", memory_d.as_str()])?,
-            Tag::parse(["p", owner.as_str()])?,
+            Tag::parse(["p", broker_pubkey.as_str()])?,
             Tag::parse(["ifc", "1", community, "1792000000"])?,
             Tag::parse(["ifc-source", source, "17"])?,
-            Tag::parse(["ifc-owner-memory", owner.as_str()])?,
+            Tag::parse(["ifc-managed-memory", broker_pubkey.as_str()])?,
             Tag::parse(["s", memory_namespace.as_str()])?,
             Tag::parse(["expected-revision", "none"])?,
         ])
+        .allow_self_tagging()
         .custom_created_at(Timestamp::from(1_791_999_920u64))
         .build(broker.public_key())
         .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x24), &broker)?;
     let telemetry_plaintext = r#"{"type":"tool_result","rawInput":"fixture tool arguments","resultText":"fixture tool result"}"#;
+    let telemetry_key = v2::ConversationKey::derive(broker.secret_key(), &human.public_key())?;
     let telemetry_payload = v2::encrypt_to_bytes_with_rng(
         &mut FixedNonce(0x45),
-        &memory_key,
+        &telemetry_key,
         telemetry_plaintext.as_bytes(),
     )?;
     let telemetry_ciphertext = base64::engine::general_purpose::STANDARD.encode(telemetry_payload);
-    let broker_pubkey = broker.public_key().to_hex();
     let owner_telemetry = EventBuilder::new(Kind::Custom(24200), telemetry_ciphertext)
         .tags([
             Tag::parse(["p", owner.as_str()])?,
@@ -169,13 +176,16 @@ fn main() -> anyhow::Result<()> {
         "request_sha256": digest,
         "response": {"ifc": 1, "attestation": attestation},
         "channel_publication_event": publication,
-        "owner_memory": {
-            "event": owner_memory,
+        "managed_memory": {
+            "event": managed_memory,
             "canonical_slug": memory_slug,
             "d_tag": memory_d,
             "namespace": memory_namespace,
+            "recipient": broker_pubkey,
+            "saved_human_owner": owner,
+            "scope_canonical_json_utf8": String::from_utf8(audience_bytes)?,
             "plaintext_utf8": memory_plaintext,
-            "application_metadata_status": "illustrative until the Kotlin protected IFC object is frozen"
+            "application_metadata_status": "illustrative until the exact Kotlin protected version-two object is supplied"
         },
         "owner_telemetry": {
             "event": owner_telemetry,

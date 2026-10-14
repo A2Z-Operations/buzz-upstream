@@ -2144,11 +2144,12 @@ mod tests {
             assert_eq!(expired_response[3], "ifc-expired");
 
             let owner_hex = owner.public_key().to_hex();
+            let agent_hex = agent.public_key().to_hex();
             let source_text = source.to_string();
             let invalid_extras = [
                 Tag::parse(["ifc-owner-telemetry", owner_hex.as_str()]).expect("duplicate target"),
                 Tag::parse(["ifc-unknown", "value"]).expect("unknown tag"),
-                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                Tag::parse(["ifc-managed-memory", agent_hex.as_str()]).expect("memory target"),
                 Tag::parse(["ifc-destination", source_text.as_str(), "2"])
                     .expect("destination tag"),
             ];
@@ -2825,31 +2826,31 @@ mod tests {
                 .expect("sign membership notification")
         }
 
-        fn fenced_memory_event(agent: &Keys, owner: &Keys, source: Uuid) -> nostr::Event {
-            let owner_hex = owner.public_key().to_hex();
+        fn managed_memory_event(agent: &Keys, source: Uuid) -> nostr::Event {
+            let agent_hex = agent.public_key().to_hex();
             let source_text = source.to_string();
             let community_text = Uuid::nil().to_string();
             let expiry = (chrono::Utc::now().timestamp() + 120).to_string();
-            let key = buzz_core::engram::conversation_key(agent.secret_key(), &owner.public_key());
+            let key = buzz_core::engram::conversation_key(agent.secret_key(), &agent.public_key());
             let d = buzz_core::engram::d_tag(&key, "fanout/read-gate");
             let ciphertext = nip44::encrypt(
                 agent.secret_key(),
-                &owner.public_key(),
+                &agent.public_key(),
                 r#"{"slug":"fanout/read-gate","value":"private"}"#,
                 Version::V2,
             )
             .expect("encrypt memory");
-            EventBuilder::new(
+            let event = EventBuilder::new(
                 Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
                 ciphertext,
             )
             .tags([
                 Tag::parse(["d", d.as_str()]).expect("d tag"),
-                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["p", agent_hex.as_str()]).expect("p tag"),
                 Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
                     .expect("ifc tag"),
                 Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
-                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                Tag::parse(["ifc-managed-memory", agent_hex.as_str()]).expect("memory target"),
                 Tag::parse([
                     "s",
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
@@ -2857,8 +2858,18 @@ mod tests {
                 .expect("memory namespace"),
                 Tag::parse(["expected-revision", "none"]).expect("memory expected revision"),
             ])
+            .allow_self_tagging()
             .sign_with_keys(agent)
-            .expect("sign memory")
+            .expect("sign memory");
+            assert_eq!(
+                event
+                    .tags
+                    .public_keys()
+                    .map(|key| key.to_hex())
+                    .collect::<Vec<_>>(),
+                [agent.public_key().to_hex()]
+            );
+            event
         }
 
         fn unfenced_memory_event(agent: &Keys, owner: &Keys) -> nostr::Event {
@@ -2872,6 +2883,20 @@ mod tests {
             ])
             .sign_with_keys(agent)
             .expect("sign legacy memory")
+        }
+
+        fn partial_ifc_memory_event(agent: &Keys, owner: &Keys) -> nostr::Event {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
+                "partial reserved ciphertext",
+            )
+            .tags([
+                Tag::parse(["d", &"b".repeat(64)]).expect("d tag"),
+                Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
+                Tag::parse(["ifc-unknown", "reserved"]).expect("partial IFC tag"),
+            ])
+            .sign_with_keys(agent)
+            .expect("sign partial reserved memory")
         }
 
         fn event_from_ws_message(msg: Message) -> nostr::Event {
@@ -3004,7 +3029,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn local_and_pubsub_fanout_gate_fenced_memory_but_not_legacy_memory() {
+        async fn local_and_pubsub_fanout_gate_managed_memory_but_not_legacy_memory() {
             for local in [false, true] {
                 let state = test_state().await;
                 let tenant = buzz_core::tenant::TenantContext::resolved(
@@ -3014,13 +3039,14 @@ mod tests {
                 let agent = Keys::generate();
                 let owner = Keys::generate();
                 let stranger = Keys::generate();
-                let fenced = fenced_memory_event(&agent, &owner, Uuid::new_v4());
+                let fenced = managed_memory_event(&agent, Uuid::new_v4());
                 let legacy = unfenced_memory_event(&agent, &owner);
+                let partial = partial_ifc_memory_event(&agent, &owner);
                 let subscribe = |who: &Keys| {
                     register_global_sub(
                         &state,
                         "ids",
-                        Filter::new().ids([fenced.id, legacy.id]),
+                        Filter::new().ids([fenced.id, legacy.id, partial.id]),
                         Some(who.public_key().to_bytes().to_vec()),
                     )
                     .1
@@ -3029,7 +3055,7 @@ mod tests {
                 let mut owner_rx = subscribe(&owner);
                 let mut stranger_rx = subscribe(&stranger);
 
-                for event in [fenced.clone(), legacy.clone()] {
+                for event in [fenced.clone(), legacy.clone(), partial.clone()] {
                     if local {
                         super::super::dispatch_persistent_event_inner(
                             &tenant,
@@ -3054,11 +3080,17 @@ mod tests {
                     }
                 }
 
-                for receiver in [&mut agent_rx, &mut owner_rx] {
-                    let first = event_from_ws_message(receiver.try_recv().expect("fenced memory"));
-                    let second = event_from_ws_message(receiver.try_recv().expect("legacy memory"));
-                    assert_eq!([first.id, second.id], [fenced.id, legacy.id]);
-                }
+                let first = event_from_ws_message(agent_rx.try_recv().expect("managed memory"));
+                let second = event_from_ws_message(agent_rx.try_recv().expect("legacy memory"));
+                let third = event_from_ws_message(agent_rx.try_recv().expect("partial IFC memory"));
+                assert_eq!(
+                    [first.id, second.id, third.id],
+                    [fenced.id, legacy.id, partial.id]
+                );
+                let owner_event =
+                    event_from_ws_message(owner_rx.try_recv().expect("legacy owner memory"));
+                assert_eq!(owner_event.id, legacy.id);
+                assert!(owner_rx.try_recv().is_err());
                 let delivered =
                     event_from_ws_message(stranger_rx.try_recv().expect("legacy memory"));
                 assert_eq!(delivered.id, legacy.id);
@@ -3290,7 +3322,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn redis_round_trip_withholds_fenced_memory_from_stranger() {
+        async fn redis_round_trip_delivers_managed_memory_only_to_author() {
             let Some(redis_url) = redis_url_if_available().await else {
                 eprintln!("skipping Redis memory fan-out test: Redis unavailable");
                 return;
@@ -3318,12 +3350,13 @@ mod tests {
             let agent = Keys::generate();
             let owner = Keys::generate();
             let stranger = Keys::generate();
-            let event = fenced_memory_event(&agent, &owner, Uuid::new_v4());
+            let event = managed_memory_event(&agent, Uuid::new_v4());
+            let partial = partial_ifc_memory_event(&agent, &owner);
             let subscribe = |who: &Keys| {
                 register_global_sub(
                     &receiver,
                     "memory",
-                    Filter::new().id(event.id),
+                    Filter::new().ids([event.id, partial.id]),
                     Some(who.public_key().to_bytes().to_vec()),
                 )
                 .1
@@ -3337,20 +3370,27 @@ mod tests {
                 .publish_event(&tenant, EventTopic::Global, &event)
                 .await
                 .expect("publish memory through Redis");
-            for receiver in [&mut agent_rx, &mut owner_rx] {
+            origin
+                .pubsub
+                .publish_event(&tenant, EventTopic::Global, &partial)
+                .await
+                .expect("publish partial IFC memory through Redis");
+            for expected in [event.id, partial.id] {
                 let message =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                    tokio::time::timeout(std::time::Duration::from_secs(2), agent_rx.recv())
                         .await
                         .expect("authorized Redis delivery")
                         .expect("connection open");
-                assert_eq!(event_from_ws_message(message).id, event.id);
+                assert_eq!(event_from_ws_message(message).id, expected);
             }
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(250), stranger_rx.recv(),)
-                    .await
-                    .is_err(),
-                "stranger must not receive fenced memory metadata"
-            );
+            for receiver in [&mut owner_rx, &mut stranger_rx] {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv())
+                        .await
+                        .is_err(),
+                    "non-author must not receive managed-memory metadata"
+                );
+            }
 
             origin_subscriber.abort();
             receiver_subscriber.abort();

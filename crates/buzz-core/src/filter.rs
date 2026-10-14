@@ -13,8 +13,8 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 
 /// Result-level read authorization for events carrying private metadata.
 /// `KIND_DM_VISIBILITY` and `KIND_AGENT_TURN_METRIC` require the reader to
-/// equal the event's `#p` tag. A fenced `KIND_AGENT_ENGRAM` additionally
-/// permits its author, while an unfenced engram retains its legacy behavior.
+/// equal the event's `#p` tag. Any IFC-tagged `KIND_AGENT_ENGRAM` permits only
+/// its author, while an unfenced engram retains its legacy behavior.
 /// Returns `true` for every other kind.
 ///
 /// This guards every delivery surface — WS historical pull (`req.rs`), HTTP
@@ -24,17 +24,10 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
     if kind == crate::kind::KIND_AGENT_ENGRAM && crate::ifc::has_ifc_tag(event) {
-        if event
+        return event
             .pubkey
             .to_hex()
-            .eq_ignore_ascii_case(reader_pubkey_hex)
-        {
-            return true;
-        }
-        return event
-            .tags
-            .public_keys()
-            .any(|pubkey| pubkey.to_hex().eq_ignore_ascii_case(reader_pubkey_hex));
+            .eq_ignore_ascii_case(reader_pubkey_hex);
     }
     if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
         return true;
@@ -355,7 +348,7 @@ mod tests {
             &fenced,
             &agent.public_key().to_hex()
         ));
-        assert!(reader_authorized_for_event(&fenced, &owner_hex));
+        assert!(!reader_authorized_for_event(&fenced, &owner_hex));
         assert!(!reader_authorized_for_event(
             &fenced,
             &stranger.public_key().to_hex()

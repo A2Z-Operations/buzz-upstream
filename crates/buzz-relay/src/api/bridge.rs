@@ -2056,7 +2056,8 @@ async fn count_events_authed(
             crate::handlers::req::filter_can_match_author_only_kinds(filter);
         // Same result-gated guard as the WS COUNT handler: force the per-event
         // fallback for filters that can match 44200, 30622, or fenced 30174
-        // unless #p=[self] is safely pushed down (existence leak otherwise).
+        // unless the kind supports a safe #p=[self] pushdown. Managed memory
+        // always uses the per-event author-only predicate.
         let needs_result_gated_filtering =
             crate::handlers::req::filter_can_match_result_gated_kinds(filter)
                 && !crate::handlers::req::result_gated_count_safe_for_pushdown(
@@ -7703,7 +7704,7 @@ pub(crate) mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres and Redis"]
-    async fn fenced_memory_production_reads_hide_envelope_and_count_from_strangers() {
+    async fn managed_memory_production_reads_are_author_only_and_namespace_scoped() {
         use buzz_core::engram::{conversation_key, d_tag};
         use buzz_core::kind::KIND_AGENT_ENGRAM;
         use buzz_db::channel::{ChannelType, ChannelVisibility};
@@ -7755,44 +7756,73 @@ pub(crate) mod postgres_tests {
             )
             .await
             .expect("create source channel");
+        assert!(!state
+            .db
+            .is_member(community, source, owner.public_key().as_bytes())
+            .await
+            .expect("check saved owner source access"));
 
-        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
         let source_text = source.to_string();
         let community_text = community.to_string();
         let expiry = (chrono::Utc::now().timestamp() + 120).to_string();
-        let memory_key = conversation_key(agent.secret_key(), &owner.public_key());
+        let managed_key = conversation_key(agent.secret_key(), &agent.public_key());
+        let legacy_key = conversation_key(agent.secret_key(), &owner.public_key());
         let namespace = "ab".repeat(32);
         let memory_event = |slug: &str, fenced: bool, namespace: Option<&str>| {
-            let d = d_tag(&memory_key, slug);
+            let key = if fenced { &managed_key } else { &legacy_key };
+            let recipient = if fenced {
+                agent.public_key()
+            } else {
+                owner.public_key()
+            };
+            let recipient_hex = recipient.to_hex();
+            let d = d_tag(key, slug);
             let ciphertext = nip44::encrypt(
                 agent.secret_key(),
-                &owner.public_key(),
+                &recipient,
                 format!(r#"{{"slug":"{slug}","value":"private"}}"#),
                 Version::V2,
             )
-            .expect("encrypt owner memory");
+            .expect("encrypt memory");
             let mut tags = vec![
                 Tag::parse(["d", d.as_str()]).expect("d tag"),
-                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["p", recipient_hex.as_str()]).expect("p tag"),
             ];
             if fenced {
                 tags.extend([
                     Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
                         .expect("ifc tag"),
                     Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
-                    Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                    Tag::parse(["ifc-managed-memory", agent_hex.as_str()]).expect("memory target"),
                     Tag::parse(["s", namespace.expect("fenced memory namespace")])
                         .expect("memory namespace"),
                     Tag::parse(["expected-revision", "none"]).expect("memory expected revision"),
                 ]);
             }
-            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), ciphertext)
+            let event = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), ciphertext)
                 .tags(tags)
+                .allow_self_tagging()
                 .sign_with_keys(&agent)
-                .expect("sign memory")
+                .expect("sign memory");
+            if fenced {
+                assert_eq!(
+                    event
+                        .tags
+                        .public_keys()
+                        .map(|key| key.to_hex())
+                        .collect::<Vec<_>>(),
+                    [agent.public_key().to_hex()]
+                );
+            }
+            event
         };
         let fenced = memory_event("read/fenced", true, Some(namespace.as_str()));
         let legacy = memory_event("read/legacy", false, None);
+        let plaintext = nip44::decrypt(agent.secret_key(), &agent.public_key(), &fenced.content)
+            .expect("decrypt managed memory with agent-self key");
+        assert_eq!(plaintext, r#"{"slug":"read/fenced","value":"private"}"#);
+        assert!(nip44::decrypt(owner.secret_key(), &agent.public_key(), &fenced.content).is_err());
         for event in [&fenced, &legacy] {
             let body = serde_json::to_vec(event).expect("serialize memory");
             let (status, response) =
@@ -7801,6 +7831,33 @@ pub(crate) mod postgres_tests {
             assert_eq!(status, axum::http::StatusCode::OK, "{response}");
             assert!(response.contains(r#""accepted":true"#), "{response}");
         }
+        let partial_slug = "read/partial-reserved";
+        let partial_d = d_tag(&legacy_key, partial_slug);
+        let partial_ciphertext = nip44::encrypt(
+            agent.secret_key(),
+            &owner.public_key(),
+            format!(r#"{{"slug":"{partial_slug}","value":"private"}}"#),
+            Version::V2,
+        )
+        .expect("encrypt partial reserved memory");
+        let partial_owner = owner.public_key().to_hex();
+        let partial_reserved =
+            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), partial_ciphertext)
+                .tags([
+                    Tag::parse(["d", partial_d.as_str()]).expect("partial d tag"),
+                    Tag::parse(["p", partial_owner.as_str()]).expect("partial p tag"),
+                    Tag::parse(["ifc-unknown", "reserved"]).expect("partial IFC tag"),
+                ])
+                .sign_with_keys(&agent)
+                .expect("sign partial reserved memory");
+        assert!(
+            state
+                .db
+                .insert_event(community, &partial_reserved, None)
+                .await
+                .expect("seed pre-existing partial reserved memory")
+                .1
+        );
 
         // Seed more unrelated namespaces than the COUNT fallback budget in one
         // isolated-Postgres statement. They are newer than the target, so
@@ -7823,7 +7880,7 @@ pub(crate) mod postgres_tests {
                     jsonb_build_array('p', $4::text),
                     jsonb_build_array('ifc', '1', $5::text, $6::text),
                     jsonb_build_array('ifc-source', $7::text, '1'),
-                    jsonb_build_array('ifc-owner-memory', $4::text),
+                    jsonb_build_array('ifc-managed-memory', $4::text),
                     jsonb_build_array('s', lpad(to_hex(g + 1000000), 64, '0')),
                     jsonb_build_array('expected-revision', 'none')
                 ),
@@ -7839,7 +7896,7 @@ pub(crate) mod postgres_tests {
         .bind(community.as_uuid())
         .bind(agent.public_key().to_bytes().to_vec())
         .bind(fenced.created_at.as_secs() as i64)
-        .bind(&owner_hex)
+        .bind(&agent_hex)
         .bind(&community_text)
         .bind(&expiry)
         .bind(&source_text)
@@ -7897,12 +7954,12 @@ pub(crate) mod postgres_tests {
             "kinds": [KIND_AGENT_ENGRAM]
         })])
         .expect("serialize exact-id kind filter");
-        for (reader, body) in [(&agent, &no_kind), (&owner, &with_kind)] {
+        for body in [&no_kind, &with_kind] {
             let (status, bytes) = post_read_route(
                 state.clone(),
                 &host,
                 "/query",
-                &reader.public_key().to_hex(),
+                &agent.public_key().to_hex(),
                 body,
             )
             .await;
@@ -7916,7 +7973,7 @@ pub(crate) mod postgres_tests {
                 state.clone(),
                 &host,
                 "/count",
-                &reader.public_key().to_hex(),
+                &agent.public_key().to_hex(),
                 body,
             )
             .await;
@@ -7924,43 +7981,79 @@ pub(crate) mod postgres_tests {
             let count: serde_json::Value = serde_json::from_slice(&bytes).expect("count response");
             assert_eq!(count["count"], 1);
         }
-        for body in [&no_kind, &with_kind] {
+        for reader in [&owner, &stranger] {
+            for body in [&no_kind, &with_kind] {
+                let (status, bytes) = post_read_route(
+                    state.clone(),
+                    &host,
+                    "/query",
+                    &reader.public_key().to_hex(),
+                    body,
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                assert_eq!(bytes.as_ref(), b"[]");
+                let (status, bytes) = post_read_route(
+                    state.clone(),
+                    &host,
+                    "/count",
+                    &reader.public_key().to_hex(),
+                    body,
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let count: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("count response");
+                assert_eq!(count["count"], 0);
+            }
+        }
+        let partial_filter = serde_json::to_vec(&[serde_json::json!({
+            "ids": [partial_reserved.id.to_hex()],
+            "kinds": [KIND_AGENT_ENGRAM]
+        })])
+        .expect("serialize partial reserved filter");
+        for (reader, expected_count) in [(&agent, 1), (&owner, 0)] {
             let (status, bytes) = post_read_route(
                 state.clone(),
                 &host,
                 "/query",
-                &stranger.public_key().to_hex(),
-                body,
+                &reader.public_key().to_hex(),
+                &partial_filter,
             )
             .await;
             assert_eq!(status, axum::http::StatusCode::OK);
-            assert_eq!(bytes.as_ref(), b"[]");
+            let events: Vec<nostr::Event> =
+                serde_json::from_slice(&bytes).expect("partial reserved query");
+            assert_eq!(events.len(), expected_count);
             let (status, bytes) = post_read_route(
                 state.clone(),
                 &host,
                 "/count",
-                &stranger.public_key().to_hex(),
-                body,
+                &reader.public_key().to_hex(),
+                &partial_filter,
             )
             .await;
             assert_eq!(status, axum::http::StatusCode::OK);
-            let count: serde_json::Value = serde_json::from_slice(&bytes).expect("count response");
-            assert_eq!(count["count"], 0);
+            let count: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("partial reserved count");
+            assert_eq!(count["count"], expected_count);
         }
 
         let broad = serde_json::to_vec(&[serde_json::json!({
             "kinds": [KIND_AGENT_ENGRAM]
         })])
         .expect("serialize broad filter");
-        let (status, _) = post_read_route(
-            state.clone(),
-            &host,
-            "/query",
-            &stranger.public_key().to_hex(),
-            &broad,
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        for reader in [&owner, &stranger] {
+            let (status, _) = post_read_route(
+                state.clone(),
+                &host,
+                "/query",
+                &reader.public_key().to_hex(),
+                &broad,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        }
 
         let legacy_filter = serde_json::to_vec(&[serde_json::json!({
             "ids": [legacy.id.to_hex()]
@@ -7980,6 +8073,18 @@ pub(crate) mod postgres_tests {
             events.iter().map(|event| event.id).collect::<Vec<_>>(),
             [legacy.id]
         );
+        let (status, bytes) = post_read_route(
+            state.clone(),
+            &host,
+            "/count",
+            &stranger.public_key().to_hex(),
+            &legacy_filter,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let legacy_count: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("legacy count response");
+        assert_eq!(legacy_count["count"], 1);
 
         let s_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::S);
         let scoped_filter = nostr::Filter::new()
@@ -8040,9 +8145,21 @@ pub(crate) mod postgres_tests {
             false,
         )
         .await;
-        assert!(owner_frames
+        assert!(!owner_frames
             .iter()
             .any(|frame| frame.contains(&fenced.id.to_hex())));
+        let owner_count_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &owner,
+            None,
+            id_filter.clone(),
+            true,
+        )
+        .await;
+        assert!(owner_count_frames
+            .iter()
+            .any(|frame| frame.contains(r#""count":0"#)));
         let stranger_frames = ws_read_frames(
             state.clone(),
             tenant.clone(),

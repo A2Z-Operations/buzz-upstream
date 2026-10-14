@@ -440,9 +440,9 @@ pub struct IngestResult {
 pub enum IngestError {
     /// Client error (bad event) — WS: OK false, HTTP: 400.
     Rejected(String),
-    /// Canvas CAS or owner-memory LWW conflict — WS: OK false, HTTP: 409.
+    /// Canvas CAS or managed-memory LWW conflict — WS: OK false, HTTP: 409.
     ///
-    /// Emitted when a canvas revision precondition fails or an owner-memory
+    /// Emitted when a canvas revision precondition fails or a managed-memory
     /// event does not supersede the current coordinate head. Kept separate from
     /// [`IngestError::Rejected`] so the HTTP bridge can map it to
     /// `409 CONFLICT` while generic client mistakes remain `400 BAD_REQUEST`.
@@ -1454,7 +1454,7 @@ fn validate_diff_event(event: &Event) -> Result<(), String> {
 /// no plaintext, but it can — and must — enforce the public tag shape:
 ///
 /// * exactly one `d` tag with a 64-hex value (`d_tag = lower_hex(HMAC...)`),
-/// * exactly one `p` tag with a 64-hex pubkey (the owner counterparty).
+/// * exactly one `p` tag with a 64-hex pubkey (the encryption counterparty).
 ///
 /// Content is opaque NIP-44 ciphertext; we do not parse it.
 fn validate_engram_envelope(event: &Event) -> Result<(), String> {
@@ -2486,7 +2486,7 @@ async fn ingest_event_inner(
                     channel: channel_label(destination.channel_id),
                     claimed_community: claimed,
                 },
-                IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                IfcPublicationTarget::ManagedMemory { .. } => TraceAction::WriteInsertGlobal {
                     msg_id: msg_id_label(event.id.as_bytes()),
                     claimed_community: claimed,
                 },
@@ -3481,7 +3481,7 @@ async fn ingest_event_inner(
                         channel: channel_label(destination.channel_id),
                         claimed_community: claimed,
                     },
-                    IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                    IfcPublicationTarget::ManagedMemory { .. } => TraceAction::WriteInsertGlobal {
                         msg_id: msg_id_label(event.id.as_bytes()),
                         claimed_community: claimed,
                     },
@@ -3515,7 +3515,7 @@ async fn ingest_event_inner(
             }
             Ok(buzz_db::ifc::IfcPublishOutcome::MemoryConflict(_)) => {
                 return Err(IngestError::CanvasConflict(
-                    "conflict: stale owner-memory replacement".into(),
+                    "conflict: stale managed-memory replacement".into(),
                 ));
             }
             Err(buzz_db::ifc::IfcError::PolicyChanged) => {
@@ -6910,6 +6910,11 @@ mod postgres_tests {
             )
             .await
             .expect("create source channel");
+        assert!(!state
+            .db
+            .is_member(community, source, owner.public_key().as_bytes())
+            .await
+            .expect("check saved owner source access"));
         let owner_hex = owner.public_key().to_hex();
         let agent_hex = agent.public_key().to_hex();
         let source_text = source.to_string();
@@ -6950,12 +6955,11 @@ mod postgres_tests {
             .expect("query telemetry receipt"));
     }
 
-    /// Owner memory retains the existing encrypted 30174 envelope and LWW
-    /// semantics while source freshness and durable exact retries use the
-    /// shared fenced-ingest transaction.
+    /// Managed memory retains the existing encrypted 30174 envelope and LWW
+    /// semantics while using an agent-self custody recipient.
     #[tokio::test]
     #[ignore = "requires Postgres and Redis"]
-    async fn fenced_owner_memory_uses_production_ingest_and_parameterized_lww() {
+    async fn fenced_managed_memory_uses_production_ingest_and_parameterized_lww() {
         use buzz_core::engram::{conversation_key, d_tag};
         use buzz_db::channel::{ChannelType, ChannelUpdate, ChannelVisibility};
         use nostr::nips::nip44::{self, Version};
@@ -7011,31 +7015,42 @@ mod postgres_tests {
             .expect("create source channel");
 
         let slug = "mem/production-seam";
-        let memory_key = conversation_key(agent.secret_key(), &owner.public_key());
+        let memory_key = conversation_key(agent.secret_key(), &agent.public_key());
         let d = d_tag(&memory_key, slug);
         let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
         let community_text = community.to_string();
         let source_text = source.to_string();
         let expiry = (Utc::now().timestamp() + 120).to_string();
         let memory_namespace = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-        let encrypt = |value: &str| {
+        let encrypt_managed = |value: &str| {
+            nip44::encrypt(
+                agent.secret_key(),
+                &agent.public_key(),
+                format!(r#"{{"slug":"{slug}","value":"{value}"}}"#),
+                Version::V2,
+            )
+            .expect("encrypt memory")
+        };
+        let encrypt_legacy = |value: &str| {
             nip44::encrypt(
                 agent.secret_key(),
                 &owner.public_key(),
                 format!(r#"{{"slug":"{slug}","value":"{value}"}}"#),
                 Version::V2,
             )
-            .expect("encrypt memory")
+            .expect("encrypt legacy memory")
         };
         let memory =
             |created_at: u64, value: &str, expected_revision: Option<&str>, extra: &[Tag]| {
                 let mut tags = vec![
                     Tag::parse(["d", d.as_str()]).expect("d tag"),
-                    Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                    Tag::parse(["p", agent_hex.as_str()]).expect("p tag"),
                     Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
                         .expect("ifc tag"),
                     Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
-                    Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                    Tag::parse(["ifc-managed-memory", agent_hex.as_str()])
+                        .expect("managed-memory tag"),
                     Tag::parse(["s", memory_namespace]).expect("memory namespace tag"),
                 ];
                 if let Some(expected_revision) = expected_revision {
@@ -7045,11 +7060,24 @@ mod postgres_tests {
                     );
                 }
                 tags.extend_from_slice(extra);
-                EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt(value))
-                    .tags(tags)
-                    .custom_created_at(Timestamp::from(created_at))
-                    .sign_with_keys(&agent)
-                    .expect("sign fenced memory")
+                let event = EventBuilder::new(
+                    Kind::Custom(KIND_AGENT_ENGRAM as u16),
+                    encrypt_managed(value),
+                )
+                .tags(tags)
+                .allow_self_tagging()
+                .custom_created_at(Timestamp::from(created_at))
+                .sign_with_keys(&agent)
+                .expect("sign fenced memory");
+                assert_eq!(
+                    event
+                        .tags
+                        .public_keys()
+                        .map(|key| key.to_hex())
+                        .collect::<Vec<_>>(),
+                    [agent.public_key().to_hex()]
+                );
+                event
             };
         let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
         let http = || IngestAuth::Http {
@@ -7065,6 +7093,14 @@ mod postgres_tests {
         };
         let now = Utc::now().timestamp() as u64;
         let first = memory(now, "first", Some("none"), &[]);
+        let first_plaintext =
+            nip44::decrypt(agent.secret_key(), &agent.public_key(), &first.content)
+                .expect("decrypt agent-self memory");
+        assert_eq!(
+            first_plaintext,
+            format!(r#"{{"slug":"{slug}","value":"first"}}"#)
+        );
+        assert!(nip44::decrypt(owner.secret_key(), &agent.public_key(), &first.content).is_err());
         let conn_id = Uuid::new_v4();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(4);
@@ -7085,7 +7121,7 @@ mod postgres_tests {
         );
         state
             .conn_manager
-            .set_authenticated_pubkey(conn_id, owner.public_key().to_bytes().to_vec());
+            .set_authenticated_pubkey(conn_id, agent.public_key().to_bytes().to_vec());
         state.sub_registry.register_scoped(
             community,
             conn_id,
@@ -7115,17 +7151,20 @@ mod postgres_tests {
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, stale.clone(), http()).await,
             Err(IngestError::CanvasConflict(message))
-                if message == "conflict: stale owner-memory replacement"
+                if message == "conflict: stale managed-memory replacement"
         ));
 
-        let legacy = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt("legacy"))
-            .tags([
-                Tag::parse(["d", d.as_str()]).expect("legacy d tag"),
-                Tag::parse(["p", owner_hex.as_str()]).expect("legacy p tag"),
-            ])
-            .custom_created_at(Timestamp::from(now + 2))
-            .sign_with_keys(&agent)
-            .expect("sign legacy memory");
+        let legacy = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt_legacy("legacy"),
+        )
+        .tags([
+            Tag::parse(["d", d.as_str()]).expect("legacy d tag"),
+            Tag::parse(["p", owner_hex.as_str()]).expect("legacy p tag"),
+        ])
+        .custom_created_at(Timestamp::from(now + 2))
+        .sign_with_keys(&agent)
+        .expect("sign legacy memory");
         ingest_event_inner(&state, &tracer, &tenant, legacy.clone(), websocket())
             .await
             .expect("insert ordinary unfenced replacement");
@@ -7133,13 +7172,13 @@ mod postgres_tests {
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, raced.clone(), http()).await,
             Err(IngestError::CanvasConflict(message))
-                if message == "conflict: stale owner-memory replacement"
+                if message == "conflict: stale managed-memory replacement"
         ));
 
         let legacy_id = legacy.id.to_hex();
         let tombstone_ciphertext = nip44::encrypt(
             agent.secret_key(),
-            &owner.public_key(),
+            &agent.public_key(),
             format!(r#"{{"slug":"{slug}","value":null}}"#),
             Version::V2,
         )
@@ -7147,6 +7186,7 @@ mod postgres_tests {
         let tombstone =
             EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), tombstone_ciphertext)
                 .tags(memory(now + 4, "tombstone template", Some(legacy_id.as_str()), &[]).tags)
+                .allow_self_tagging()
                 .custom_created_at(Timestamp::from(now + 4))
                 .sign_with_keys(&agent)
                 .expect("sign memory tombstone");
@@ -7164,7 +7204,7 @@ mod postgres_tests {
             )
             .await,
             Err(IngestError::CanvasConflict(message))
-                if message == "conflict: stale owner-memory replacement"
+                if message == "conflict: stale managed-memory replacement"
         ));
 
         state
@@ -7207,6 +7247,99 @@ mod postgres_tests {
         );
         assert!(matches!(
             ingest_event_inner(&state, &tracer, &tenant, malformed.clone(), http()).await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        let replacement_head = tombstone_id.as_str();
+        let target_template = memory(now + 7, "target template", Some(replacement_head), &[]);
+        let old_target_tags = target_template
+            .tags
+            .iter()
+            .map(|tag| {
+                let parts = tag.as_slice();
+                if parts
+                    .first()
+                    .is_some_and(|name| name == "ifc-managed-memory")
+                {
+                    Tag::parse(["ifc-owner-memory", owner_hex.as_str()])
+                        .expect("old owner-memory tag")
+                } else {
+                    tag.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let old_target = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt_managed("old target"),
+        )
+        .tags(old_target_tags)
+        .allow_self_tagging()
+        .custom_created_at(Timestamp::from(now + 7))
+        .sign_with_keys(&agent)
+        .expect("sign old-target memory");
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, old_target.clone(), websocket()).await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+
+        let mismatched_p_tags = target_template
+            .tags
+            .iter()
+            .map(|tag| {
+                let parts = tag.as_slice();
+                if parts.first().is_some_and(|name| name == "p") {
+                    Tag::parse(["p", owner_hex.as_str()]).expect("mismatched p tag")
+                } else {
+                    tag.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mismatched_p = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt_managed("mismatched p"),
+        )
+        .tags(mismatched_p_tags)
+        .custom_created_at(Timestamp::from(now + 7))
+        .sign_with_keys(&agent)
+        .expect("sign mismatched-p memory");
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, mismatched_p.clone(), http()).await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+
+        let mismatched_target_tags = target_template
+            .tags
+            .iter()
+            .map(|tag| {
+                let parts = tag.as_slice();
+                if parts
+                    .first()
+                    .is_some_and(|name| name == "ifc-managed-memory")
+                {
+                    Tag::parse(["ifc-managed-memory", owner_hex.as_str()])
+                        .expect("mismatched managed-memory tag")
+                } else {
+                    tag.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mismatched_target = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_ENGRAM as u16),
+            encrypt_managed("mismatched target"),
+        )
+        .tags(mismatched_target_tags)
+        .allow_self_tagging()
+        .custom_created_at(Timestamp::from(now + 7))
+        .sign_with_keys(&agent)
+        .expect("sign mismatched-target memory");
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                mismatched_target.clone(),
+                websocket()
+            )
+            .await,
             Err(IngestError::Rejected(message)) if message == "ifc-invalid"
         ));
         let missing_precondition = memory(now + 7, "missing", None, &[]);
@@ -7252,6 +7385,25 @@ mod postgres_tests {
             .await,
             Err(IngestError::Rejected(message)) if message == "ifc-invalid"
         ));
+        let duplicate_target_tag = Tag::parse(["ifc-managed-memory", agent_hex.as_str()])
+            .expect("duplicate managed-memory tag");
+        let duplicate_target = memory(
+            now + 7,
+            "duplicate target",
+            Some(tombstone_id.as_str()),
+            &[duplicate_target_tag],
+        );
+        assert!(matches!(
+            ingest_event_inner(
+                &state,
+                &tracer,
+                &tenant,
+                duplicate_target.clone(),
+                http()
+            )
+            .await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
         let duplicate_namespace_tag =
             Tag::parse(["s", memory_namespace]).expect("duplicate namespace tag");
         let duplicate_namespace = memory(
@@ -7285,9 +7437,10 @@ mod postgres_tests {
         });
         let missing_namespace = EventBuilder::new(
             Kind::Custom(KIND_AGENT_ENGRAM as u16),
-            encrypt("missing namespace"),
+            encrypt_managed("missing namespace"),
         )
         .tags(missing_namespace_tags.clone())
+        .allow_self_tagging()
         .custom_created_at(Timestamp::from(now + 7))
         .sign_with_keys(&agent)
         .expect("sign missing-namespace memory");
@@ -7307,9 +7460,10 @@ mod postgres_tests {
         );
         let substituted_namespace = EventBuilder::new(
             Kind::Custom(KIND_AGENT_ENGRAM as u16),
-            encrypt("substituted namespace"),
+            encrypt_managed("substituted namespace"),
         )
         .tags(missing_namespace_tags)
+        .allow_self_tagging()
         .custom_created_at(Timestamp::from(now + 7))
         .sign_with_keys(&agent)
         .expect("sign substituted-namespace memory");
@@ -7326,6 +7480,7 @@ mod postgres_tests {
         ));
         let bad_cipher = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), "not-nip44")
             .tags(memory(now + 7, "template", Some(tombstone_id.as_str()), &[]).tags)
+            .allow_self_tagging()
             .custom_created_at(Timestamp::from(now + 7))
             .sign_with_keys(&agent)
             .expect("sign malformed ciphertext");
@@ -7348,9 +7503,13 @@ mod postgres_tests {
             absent_after_tombstone.id.as_bytes().as_slice(),
             stale_source.id.as_bytes().as_slice(),
             malformed.id.as_bytes().as_slice(),
+            old_target.id.as_bytes().as_slice(),
+            mismatched_p.id.as_bytes().as_slice(),
+            mismatched_target.id.as_bytes().as_slice(),
             missing_precondition.id.as_bytes().as_slice(),
             malformed_precondition.id.as_bytes().as_slice(),
             duplicate_precondition.id.as_bytes().as_slice(),
+            duplicate_target.id.as_bytes().as_slice(),
             duplicate_namespace.id.as_bytes().as_slice(),
             missing_namespace.id.as_bytes().as_slice(),
             substituted_namespace.id.as_bytes().as_slice(),

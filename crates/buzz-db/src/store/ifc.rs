@@ -188,26 +188,20 @@ async fn lock_event_receipt(
     Ok(())
 }
 
-async fn validate_known_memory_owner(
-    tx: &mut crate::AdmittedTx,
+fn validate_managed_memory_self_recipient(
     event: &Event,
-    owner_pubkey: &str,
+    agent_pubkey: &str,
 ) -> Result<(), IfcError> {
-    let owner = hex::decode(owner_pubkey).map_err(|_| IfcError::Invalid)?;
-    let registered: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "SELECT agent_owner_pubkey FROM users \
-         WHERE community_id=$1 AND pubkey=$2 FOR SHARE",
-    )
-    .bind(tx.community().as_uuid())
-    .bind(event.pubkey.as_bytes())
-    .fetch_optional(tx.conn())
-    .await
-    .map_err(DbError::from)?;
-    if registered
-        .and_then(|(registered,)| registered)
-        .is_some_and(|registered| registered != owner)
-    {
-        return Err(IfcError::AccessDenied);
+    if event.pubkey.to_hex() != agent_pubkey {
+        return Err(IfcError::Invalid);
+    }
+    let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+    let mut recipients = event
+        .tags
+        .filter(nostr::TagKind::SingleLetter(p_tag))
+        .filter_map(nostr::Tag::content);
+    if recipients.next() != Some(agent_pubkey) || recipients.next().is_some() {
+        return Err(IfcError::Invalid);
     }
     Ok(())
 }
@@ -433,14 +427,14 @@ impl Db {
                     .await?;
                 }
             }
-            IfcPublicationTarget::OwnerMemory {
-                owner_pubkey,
+            IfcPublicationTarget::ManagedMemory {
+                agent_pubkey,
                 d_tag,
                 ..
             } => {
                 super::replaceable::acquire_parameterized_event_write_lock(&mut tx, event, d_tag)
                     .await?;
-                validate_known_memory_owner(&mut tx, event, owner_pubkey).await?;
+                validate_managed_memory_self_recipient(event, agent_pubkey)?;
             }
             IfcPublicationTarget::OwnerTelemetry { .. } => return Err(IfcError::Invalid),
         }
@@ -512,7 +506,7 @@ impl Db {
                     IfcPublishOutcome::Inserted(Box::new(stored))
                 }
             }
-            IfcPublicationTarget::OwnerMemory {
+            IfcPublicationTarget::ManagedMemory {
                 d_tag,
                 expected_head,
                 ..
@@ -769,22 +763,21 @@ mod postgres_tests {
 
     fn fenced_memory_event(
         keys: &Keys,
-        owner: &Keys,
         community: CommunityId,
         source: (Uuid, i64),
         d_tag: &str,
         revision_and_timing: (&str, u64, i64),
         content: &str,
     ) -> Event {
-        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = keys.public_key().to_hex();
         let source_channel = source.0.to_string();
         let source_generation = source.1.to_string();
         let community_text = community.to_string();
         let expiry = revision_and_timing.2.to_string();
-        EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), content)
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), content)
             .tags([
                 Tag::parse(["d", d_tag]).expect("d tag"),
-                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["p", agent_hex.as_str()]).expect("p tag"),
                 Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
                     .expect("ifc tag"),
                 Tag::parse([
@@ -793,7 +786,7 @@ mod postgres_tests {
                     source_generation.as_str(),
                 ])
                 .expect("source tag"),
-                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+                Tag::parse(["ifc-managed-memory", agent_hex.as_str()]).expect("managed-memory tag"),
                 Tag::parse([
                     "s",
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
@@ -802,9 +795,19 @@ mod postgres_tests {
                 Tag::parse(["expected-revision", revision_and_timing.0])
                     .expect("expected revision tag"),
             ])
+            .allow_self_tagging()
             .custom_created_at(Timestamp::from(revision_and_timing.1))
             .sign_with_keys(keys)
-            .expect("sign owner memory")
+            .expect("sign managed memory");
+        assert_eq!(
+            event
+                .tags
+                .public_keys()
+                .map(|key| key.to_hex())
+                .collect::<Vec<_>>(),
+            [keys.public_key().to_hex()]
+        );
+        event
     }
 
     fn fenced_telemetry_event(
@@ -1532,12 +1535,11 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
-    async fn owner_memory_uses_atomic_lww_receipts_and_fixed_owner() {
+    async fn managed_memory_uses_atomic_lww_receipts_and_self_recipient() {
         let db = connect().await;
         let (community, source, agent) = fixture(db.pool()).await;
         let owner = Keys::generate();
-        let wrong_owner = Keys::generate();
-        for keys in [&agent, &owner, &wrong_owner] {
+        for keys in [&agent, &owner] {
             db.ensure_user(community, keys.public_key().as_bytes())
                 .await
                 .expect("ensure owner user");
@@ -1550,11 +1552,14 @@ mod postgres_tests {
             )
             .await
             .expect("set fixed owner"));
+        assert!(!db
+            .is_member(community, source, owner.public_key().as_bytes())
+            .await
+            .expect("check saved owner source access"));
         let d_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let now = Utc::now().timestamp() as u64;
         let first = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 1),
             d_tag,
@@ -1579,7 +1584,6 @@ mod postgres_tests {
 
         let second = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 1),
             d_tag,
@@ -1604,7 +1608,6 @@ mod postgres_tests {
 
         let stale = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 1),
             d_tag,
@@ -1636,7 +1639,6 @@ mod postgres_tests {
         let wrong_head_text = "42".repeat(32);
         let wrong_head = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 1),
             d_tag,
@@ -1684,35 +1686,9 @@ mod postgres_tests {
             Ok(IfcPublishOutcome::HistoricDuplicate)
         ));
 
-        let wrong = fenced_memory_event(
-            &agent,
-            &wrong_owner,
-            community,
-            (source, 2),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            ("none", now + 2, Utc::now().timestamp() + 120),
-            "wrong owner ciphertext",
-        );
-        let wrong_fence = parse_publication_fence(&wrong)
-            .expect("parse wrong owner")
-            .expect("wrong owner fence");
-        assert!(matches!(
-            db.publish_ifc_event(
-                community,
-                &wrong,
-                &wrong_fence,
-                &agent.public_key().to_hex(),
-                None,
-                None
-            )
-            .await,
-            Err(IfcError::AccessDenied)
-        ));
-
         let interleaved_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let frozen_absence = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 2),
             interleaved_d,
@@ -1758,7 +1734,6 @@ mod postgres_tests {
 
         let tombstone = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 2),
             interleaved_d,
@@ -1782,7 +1757,6 @@ mod postgres_tests {
         ));
         let missing_tombstone_head = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 2),
             interleaved_d,
@@ -1812,7 +1786,6 @@ mod postgres_tests {
             .expect("missing tombstone receipt"));
         let after_tombstone = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 2),
             interleaved_d,
@@ -1842,7 +1815,6 @@ mod postgres_tests {
         let expires_at = Utc::now().timestamp() + 2;
         let expiring = fenced_memory_event(
             &agent,
-            &owner,
             community,
             (source, 2),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

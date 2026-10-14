@@ -1063,6 +1063,12 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
         push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
     }
 
+    if let Some((ref name, ref value)) = q.custom_tag {
+        let containment = serde_json::json!([[name, value]]);
+        qb.push(format!(" AND {col_prefix}tags @> "))
+            .push_bind(containment);
+    }
+
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
             .push_bind(s);

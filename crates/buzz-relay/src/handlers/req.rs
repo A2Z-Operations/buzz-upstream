@@ -963,7 +963,7 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
                 .iter()
                 .all(|k| buzz_core::kind::is_parameterized_replaceable(k.as_u16() as u32))
     });
-    let is_owner_memory_only = filter.kinds.as_ref().is_some_and(|ks| {
+    let is_managed_memory_only = filter.kinds.as_ref().is_some_and(|ks| {
         !ks.is_empty()
             && ks
                 .iter()
@@ -994,9 +994,9 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
                 // #e is fully pushed (any count) via JSONB containment.
             }
             "s" => {
-                // A single owner-memory namespace is pushed through the
+                // A single managed-memory namespace is pushed through the
                 // existing JSONB containment predicate before SQL LIMIT.
-                if tag_values.len() != 1 || !is_owner_memory_only {
+                if tag_values.len() != 1 || !is_managed_memory_only {
                     return false;
                 }
             }
@@ -1174,7 +1174,7 @@ fn filter_to_query_params(
         .filter(|values| !values.is_empty())
         .map(|values| values.iter().map(|v| v.to_string()).collect());
 
-    // Fenced owner-memory lists use one opaque audience namespace. Push that
+    // Fenced managed-memory lists use one opaque audience namespace. Push that
     // exact signed tag through the existing JSONB containment predicate before
     // SQL LIMIT. Mixed-kind and multi-namespace filters retain the generic
     // post-filter path so other kind semantics are unchanged.
@@ -1579,9 +1579,9 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
 /// Authorize read access for filters that can match KIND_AGENT_ENGRAM events.
 ///
 /// NIP-AE engrams are global (no channel scope) and have encrypted content,
-/// but their public `#p` (owner) and timestamps still leak who-pairs-with-whom
-/// plus write-activity patterns. Only the agent (the event's author) or the
-/// owner (the `#p` value) should be able to enumerate them.
+/// but their public `#p` and timestamps still expose recipient and activity
+/// metadata. This admission gate retains legacy author-or-recipient queries;
+/// the shared per-event predicate narrows every IFC-tagged result to its author.
 ///
 /// A filter is authorized when at least one of:
 ///   - `authors` is non-empty and every entry equals the authed pubkey
@@ -1589,9 +1589,8 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
 ///   - `#p` is non-empty and every entry equals the authed pubkey
 ///     (the owner reading engrams addressed to them).
 ///
-/// Filters with explicit `ids` are exempt — knowing the event id already
-/// implies authorization (the engram event id is itself derived from the
-/// signed envelope, which only the agent could have produced).
+/// Filters with explicit `ids` are admitted so the relay can load the candidate;
+/// authorization is still applied to the actual event before delivery or count.
 ///
 /// Mixed-kind filters (e.g. `{kinds:[30174, 9]}`) are evaluated under this
 /// gate when KIND_AGENT_ENGRAM is present; matching events of other kinds in
@@ -1678,8 +1677,8 @@ pub(crate) fn filter_can_match_result_gated_kinds(filter: &Filter) -> bool {
 }
 
 /// Returns `true` if a result-gated-kind COUNT filter can safely use the fast
-/// SQL pushdown path — specifically, when the filter's `#p` tag is non-empty
-/// and every entry equals the authenticated reader's pubkey.
+/// SQL pushdown path: managed-memory filters must pin every author to the
+/// authenticated reader; other result-gated filters may pin `#p` instead.
 ///
 /// In that case the SQL `WHERE #p = self` pushdown scopes the query to the
 /// reader's own events, so the fast path cannot leak another owner's event
@@ -1692,6 +1691,27 @@ pub(crate) fn result_gated_count_safe_for_pushdown(
     filter: &Filter,
     authed_pubkey_hex: &str,
 ) -> bool {
+    let memory_only = filter.kinds.as_ref().is_some_and(|kinds| {
+        !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|kind| kind.as_u16() as u32 == KIND_AGENT_ENGRAM)
+    });
+    if memory_only {
+        return filter.authors.as_ref().is_some_and(|authors| {
+            !authors.is_empty()
+                && authors
+                    .iter()
+                    .all(|author| author.to_hex().eq_ignore_ascii_case(authed_pubkey_hex))
+        });
+    }
+    if filter.kinds.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| kind.as_u16() as u32 == KIND_AGENT_ENGRAM)
+    }) {
+        return false;
+    }
     let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
     filter
         .generic_tags
@@ -2507,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_memory_namespace_is_pushed_only_for_one_exact_scope() {
+    fn managed_memory_namespace_is_pushed_only_for_one_exact_scope() {
         let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
         let s = nostr::SingleLetterTag::lowercase(nostr::Alphabet::S);
         let namespace = "ab".repeat(32);
@@ -3367,6 +3387,24 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    #[test]
+    fn result_gated_safe_pushdown_never_uses_p_for_managed_memory() {
+        let (agent, _owner, _other) = three_pubkeys();
+        let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+        let f = nostr::Filter::new()
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tags(p_tag, [agent.clone()]);
+        assert!(!result_gated_count_safe_for_pushdown(&f, &agent));
+
+        let own_author = f
+            .clone()
+            .author(nostr::PublicKey::from_hex(&agent).expect("agent key"));
+        assert!(result_gated_count_safe_for_pushdown(&own_author, &agent));
+
+        let wildcard = nostr::Filter::new().custom_tags(p_tag, [agent.clone()]);
+        assert!(!result_gated_count_safe_for_pushdown(&wildcard, &agent));
     }
 
     // ── W3: B2 REQ gate — barrier expiry mid-flight blocks subscription registration
