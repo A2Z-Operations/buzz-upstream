@@ -1370,6 +1370,12 @@ async fn query_events_authed(
     )
     .await?;
 
+    if let Some(result) = crate::ifc::query(state, tenant, &pubkey, body).await {
+        return result
+            .map(Json)
+            .map_err(|(status, message)| api_error(status, &message));
+    }
+
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)

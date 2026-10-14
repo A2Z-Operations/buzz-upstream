@@ -13,6 +13,7 @@ CREATE TABLE channels (
     name            VARCHAR(255) NOT NULL,
     channel_type    channel_type NOT NULL DEFAULT 'stream',
     visibility      channel_visibility NOT NULL DEFAULT 'open',
+    history_access  TEXT NOT NULL DEFAULT 'all_current_members',
     description     TEXT,
     canvas          TEXT,
     created_by      BYTEA NOT NULL,
@@ -33,7 +34,8 @@ CREATE TABLE channels (
     ttl_seconds     INT,
     ttl_deadline    TIMESTAMPTZ,
     PRIMARY KEY (community_id, id),
-    CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
+    CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    CONSTRAINT chk_channels_history_access CHECK (history_access = 'all_current_members')
 );
 
 -- nip29 group id and DM participant hash are unique WITHIN a community, not globally.

@@ -34,6 +34,9 @@ pub struct RelayInfo {
     /// Host-bound atomic read-state snapshot capability; absent on unresolved hosts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_state_snapshot: Option<serde_json::Value>,
+    /// Remote-agent information-flow proof and fenced-publication capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ifc: Option<serde_json::Value>,
     /// Opt-in, host-bound private accessory API; separate from legacy NIP-RS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buzz_v1: Option<BuzzV1Descriptor>,
@@ -271,6 +274,7 @@ impl RelayInfo {
             description: "Buzz — private team communication relay".to_string(),
             icon: icon.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             read_state_snapshot: None,
+            ifc: None,
             buzz_v1: None,
             artifacts: serde_json::json!({
                 "version": 1, "revision_kind": 45010, "removal_kind": 45011,
@@ -381,6 +385,7 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         state.config.klipy.as_ref().map(|_| "klipy"),
     );
     if let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await {
+        info.ifc = ifc_descriptor(state.config.relay_private_key.is_some());
         if state.config.buzz_v1_enabled {
             use buzz_db::personal_read::{ELIGIBLE_KINDS, MAX_CHANNELS, MAX_INTENTS};
             info.buzz_v1 = Some(BuzzV1Descriptor {
@@ -420,6 +425,25 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         info.push = Some(push);
     }
     info
+}
+
+fn ifc_descriptor(has_stable_relay_key: bool) -> Option<serde_json::Value> {
+    has_stable_relay_key.then(|| {
+        serde_json::json!({
+            "version": 1,
+            "attestation_kind": buzz_core::kind::KIND_IFC_ATTESTATION,
+            "query": "/query",
+            "max_sources": buzz_core::ifc::IFC_MAX_SOURCES,
+            "max_fence_ttl_seconds": buzz_core::ifc::IFC_MAX_TTL_SECONDS,
+            "receipt_retention_seconds": buzz_core::ifc::IFC_RECEIPT_RETENTION_SECONDS,
+            "max_policy_members": buzz_db::ifc::IFC_MAX_POLICY_MEMBERS,
+            "max_resources": buzz_db::ifc::IFC_MAX_RESOURCES,
+            "max_response_bytes": crate::ifc::MAX_RESPONSE_BYTES,
+            "query_timeout_ms": crate::ifc::QUERY_DEADLINE.as_millis(),
+            "history_access": ["all_current_members"],
+            "fenced_kinds": buzz_core::ifc::IFC_CHANNEL_PUBLICATION_KINDS,
+        })
+    })
 }
 
 /// Fetches the workspace icon for the community bound to `raw_host`, as the
@@ -531,6 +555,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn ifc_descriptor_requires_stable_key_and_omits_owner_memory() {
+        assert!(ifc_descriptor(false).is_none());
+        let descriptor = ifc_descriptor(true).expect("stable relay key advertises IFC");
+        assert_eq!(descriptor["version"], 1);
+        assert_eq!(
+            descriptor["attestation_kind"],
+            buzz_core::kind::KIND_IFC_ATTESTATION
+        );
+        assert_eq!(
+            descriptor["fenced_kinds"],
+            serde_json::json!(buzz_core::ifc::IFC_CHANNEL_PUBLICATION_KINDS)
+        );
+        assert!(!descriptor.to_string().contains("30078"));
+    }
 
     #[test]
     fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {

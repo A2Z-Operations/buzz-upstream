@@ -30,6 +30,8 @@ mod event_follow_up_postgres_tests;
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
+/// Canonical remote-agent information-flow policy and fenced writes.
+pub mod ifc;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Deployment-global operator-listener mention registrations and delivery queues.

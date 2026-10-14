@@ -118,7 +118,7 @@ pub(crate) async fn refresh_channel_ttls(
     Ok(())
 }
 
-async fn refresh_channel_ttl(
+pub(crate) async fn refresh_channel_ttl(
     conn: &mut PgConnection,
     community: CommunityId,
     channel: Uuid,

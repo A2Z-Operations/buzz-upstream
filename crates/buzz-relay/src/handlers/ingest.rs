@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use buzz_auth::Scope;
+use buzz_core::ifc::{has_ifc_tag, parse_publication_fence};
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
@@ -2423,6 +2424,10 @@ async fn ingest_event_inner(
         )));
     }
 
+    if has_ifc_tag(&event) && parse_publication_fence(&event).is_err() {
+        return Err(IngestError::Rejected("ifc-invalid".into()));
+    }
+
     if buzz_core::kind::is_relay_only_kind(kind_u32) {
         return Err(IngestError::Rejected("restricted: relay-only kind".into()));
     }
@@ -2447,6 +2452,41 @@ async fn ingest_event_inner(
         }
     }
     let event = std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone());
+
+    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
+    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
+        return Err(IngestError::AuthFailed(
+            "invalid: event pubkey does not match authenticated identity".into(),
+        ));
+    }
+    let ifc_fence =
+        parse_publication_fence(&event).map_err(|_| IngestError::Rejected("ifc-invalid".into()))?;
+    if let Some(fence) = &ifc_fence {
+        if fence.community_id != *tenant.community().as_uuid() {
+            return Err(IngestError::Rejected("ifc-invalid".into()));
+        }
+        if state
+            .db
+            .ifc_event_was_accepted(tenant.community(), event.id.as_bytes())
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?
+        {
+            emit(
+                tracer,
+                TraceAction::WriteDuplicate {
+                    msg_id: msg_id_label(event.id.as_bytes()),
+                    channel: channel_label(fence.destination.channel_id),
+                    claimed_community: claimed_community_from_event(&event),
+                },
+                state_for_request(tenant, auth.pubkey()),
+            );
+            return Ok(IngestResult {
+                event_id: event_id_hex,
+                accepted: true,
+                message: "duplicate:".into(),
+            });
+        }
+    }
 
     if kind_u32 == buzz_core::kind::KIND_ARTIFACT
         && event.pubkey == *auth.pubkey()
@@ -2499,13 +2539,6 @@ async fn ingest_event_inner(
             MAX_EVENT_CONTENT_BYTES,
             event.content.len()
         )));
-    }
-
-    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
-        return Err(IngestError::AuthFailed(
-            "invalid: event pubkey does not match authenticated identity".into(),
-        ));
     }
 
     let required = match required_scope_for_kind(kind_u32, &event) {
@@ -2690,6 +2723,12 @@ async fn ingest_event_inner(
                 IngestError::AuthFailed(e)
             }
         })?;
+        if let Some(fence) = &ifc_fence {
+            for source in &fence.sources {
+                check_token_channel_access(&auth, source.channel_id)
+                    .map_err(IngestError::AuthFailed)?;
+            }
+        }
     } else if deletion_targets_event && auth.channel_ids().is_some() {
         return Err(deletion_denied());
     } else if auth.channel_ids().is_some() {
@@ -2741,7 +2780,8 @@ async fn ingest_event_inner(
         // member/open gate here lets the owning human act on private agent channels
         // without being a member (OQ1 decision; see validate_edit_ownership /
         // validate_admin_event for per-kind enforcement).
-        let skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
+        let skip_membership = ifc_fence.is_some()
+            || kind_u32 == KIND_NIP29_JOIN_REQUEST
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || kind_u32 == KIND_STREAM_MESSAGE_EDIT
             || kind_u32 == KIND_NIP29_EDIT_METADATA
@@ -3398,7 +3438,76 @@ async fn ingest_event_inner(
     };
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    let (stored_event, was_inserted) = if workflow_deletion {
+    let (stored_event, was_inserted) = if let Some(fence) = &ifc_fence {
+        let thread_params = thread_meta.as_ref().map(|metadata| metadata.as_params());
+        let canvas_precondition = canvas_revision_spec.as_ref().map(|spec| match spec {
+            CanvasRevisionSpec::NoHead => buzz_db::ChannelHeadPrecondition::ExpectNoHead,
+            CanvasRevisionSpec::Head(id) => buzz_db::ChannelHeadPrecondition::ExpectedHead(id),
+        });
+        match state
+            .db
+            .publish_ifc_event(
+                tenant.community(),
+                &event,
+                fence,
+                &auth.pubkey().to_hex(),
+                thread_params,
+                canvas_precondition,
+            )
+            .await
+        {
+            Ok(buzz_db::ifc::IfcPublishOutcome::Inserted(stored)) => (*stored, true),
+            Ok(buzz_db::ifc::IfcPublishOutcome::HistoricDuplicate) => {
+                emit(
+                    tracer,
+                    TraceAction::WriteDuplicate {
+                        msg_id: msg_id_label(event.id.as_bytes()),
+                        channel: channel_label(fence.destination.channel_id),
+                        claimed_community: claimed_community_from_event(&event),
+                    },
+                    state_for_request(tenant, auth.pubkey()),
+                );
+                return Ok(IngestResult {
+                    event_id: event_id_hex,
+                    accepted: true,
+                    message: "duplicate:".into(),
+                });
+            }
+            Ok(buzz_db::ifc::IfcPublishOutcome::CanvasConflict(status)) => {
+                let message = match status {
+                    buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
+                        "conflict: canvas revision does not exist"
+                    }
+                    buzz_db::ChannelHeadWriteStatus::RevisionMismatch => {
+                        "conflict: canvas changed since it was loaded"
+                    }
+                    buzz_db::ChannelHeadWriteStatus::SupersedeFailed => {
+                        "conflict: canvas write does not supersede the current head"
+                    }
+                    buzz_db::ChannelHeadWriteStatus::Inserted
+                    | buzz_db::ChannelHeadWriteStatus::Duplicate => "ifc-invalid",
+                };
+                return Err(IngestError::CanvasConflict(message.into()));
+            }
+            Err(buzz_db::ifc::IfcError::PolicyChanged) => {
+                return Err(IngestError::CanvasConflict("ifc-policy-changed".into()));
+            }
+            Err(buzz_db::ifc::IfcError::Expired) => {
+                return Err(IngestError::Rejected("ifc-expired".into()));
+            }
+            Err(buzz_db::ifc::IfcError::Invalid) => {
+                return Err(IngestError::Rejected("ifc-invalid".into()));
+            }
+            Err(buzz_db::ifc::IfcError::AccessDenied) => {
+                return Err(IngestError::AuthFailed(
+                    "restricted: channel access denied".into(),
+                ));
+            }
+            Err(buzz_db::ifc::IfcError::Database(error)) => {
+                return Err(IngestError::Internal(format!("error: {error}")));
+            }
+        }
+    } else if workflow_deletion {
         // A single commit owns public acceptance, domain mutation, and dispatch.
         // Failure rolls everything back; identical concurrent requests cannot
         // divide insertion and repair ownership between two relay workers.
@@ -6608,6 +6717,112 @@ mod postgres_tests {
             Err(other) => panic!("a failed source lookup must be internal, got {other:?}"),
             Ok(_) => panic!("a failed source lookup must deny the move, got accepted"),
         }
+    }
+
+    /// A committed HTTP publication is a historic duplicate when retried through
+    /// WebSocket auth after policy advancement, while new stale bytes are denied.
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn fenced_ingest_accepts_exact_retry_across_http_and_websocket_auth() {
+        use buzz_db::channel::{ChannelType, ChannelUpdate, ChannelVisibility};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("connect test Postgres");
+        let state = build_canvas_ingest_state(&db_url, &pool).await;
+        let host = format!("ifc-ingest-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let author = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel_id,
+                &format!("ifc-ingest-{}", channel_id.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                author.public_key().to_bytes().as_slice(),
+                None,
+            )
+            .await
+            .expect("create test channel");
+        let channel = channel_id.to_string();
+        let community_text = community.to_string();
+        let expiry = (Utc::now().timestamp() + 120).to_string();
+        let fenced = |content: &str| {
+            EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+                .tags([
+                    Tag::parse(["h", channel.as_str()]).expect("h tag"),
+                    Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                        .expect("ifc tag"),
+                    Tag::parse(["ifc-source", channel.as_str(), "1"]).expect("source tag"),
+                    Tag::parse(["ifc-destination", channel.as_str(), "1"])
+                        .expect("destination tag"),
+                ])
+                .sign_with_keys(&author)
+                .expect("sign fenced event")
+        };
+        let event = fenced("accepted once");
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+        let http = IngestAuth::Http {
+            pubkey: author.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        ingest_event_inner(&state, &tracer, &tenant, event.clone(), http)
+            .await
+            .expect("HTTP fenced publication");
+
+        state
+            .db
+            .update_channel(
+                community,
+                channel_id,
+                ChannelUpdate {
+                    visibility: Some("private".to_owned()),
+                    ..ChannelUpdate::default()
+                },
+            )
+            .await
+            .expect("advance policy");
+        let websocket = || IngestAuth::Nip42 {
+            pubkey: author.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            channel_ids: Some(vec![channel_id]),
+            conn_id: Uuid::new_v4(),
+        };
+        let retry = ingest_event_inner(&state, &tracer, &tenant, event.clone(), websocket())
+            .await
+            .expect("WebSocket exact retry");
+        assert_eq!(retry.message, "duplicate:");
+
+        let stale = fenced("never inserted");
+        let stale_id = stale.id.as_bytes().to_vec();
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, stale, websocket()).await,
+            Err(IngestError::CanvasConflict(message)) if message == "ifc-policy-changed"
+        ));
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE community_id=$1 AND id = ANY($2::bytea[])",
+        )
+        .bind(community.as_uuid())
+        .bind(vec![event.id.as_bytes().as_slice(), stale_id.as_slice()])
+        .fetch_one(&pool)
+        .await
+        .expect("count production ingest rows");
+        assert_eq!(stored, 1);
     }
 
     /// End-to-end CAS dispatch wiring: a tagged write inserts, a stale same-head

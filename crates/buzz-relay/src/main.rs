@@ -1026,6 +1026,15 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
             ));
         }
     }
+    match state.db.verify_ifc_policy_catalog().await {
+        Ok(()) => info!("IFC policy catalog verified"),
+        Err(error) => {
+            error!(%error, "IFC policy catalog validation failed");
+            return Err(anyhow::anyhow!(
+                "IFC policy catalog is unsafe; apply or repair migration 0061 before starting this relay: {error}"
+            ));
+        }
+    }
     step.finish();
 
     // Repair legacy NIP-29 channel rosters that were persisted while the

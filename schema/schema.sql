@@ -78,11 +78,14 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i functions/enforce_community_write_fence.sql
 \i functions/enforce_community_tombstone.sql
 \i functions/attach_community_write_fence.sql
+\i functions/channel_policy_lock_key.sql
+\i functions/maintain_channel_policy_generation.sql
 
 -- tables
 \i tables/public/communities.sql
 \i tables/public/channels.sql
 \i tables/public/channel_members.sql
+\i tables/public/channel_policy_generations.sql
 \i tables/public/users.sql
 \i tables/public/personal_read_accounts.sql
 \i tables/public/personal_read_frontiers.sql
@@ -135,6 +138,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/operator_listener_outbox.sql
 \i tables/public/relay_operator_audit.sql
 \i tables/public/storage_accounting_snapshots.sql
+\i tables/public/ifc_event_acceptances.sql
 \i tables/public/artifact_heads.sql
 \i tables/public/artifact_revisions.sql
 
@@ -179,6 +183,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/workflows.sql
 \i triggers/artifact_heads.sql
 \i triggers/artifact_revisions.sql
+\i triggers/channel_policy.sql
 
 -- seeds
 \i seeds/communities.sql

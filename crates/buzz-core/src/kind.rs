@@ -590,6 +590,8 @@ pub const KIND_ARTIFACT_REMOVAL: u32 = 45011;
 pub const KIND_FORUM_VOTE: u32 = 45002;
 /// A comment reply on a forum post.
 pub const KIND_FORUM_COMMENT: u32 = 45003;
+/// Relay-signed, response-only remote-agent policy attestation.
+pub const KIND_IFC_ATTESTATION: u32 = 45900;
 
 // Workflow engine (46000–46999)
 /// Trigger workflow execution.
@@ -776,6 +778,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_ARTIFACT_REMOVAL,
     KIND_FORUM_VOTE,
     KIND_FORUM_COMMENT,
+    KIND_IFC_ATTESTATION,
     KIND_WORKFLOW_TRIGGER,
     KIND_APPROVAL_GRANT,
     KIND_APPROVAL_DENY,
@@ -876,6 +879,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
     matches!(
         kind,
         KIND_ARTIFACT_REMOVAL
+            | KIND_IFC_ATTESTATION
             | KIND_NIP43_MEMBERSHIP_LIST
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT

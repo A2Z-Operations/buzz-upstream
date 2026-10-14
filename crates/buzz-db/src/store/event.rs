@@ -1916,6 +1916,78 @@ async fn acquire_canvas_coordinate_lock(tx: &mut AdmittedTx, channel_id: Uuid) -
     Ok(())
 }
 
+pub(crate) async fn insert_canvas_head_checked_tx(
+    tx: &mut AdmittedTx,
+    event: &Event,
+    channel_id: Uuid,
+    precondition: ChannelHeadPrecondition<'_>,
+) -> Result<(StoredEvent, ChannelHeadWriteStatus)> {
+    let kind_i32 = buzz_core::kind::event_kind_i32(event);
+    if kind_i32 != KIND_CANVAS as i32 {
+        return Err(DbError::InvalidData(format!(
+            "insert_canvas_head_checked requires kind {KIND_CANVAS}, got {kind_i32}"
+        )));
+    }
+    let received_at = Utc::now();
+    let incoming_id = event.id.as_bytes();
+    let community_id = tx.community();
+
+    acquire_canvas_coordinate_lock(tx, channel_id).await?;
+    let head: Option<(Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, created_at FROM events \
+         WHERE community_id = $1 AND kind = $2 AND channel_id = $3 AND deleted_at IS NULL \
+         ORDER BY created_at DESC, id ASC LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(kind_i32)
+    .bind(channel_id)
+    .fetch_optional(tx.conn())
+    .await?;
+
+    if head
+        .as_ref()
+        .is_some_and(|(id, _)| id.as_slice() == incoming_id.as_slice())
+    {
+        return Ok((
+            StoredEvent::with_received_at(event.clone(), received_at, Some(channel_id), true),
+            ChannelHeadWriteStatus::Duplicate,
+        ));
+    }
+
+    let status = match (precondition, head.as_ref()) {
+        (ChannelHeadPrecondition::ExpectNoHead, None) => None,
+        (ChannelHeadPrecondition::ExpectNoHead, Some(_)) => {
+            Some(ChannelHeadWriteStatus::RevisionMismatch)
+        }
+        (ChannelHeadPrecondition::ExpectedHead(_), None) => {
+            Some(ChannelHeadWriteStatus::RevisionMissing)
+        }
+        (ChannelHeadPrecondition::ExpectedHead(expected), Some((id, head_created_at))) => {
+            if id.as_slice() != expected {
+                Some(ChannelHeadWriteStatus::RevisionMismatch)
+            } else if !candidate_supersedes_head(event, incoming_id, *head_created_at, id) {
+                Some(ChannelHeadWriteStatus::SupersedeFailed)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(status) = status {
+        return Ok((
+            StoredEvent::with_received_at(event.clone(), received_at, Some(channel_id), false),
+            status,
+        ));
+    }
+
+    let (stored, was_inserted) =
+        insert_event_with_thread_metadata_tx(tx, event, Some(channel_id), None).await?;
+    if !was_inserted {
+        return Ok((stored, ChannelHeadWriteStatus::RevisionMismatch));
+    }
+    crate::insert_mentions_in_transaction(tx, event, Some(channel_id)).await?;
+    Ok((stored, ChannelHeadWriteStatus::Inserted))
+}
+
 /// Atomically insert an event and its optional thread metadata.
 ///
 /// `insert_event` and `insert_thread_metadata` calls could leave reply counters
@@ -2018,90 +2090,20 @@ pub async fn insert_canvas_head_checked(
     channel_id: Uuid,
     precondition: ChannelHeadPrecondition<'_>,
 ) -> Result<(StoredEvent, ChannelHeadWriteStatus)> {
-    let kind_i32 = buzz_core::kind::event_kind_i32(event);
-    if kind_i32 != KIND_CANVAS as i32 {
-        return Err(DbError::InvalidData(format!(
-            "insert_canvas_head_checked requires kind {KIND_CANVAS}, got {kind_i32}"
-        )));
-    }
-    let received_at = Utc::now();
-    let incoming_id = event.id.as_bytes();
-
     let mut tx = crate::begin_community_event_write_transaction(
         pool,
         community_id,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    acquire_canvas_coordinate_lock(&mut tx, channel_id).await?;
-
-    let head: Option<(Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, created_at FROM events \
-         WHERE community_id = $1 AND kind = $2 AND channel_id = $3 AND deleted_at IS NULL \
-         ORDER BY created_at DESC, id ASC LIMIT 1",
-    )
-    .bind(community_id.as_uuid())
-    .bind(kind_i32)
-    .bind(channel_id)
-    .fetch_optional(tx.conn())
-    .await?;
-
-    // Idempotent replay: the incoming event is already the live head.
-    if head
-        .as_ref()
-        .is_some_and(|(id, _)| id.as_slice() == incoming_id.as_slice())
-    {
+    let (stored, status) =
+        insert_canvas_head_checked_tx(&mut tx, event, channel_id, precondition).await?;
+    if !matches!(status, ChannelHeadWriteStatus::Inserted) {
         tx.rollback().await?;
-        return Ok((
-            StoredEvent::with_received_at(event.clone(), received_at, Some(channel_id), true),
-            ChannelHeadWriteStatus::Duplicate,
-        ));
+        return Ok((stored, status));
     }
-
-    let status = match (precondition, head.as_ref()) {
-        (ChannelHeadPrecondition::ExpectNoHead, None) => None,
-        (ChannelHeadPrecondition::ExpectNoHead, Some(_)) => {
-            Some(ChannelHeadWriteStatus::RevisionMismatch)
-        }
-        (ChannelHeadPrecondition::ExpectedHead(_), None) => {
-            Some(ChannelHeadWriteStatus::RevisionMissing)
-        }
-        (ChannelHeadPrecondition::ExpectedHead(expected), Some((id, head_created_at))) => {
-            if id.as_slice() != expected {
-                Some(ChannelHeadWriteStatus::RevisionMismatch)
-            } else if !candidate_supersedes_head(event, incoming_id, *head_created_at, id) {
-                Some(ChannelHeadWriteStatus::SupersedeFailed)
-            } else {
-                None
-            }
-        }
-    };
-    if let Some(status) = status {
-        tx.rollback().await?;
-        return Ok((
-            StoredEvent::with_received_at(event.clone(), received_at, Some(channel_id), false),
-            status,
-        ));
-    }
-
-    let (stored, was_inserted) =
-        insert_event_with_thread_metadata_tx(&mut tx, event, Some(channel_id), None).await?;
-    if !was_inserted {
-        // The primary-key row already exists. The idempotent-replay branch above
-        // already returned `Duplicate` for the case where the incoming event is
-        // the canonical live head. Reaching here means the row exists but is NOT
-        // the live head (e.g. soft-deleted). Because every kind-40100 mutator
-        // serializes on this advisory key, no concurrent writer can have changed
-        // the live head since our read above, so the truthful result is
-        // `RevisionMismatch` — a false `Duplicate` would acknowledge a write
-        // that did not become live.
-        tx.rollback().await?;
-        return Ok((stored, ChannelHeadWriteStatus::RevisionMismatch));
-    }
-    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
     tx.commit().await?;
-
-    Ok((stored, ChannelHeadWriteStatus::Inserted))
+    Ok((stored, status))
 }
 
 impl Db {
