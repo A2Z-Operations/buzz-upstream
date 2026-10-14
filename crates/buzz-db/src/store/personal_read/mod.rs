@@ -12,6 +12,7 @@ mod model;
 mod projection;
 mod writes;
 
+pub use follows::set_follow_window_seconds;
 pub(crate) use follows::{place, record_message};
 pub use model::*;
 

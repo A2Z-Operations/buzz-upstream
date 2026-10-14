@@ -866,3 +866,75 @@ async fn an_agent_keeps_no_read_state() {
         .await
         .is_some());
 }
+
+/// How many threads the sidebar and the threads view list under `window`.
+async fn listed_within(
+    db: &Db,
+    community: CommunityId,
+    channel: Uuid,
+    actor: &Keys,
+    window: u32,
+) -> (usize, usize) {
+    let sidebar = db
+        .personal_read_sidebar_channels(community, &actor.public_key(), window, &[channel])
+        .await
+        .unwrap()
+        .channels
+        .remove(0)
+        .threads
+        .len();
+    let view = db
+        .personal_read_threads(community, &actor.public_key(), window, MAX_THREADS, None)
+        .await
+        .unwrap()
+        .threads
+        .len();
+    (sidebar, view)
+}
+
+/// A window shorter than a day still revives on a mention: ingest refreshes
+/// against the same window the projections read.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_mention_revives_a_follow_under_a_sub_day_window() {
+    const HOUR: u32 = 60 * 60;
+    set_follow_window_seconds(HOUR);
+    let (db, pool, community, channel, actor, root) = fixture().await;
+    reply(
+        &db,
+        community,
+        channel,
+        &root,
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE personal_read_frontiers SET active_at=now()-interval '2 hours'
+         WHERE community_id=$1 AND actor=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(actor.public_key().to_bytes().as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        listed_within(&db, community, channel, &actor, HOUR).await,
+        (0, 0),
+        "dormant under the window"
+    );
+    reply(
+        &db,
+        community,
+        channel,
+        &root,
+        &Keys::generate(),
+        mention(&actor),
+    )
+    .await;
+    assert_eq!(
+        listed_within(&db, community, channel, &actor, HOUR).await,
+        (1, 1),
+        "a fresh mention revives it"
+    );
+}

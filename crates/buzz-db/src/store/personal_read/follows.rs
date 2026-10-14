@@ -1,10 +1,29 @@
 //! Read state that ingest writes. A thread frontier row exists for a thread
 //! its actor follows or has unfollowed; ingest and follow intents create one.
-use super::model::ELIGIBLE_KINDS;
+use super::model::{DEFAULT_RETENTION_SECONDS, ELIGIBLE_KINDS};
 use crate::{AdmittedTx, Result};
 use chrono::{DateTime, Utc};
 use nostr::Event;
+use std::sync::atomic::{AtomicU32, Ordering};
 use uuid::Uuid;
+
+/// The relay's follow dormancy window, in seconds (`BUZZ_V1_RETENTION_SECONDS`).
+static FOLLOW_WINDOW_SECONDS: AtomicU32 = AtomicU32::new(DEFAULT_RETENTION_SECONDS);
+
+/// Set the follow dormancy window ingest refreshes against: the same window
+/// the read projections are given. Process-wide; the relay sets it once at
+/// startup.
+pub fn set_follow_window_seconds(seconds: u32) {
+    FOLLOW_WINDOW_SECONDS.store(seconds, Ordering::Relaxed);
+}
+
+/// How stale a live follow's involvement may grow before an involvement that
+/// does not otherwise write its row refreshes it: a day, or a quarter of the
+/// window when that is shorter. Never longer than the window, so such an
+/// involvement always revives a dormant follow.
+fn refresh_after_seconds() -> f64 {
+    f64::from((FOLLOW_WINDOW_SECONDS.load(Ordering::Relaxed) / 4).min(24 * 60 * 60))
+}
 
 /// Where a newly stored channel message sits.
 #[derive(Clone, Copy)]
@@ -133,7 +152,8 @@ pub(crate) async fn record_message(
                 AND c.channel_type='dm' AND cm.pubkey<>$4
          ), rows AS (
             -- An existing follower keeps their position, so is only touched
-            -- to keep the follow live, at most daily rather than per message;
+            -- to keep the follow live, at most once per refresh interval ($12)
+            -- rather than per message;
             -- an unfollow is not touched unless this message re-follows (the
             -- author posting, or a mention). Existence probes are LIMIT 1
             -- laterals: always one index lookup.
@@ -148,7 +168,7 @@ pub(crate) async fn record_message(
                 AND (i.message IS NOT NULL OR f.unfollowed IS NULL
                     OR (i.refollow AND f.unfollowed)
                     OR (i.root_id<>''::bytea AND NOT f.unfollowed
-                        AND f.active_at < now()-interval '1 day'))
+                        AND f.active_at < now()-make_interval(secs=>$12)))
             ORDER BY i.actor, i.root_id, i.message IS NULL, NOT i.refollow
          ), accounts AS (
             INSERT INTO personal_read_accounts (community_id, actor)
@@ -184,7 +204,7 @@ pub(crate) async fn record_message(
          WHERE excluded.through_message_id IS NOT NULL OR (personal_read_frontiers.unfollowed
             AND excluded.through_timestamp > personal_read_frontiers.through_timestamp)
             OR (excluded.root_id<>''::bytea AND NOT personal_read_frontiers.unfollowed
-                AND personal_read_frontiers.active_at < now()-interval '1 day')",
+                AND personal_read_frontiers.active_at < now()-make_interval(secs=>$12))",
     )
     .bind(community.as_uuid())
     .bind(channel)
@@ -197,6 +217,7 @@ pub(crate) async fn record_message(
     .bind(reply)
     .bind(root_created_at)
     .bind(broadcast)
+    .bind(refresh_after_seconds())
     .execute(tx.conn())
     .await?;
     Ok(())

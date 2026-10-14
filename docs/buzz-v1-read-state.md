@@ -150,8 +150,8 @@ thread is neither counted nor listed, but keeps its row and position, and any
 of those involvements makes it live again at that position. Replies that do not
 involve you never revive it. A follow made by the `follow` intent never goes
 dormant; an unfollow ends that. Being mentioned, a reply to your root and DM
-replies refresh a live follow at most daily, so dormancy is measured to the
-day.
+replies refresh a live follow at most once a day, or once a quarter of the
+window when that is shorter, so dormancy is measured to that interval.
 
 ## Threads view
 
