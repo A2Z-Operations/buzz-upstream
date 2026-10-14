@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use buzz_core::ifc::IfcPublicationFence;
+use buzz_core::ifc::{IfcPublicationFence, IfcPublicationTarget};
 use buzz_core::{CommunityId, StoredEvent};
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -14,6 +14,7 @@ use crate::event::{
     insert_canvas_head_checked_tx, insert_event_with_thread_metadata_tx, ChannelHeadPrecondition,
     ChannelHeadWriteStatus, EventQuery, ThreadMetadataParams,
 };
+use crate::replaceable::{ParameterizedReplacePrecondition, ParameterizedReplaceStatus};
 use crate::{Db, DbError};
 
 /// Largest canonical active-reader set included in one proof.
@@ -58,6 +59,8 @@ pub enum IfcPublishOutcome {
     HistoricDuplicate,
     /// Canvas optimistic-concurrency validation rejected the candidate.
     CanvasConflict(ChannelHeadWriteStatus),
+    /// Owner-memory LWW ordering rejected the candidate.
+    MemoryConflict(ParameterizedReplaceStatus),
 }
 
 /// Stable fenced-read and publication failures.
@@ -176,6 +179,30 @@ async fn lock_event_receipt(
     Ok(())
 }
 
+async fn validate_known_memory_owner(
+    tx: &mut crate::AdmittedTx,
+    event: &Event,
+    owner_pubkey: &str,
+) -> Result<(), IfcError> {
+    let owner = hex::decode(owner_pubkey).map_err(|_| IfcError::Invalid)?;
+    let registered: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+        "SELECT agent_owner_pubkey FROM users \
+         WHERE community_id=$1 AND pubkey=$2 FOR SHARE",
+    )
+    .bind(tx.community().as_uuid())
+    .bind(event.pubkey.as_bytes())
+    .fetch_optional(tx.conn())
+    .await
+    .map_err(DbError::from)?;
+    if registered
+        .and_then(|(registered,)| registered)
+        .is_some_and(|registered| registered != owner)
+    {
+        return Err(IfcError::AccessDenied);
+    }
+    Ok(())
+}
+
 impl Db {
     /// Capture a canonical policy and bounded raw history under one lock cut.
     pub async fn ifc_read_cut(
@@ -277,40 +304,51 @@ impl Db {
             return Err(IfcError::Expired);
         }
 
-        // Match the established event-write order before taking policy locks:
-        // canvas coordinate, channel TTL key, ephemeral channel row, policy.
-        // The normal insert and commit paths reacquire the same transaction
-        // locks, so this keeps their existing behavior without an inversion
-        // against channel metadata writers.
-        crate::event::acquire_canvas_event_write_lock_if_needed(
-            &mut tx,
-            event,
-            Some(fence.destination.channel_id),
-        )
-        .await?;
-        if super::event_follow_up::ttl_refresh_channel(
-            Some(fence.destination.channel_id),
-            i32::from(event.kind.as_u16()),
-        )
-        .is_some()
-        {
-            super::event_follow_up::refresh_channel_ttl(
-                tx.conn(),
-                community_id,
-                fence.destination.channel_id,
-            )
-            .await?;
+        // Match each established event-write order before taking policy locks.
+        // The normal insert path reacquires the same transaction locks.
+        match &fence.target {
+            IfcPublicationTarget::Channel(destination) => {
+                crate::event::acquire_canvas_event_write_lock_if_needed(
+                    &mut tx,
+                    event,
+                    Some(destination.channel_id),
+                )
+                .await?;
+                if super::event_follow_up::ttl_refresh_channel(
+                    Some(destination.channel_id),
+                    i32::from(event.kind.as_u16()),
+                )
+                .is_some()
+                {
+                    super::event_follow_up::refresh_channel_ttl(
+                        tx.conn(),
+                        community_id,
+                        destination.channel_id,
+                    )
+                    .await?;
+                }
+            }
+            IfcPublicationTarget::OwnerMemory {
+                owner_pubkey,
+                d_tag,
+            } => {
+                super::replaceable::acquire_parameterized_event_write_lock(&mut tx, event, d_tag)
+                    .await?;
+                validate_known_memory_owner(&mut tx, event, owner_pubkey).await?;
+            }
         }
 
         let mut required = BTreeMap::new();
         for source in &fence.sources {
             required.insert(source.channel_id, source.generation);
         }
-        match required.insert(fence.destination.channel_id, fence.destination.generation) {
-            Some(source_generation) if source_generation != fence.destination.generation => {
-                return Err(IfcError::PolicyChanged);
+        if let IfcPublicationTarget::Channel(destination) = &fence.target {
+            match required.insert(destination.channel_id, destination.generation) {
+                Some(source_generation) if source_generation != destination.generation => {
+                    return Err(IfcError::PolicyChanged);
+                }
+                _ => {}
             }
-            _ => {}
         }
         lock_policies(&mut tx, required.keys().copied()).await?;
         for (channel_id, generation) in required {
@@ -332,37 +370,68 @@ impl Db {
             return Err(IfcError::Expired);
         }
 
-        let outcome = if let Some(precondition) = canvas_precondition {
-            let (stored, status) = insert_canvas_head_checked_tx(
-                &mut tx,
-                event,
-                fence.destination.channel_id,
-                precondition,
-            )
-            .await?;
-            if status != ChannelHeadWriteStatus::Inserted {
-                tx.rollback().await?;
-                return Ok(IfcPublishOutcome::CanvasConflict(status));
+        let outcome = match &fence.target {
+            IfcPublicationTarget::Channel(destination) => {
+                if let Some(precondition) = canvas_precondition {
+                    let (stored, status) = insert_canvas_head_checked_tx(
+                        &mut tx,
+                        event,
+                        destination.channel_id,
+                        precondition,
+                    )
+                    .await?;
+                    if status != ChannelHeadWriteStatus::Inserted {
+                        tx.rollback().await?;
+                        return Ok(IfcPublishOutcome::CanvasConflict(status));
+                    }
+                    IfcPublishOutcome::Inserted(Box::new(stored))
+                } else {
+                    let (stored, inserted) = insert_event_with_thread_metadata_tx(
+                        &mut tx,
+                        event,
+                        Some(destination.channel_id),
+                        thread_meta,
+                    )
+                    .await?;
+                    if !inserted {
+                        return Err(IfcError::Invalid);
+                    }
+                    crate::insert_mentions_in_transaction(
+                        &mut tx,
+                        event,
+                        Some(destination.channel_id),
+                    )
+                    .await?;
+                    IfcPublishOutcome::Inserted(Box::new(stored))
+                }
             }
-            IfcPublishOutcome::Inserted(Box::new(stored))
-        } else {
-            let (stored, inserted) = insert_event_with_thread_metadata_tx(
-                &mut tx,
-                event,
-                Some(fence.destination.channel_id),
-                thread_meta,
-            )
-            .await?;
-            if !inserted {
-                return Err(IfcError::Invalid);
+            IfcPublicationTarget::OwnerMemory { d_tag, .. } => {
+                if thread_meta.is_some() || canvas_precondition.is_some() {
+                    return Err(IfcError::Invalid);
+                }
+                let replacement = self
+                    .replace_parameterized_event_in_transaction(
+                        &mut tx,
+                        event,
+                        d_tag,
+                        None,
+                        ParameterizedReplacePrecondition::Unconditional,
+                    )
+                    .await?;
+                match replacement.status {
+                    ParameterizedReplaceStatus::Inserted => {
+                        IfcPublishOutcome::Inserted(Box::new(replacement.event))
+                    }
+                    ParameterizedReplaceStatus::Superseded
+                    | ParameterizedReplaceStatus::RevisionMissing
+                    | ParameterizedReplaceStatus::RevisionMismatch
+                    | ParameterizedReplaceStatus::ReplayOnlyMiss => {
+                        tx.rollback().await?;
+                        return Ok(IfcPublishOutcome::MemoryConflict(replacement.status));
+                    }
+                    ParameterizedReplaceStatus::Duplicate => return Err(IfcError::Invalid),
+                }
             }
-            crate::insert_mentions_in_transaction(
-                &mut tx,
-                event,
-                Some(fence.destination.channel_id),
-            )
-            .await?;
-            IfcPublishOutcome::Inserted(Box::new(stored))
         };
 
         let expires_at =
@@ -447,7 +516,7 @@ mod postgres_tests {
     use super::*;
     use crate::{migration, DbConfig};
     use buzz_core::ifc::parse_publication_fence;
-    use buzz_core::kind::KIND_STREAM_MESSAGE;
+    use buzz_core::kind::{KIND_AGENT_ENGRAM, KIND_STREAM_MESSAGE};
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
@@ -575,6 +644,39 @@ mod postgres_tests {
             ])
             .sign_with_keys(keys)
             .expect("sign event")
+    }
+
+    fn fenced_memory_event(
+        keys: &Keys,
+        owner: &Keys,
+        community: CommunityId,
+        source: (Uuid, i64),
+        d_tag: &str,
+        timing: (u64, i64),
+        content: &str,
+    ) -> Event {
+        let owner_hex = owner.public_key().to_hex();
+        let source_channel = source.0.to_string();
+        let source_generation = source.1.to_string();
+        let community_text = community.to_string();
+        let expiry = timing.1.to_string();
+        EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), content)
+            .tags([
+                Tag::parse(["d", d_tag]).expect("d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse([
+                    "ifc-source",
+                    source_channel.as_str(),
+                    source_generation.as_str(),
+                ])
+                .expect("source tag"),
+                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+            ])
+            .custom_created_at(Timestamp::from(timing.0))
+            .sign_with_keys(keys)
+            .expect("sign owner memory")
     }
 
     #[tokio::test]
@@ -1078,6 +1180,206 @@ mod postgres_tests {
             .await,
             Ok(IfcPublishOutcome::Inserted(_))
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn owner_memory_uses_atomic_lww_receipts_and_fixed_owner() {
+        let db = connect().await;
+        let (community, source, agent) = fixture(db.pool()).await;
+        let owner = Keys::generate();
+        let wrong_owner = Keys::generate();
+        for keys in [&agent, &owner, &wrong_owner] {
+            db.ensure_user(community, keys.public_key().as_bytes())
+                .await
+                .expect("ensure owner user");
+        }
+        assert!(db
+            .set_agent_owner(
+                community,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .expect("set fixed owner"));
+        let d_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let now = Utc::now().timestamp() as u64;
+        let first = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 1),
+            d_tag,
+            (now, Utc::now().timestamp() + 120),
+            "first ciphertext",
+        );
+        let first_fence = parse_publication_fence(&first)
+            .expect("parse first")
+            .expect("first fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &first,
+                &first_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::Inserted(_))
+        ));
+
+        let second = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 1),
+            d_tag,
+            (now + 1, Utc::now().timestamp() + 120),
+            "second ciphertext",
+        );
+        let second_fence = parse_publication_fence(&second)
+            .expect("parse second")
+            .expect("second fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &second,
+                &second_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::Inserted(_))
+        ));
+
+        let stale = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 1),
+            d_tag,
+            (now - 1, Utc::now().timestamp() + 120),
+            "stale ciphertext",
+        );
+        let stale_fence = parse_publication_fence(&stale)
+            .expect("parse stale")
+            .expect("stale fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &stale,
+                &stale_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::MemoryConflict(
+                ParameterizedReplaceStatus::Superseded
+            ))
+        ));
+        assert!(!db
+            .ifc_event_was_accepted(community, stale.id.as_bytes())
+            .await
+            .expect("stale receipt"));
+
+        sqlx::query("UPDATE channels SET visibility='open' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(source)
+            .execute(db.pool())
+            .await
+            .expect("advance source generation");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &first,
+                &first_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::HistoricDuplicate)
+        ));
+
+        let wrong = fenced_memory_event(
+            &agent,
+            &wrong_owner,
+            community,
+            (source, 2),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            (now + 2, Utc::now().timestamp() + 120),
+            "wrong owner ciphertext",
+        );
+        let wrong_fence = parse_publication_fence(&wrong)
+            .expect("parse wrong owner")
+            .expect("wrong owner fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &wrong,
+                &wrong_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Err(IfcError::AccessDenied)
+        ));
+
+        let expires_at = Utc::now().timestamp() + 2;
+        let expiring = fenced_memory_event(
+            &agent,
+            &owner,
+            community,
+            (source, 2),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            (now + 3, expires_at),
+            "expiring ciphertext",
+        );
+        let expiring_fence = parse_publication_fence(&expiring)
+            .expect("parse expiring")
+            .expect("expiring fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &expiring,
+                &expiring_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::Inserted(_))
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &expiring,
+                &expiring_fence,
+                &agent.public_key().to_hex(),
+                None,
+                None
+            )
+            .await,
+            Ok(IfcPublishOutcome::HistoricDuplicate)
+        ));
+
+        let active: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_AGENT_ENGRAM as i32)
+        .bind(agent.public_key().as_bytes())
+        .bind(d_tag)
+        .fetch_all(db.pool())
+        .await
+        .expect("read active memory head");
+        assert_eq!(active, vec![(second.id.as_bytes().to_vec(),)]);
     }
 
     #[tokio::test]

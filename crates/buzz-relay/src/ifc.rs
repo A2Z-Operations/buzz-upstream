@@ -459,7 +459,11 @@ impl<'de> Visitor<'de> for NoDuplicateVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ifc::parse_publication_fence;
+    use base64::Engine;
+    use buzz_core::engram::{conversation_key, d_tag, Body};
+    use buzz_core::ifc::{parse_publication_fence, IfcPublicationTarget};
+    use nostr::nips::nip44::v2;
+    use nostr::Keys;
 
     #[test]
     fn duplicate_ifc_fields_are_rejected() {
@@ -522,6 +526,20 @@ mod tests {
             .expect("resource event");
         assert!(resource.verify_id());
         assert!(resource.verify_signature());
+        assert_eq!(
+            content["requester"],
+            fixture["test_keys"]["query_requester_pubkey"]
+        );
+        assert_eq!(
+            attestation
+                .tags
+                .iter()
+                .next()
+                .expect("requester tag")
+                .as_slice()[1],
+            content["requester"].as_str().expect("requester")
+        );
+        assert_ne!(content["requester"], resource.pubkey.to_hex());
         let publication: Event =
             serde_json::from_value(fixture["channel_publication_event"].clone())
                 .expect("publication event");
@@ -530,5 +548,61 @@ mod tests {
         assert!(parse_publication_fence(&publication)
             .expect("parse publication")
             .is_some());
+
+        let memory: Event = serde_json::from_value(fixture["owner_memory"]["event"].clone())
+            .expect("owner-memory event");
+        assert!(memory.verify_id());
+        assert!(memory.verify_signature());
+        let memory_fence = parse_publication_fence(&memory)
+            .expect("parse owner-memory publication")
+            .expect("owner-memory fence");
+        let expected_d = fixture["owner_memory"]["d_tag"]
+            .as_str()
+            .expect("memory d tag");
+        assert!(matches!(
+            memory_fence.target,
+            IfcPublicationTarget::OwnerMemory { ref d_tag, .. } if d_tag == expected_d
+        ));
+        let broker = Keys::parse(
+            fixture["test_keys"]["broker_secret_hex"]
+                .as_str()
+                .expect("broker secret"),
+        )
+        .expect("broker keys");
+        let human = Keys::parse(
+            fixture["test_keys"]["human_secret_hex"]
+                .as_str()
+                .expect("human secret"),
+        )
+        .expect("human keys");
+        let memory_key = conversation_key(broker.secret_key(), &human.public_key());
+        assert_eq!(
+            d_tag(
+                &memory_key,
+                fixture["owner_memory"]["canonical_slug"]
+                    .as_str()
+                    .expect("memory slug")
+            ),
+            expected_d
+        );
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(memory.content.as_bytes())
+            .expect("memory base64");
+        let plaintext = v2::decrypt_to_bytes(&memory_key, &payload).expect("memory decrypt");
+        assert_eq!(
+            plaintext,
+            fixture["owner_memory"]["plaintext_utf8"]
+                .as_str()
+                .expect("memory plaintext")
+                .as_bytes()
+        );
+        assert_eq!(
+            Body::from_json_bytes(&plaintext)
+                .expect("compatible memory body")
+                .slug(),
+            fixture["owner_memory"]["canonical_slug"]
+                .as_str()
+                .expect("memory slug")
+        );
     }
 }

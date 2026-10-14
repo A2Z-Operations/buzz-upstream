@@ -7605,6 +7605,162 @@ pub(crate) mod postgres_tests {
         (status, bytes)
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn ifc_query_attests_exact_nip98_signer_without_owner_or_author_substitution() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use buzz_db::channel_members::MemberRole;
+        use nostr::Event;
+        use sha2::{Digest, Sha256};
+        use uuid::Uuid;
+
+        let state = nip_fi_off_test_state()
+            .await
+            .expect("build HTTP query state");
+        let host = format!("ifc-query-{}.local", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let human = Keys::generate();
+        let broker = Keys::generate();
+        for keys in [&human, &broker] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().as_bytes())
+                .await
+                .expect("ensure query principal");
+        }
+        assert!(state
+            .db
+            .set_agent_owner(
+                community,
+                broker.public_key().as_bytes(),
+                human.public_key().as_bytes(),
+            )
+            .await
+            .expect("set effective owner"));
+        let channel = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel,
+                &format!("ifc-query-{}", channel.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                human.public_key().as_bytes(),
+                None,
+            )
+            .await
+            .expect("create query channel");
+        state
+            .db
+            .add_member(
+                community,
+                channel,
+                broker.public_key().as_bytes(),
+                MemberRole::Member,
+                Some(human.public_key().as_bytes()),
+            )
+            .await
+            .expect("add broker reader");
+        let source = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            "human input",
+        )
+        .tags([Tag::parse(["h", channel.to_string().as_str()]).expect("h tag")])
+        .sign_with_keys(&human)
+        .expect("sign source event");
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &source, Some(channel), None)
+            .await
+            .expect("insert source event");
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM channel_policy_generations \
+             WHERE community_id=$1 AND channel_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(channel)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("read policy generation");
+        let body = format!(
+            "[{{\"kinds\":[40002],\"#h\":[\"{channel}\"],\"limit\":1,\"ifc\":{{\"version\":1,\"nonce\":\"0123456789abcdef0123456789abcdef\",\"expected_generation\":\"{generation}\"}}}}]"
+        );
+        let url = format!("https://{host}/query");
+        let mut headers = make_nip98_headers(&broker, &url, "POST", body.as_bytes());
+        let owner_auth = buzz_sdk::nip_oa::compute_auth_tag(&human, &broker.public_key(), "")
+            .expect("owner delegation tag");
+        headers.insert(
+            "x-auth-tag",
+            owner_auth.parse().expect("owner delegation header"),
+        );
+        let (status, _, response) = oneshot_request_full(
+            state.clone(),
+            "POST",
+            "/query",
+            &host,
+            headers,
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let response: Value = serde_json::from_slice(&response).expect("parse IFC response");
+        let attestation: Event =
+            serde_json::from_value(response["attestation"].clone()).expect("parse attestation");
+        assert!(attestation.verify_id());
+        assert!(attestation.verify_signature());
+        let content: Value = serde_json::from_str(&attestation.content).expect("parse proof");
+        assert_eq!(content["requester"], broker.public_key().to_hex());
+        assert_ne!(content["requester"], human.public_key().to_hex());
+        assert_eq!(
+            attestation
+                .tags
+                .iter()
+                .next()
+                .expect("requester tag")
+                .as_slice()[1],
+            broker.public_key().to_hex()
+        );
+        assert_eq!(
+            content["request_sha256"],
+            hex::encode(Sha256::digest(body.as_bytes()))
+        );
+        let proved: Event = serde_json::from_value(content["resources"][0]["event"].clone())
+            .expect("parse proved resource");
+        assert_eq!(proved.id, source.id);
+        assert_eq!(proved.pubkey, human.public_key());
+
+        let unknown = format!(
+            "[{{\"kinds\":[40002],\"#h\":[\"{channel}\"],\"ifc\":{{\"version\":1,\"nonce\":\"1123456789abcdef0123456789abcdef\",\"unknown\":true}}}}]"
+        );
+        let unknown_headers = make_nip98_headers(&broker, &url, "POST", unknown.as_bytes());
+        let (status, _, response) = oneshot_request_full(
+            state,
+            "POST",
+            "/query",
+            &host,
+            unknown_headers,
+            unknown.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !response.starts_with(b"["),
+            "unknown IFC input must not fall back to a legacy event array"
+        );
+    }
+
     // ── Bridge dispatch test: writer-pin routes to the writer pool ────────────
     //
     // Exercises the catchall dispatch loop's `ReadRoute` match at the shipping

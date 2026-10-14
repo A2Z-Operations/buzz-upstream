@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use buzz_auth::Scope;
-use buzz_core::ifc::{has_ifc_tag, parse_publication_fence};
+use buzz_core::ifc::{has_ifc_tag, parse_publication_fence, IfcPublicationTarget};
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
@@ -440,11 +440,10 @@ pub struct IngestResult {
 pub enum IngestError {
     /// Client error (bad event) — WS: OK false, HTTP: 400.
     Rejected(String),
-    /// Canvas CAS precondition failure — WS: OK false, HTTP: 409.
+    /// Canvas CAS or owner-memory LWW conflict — WS: OK false, HTTP: 409.
     ///
-    /// Emitted when a canvas write's `expected-revision` tag no longer matches
-    /// the relay's canonical head: the revision is missing, has changed, or the
-    /// new event does not supersede the current one.  Kept separate from
+    /// Emitted when a canvas revision precondition fails or an owner-memory
+    /// event does not supersede the current coordinate head. Kept separate from
     /// [`IngestError::Rejected`] so the HTTP bridge can map it to
     /// `409 CONFLICT` while generic client mistakes remain `400 BAD_REQUEST`.
     CanvasConflict(String),
@@ -1940,6 +1939,12 @@ fn validate_engram_nip44_content(content: &str) -> Result<(), String> {
     }
     let bytes = content.as_bytes();
     let len = bytes.len();
+    if len > buzz_core::observer::NIP44_MAX_CONTENT_LEN {
+        return Err(format!(
+            "agent-engram content exceeds the NIP-44 v2 maximum ({} bytes)",
+            buzz_core::observer::NIP44_MAX_CONTENT_LEN
+        ));
+    }
     if !len.is_multiple_of(4) {
         return Err("agent-engram content is not valid base64 (length)".to_string());
     }
@@ -2471,15 +2476,19 @@ async fn ingest_event_inner(
             .await
             .map_err(|error| IngestError::Internal(format!("error: {error}")))?
         {
-            emit(
-                tracer,
-                TraceAction::WriteDuplicate {
+            let claimed = claimed_community_from_event(&event);
+            let action = match &fence.target {
+                IfcPublicationTarget::Channel(destination) => TraceAction::WriteDuplicate {
                     msg_id: msg_id_label(event.id.as_bytes()),
-                    channel: channel_label(fence.destination.channel_id),
-                    claimed_community: claimed_community_from_event(&event),
+                    channel: channel_label(destination.channel_id),
+                    claimed_community: claimed,
                 },
-                state_for_request(tenant, auth.pubkey()),
-            );
+                IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                    msg_id: msg_id_label(event.id.as_bytes()),
+                    claimed_community: claimed,
+                },
+            };
+            emit(tracer, action, state_for_request(tenant, auth.pubkey()));
             return Ok(IngestResult {
                 event_id: event_id_hex,
                 accepted: true,
@@ -3458,15 +3467,19 @@ async fn ingest_event_inner(
         {
             Ok(buzz_db::ifc::IfcPublishOutcome::Inserted(stored)) => (*stored, true),
             Ok(buzz_db::ifc::IfcPublishOutcome::HistoricDuplicate) => {
-                emit(
-                    tracer,
-                    TraceAction::WriteDuplicate {
+                let claimed = claimed_community_from_event(&event);
+                let action = match &fence.target {
+                    IfcPublicationTarget::Channel(destination) => TraceAction::WriteDuplicate {
                         msg_id: msg_id_label(event.id.as_bytes()),
-                        channel: channel_label(fence.destination.channel_id),
-                        claimed_community: claimed_community_from_event(&event),
+                        channel: channel_label(destination.channel_id),
+                        claimed_community: claimed,
                     },
-                    state_for_request(tenant, auth.pubkey()),
-                );
+                    IfcPublicationTarget::OwnerMemory { .. } => TraceAction::WriteInsertGlobal {
+                        msg_id: msg_id_label(event.id.as_bytes()),
+                        claimed_community: claimed,
+                    },
+                };
+                emit(tracer, action, state_for_request(tenant, auth.pubkey()));
                 return Ok(IngestResult {
                     event_id: event_id_hex,
                     accepted: true,
@@ -3488,6 +3501,11 @@ async fn ingest_event_inner(
                     | buzz_db::ChannelHeadWriteStatus::Duplicate => "ifc-invalid",
                 };
                 return Err(IngestError::CanvasConflict(message.into()));
+            }
+            Ok(buzz_db::ifc::IfcPublishOutcome::MemoryConflict(_)) => {
+                return Err(IngestError::CanvasConflict(
+                    "conflict: stale owner-memory replacement".into(),
+                ));
             }
             Err(buzz_db::ifc::IfcError::PolicyChanged) => {
                 return Err(IngestError::CanvasConflict("ifc-policy-changed".into()));
@@ -4855,6 +4873,19 @@ mod postgres_tests {
         let ev = make_engram(&[&["d", &d], &["p", &p]], "Ag==");
         let err = validate_engram_envelope(&ev).unwrap_err();
         assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn engram_envelope_rejects_oversized_nip44_content() {
+        let d = "a".repeat(64);
+        let p = "b".repeat(64);
+        let too_large = format!(
+            "Ag{}",
+            "A".repeat(buzz_core::observer::NIP44_MAX_CONTENT_LEN + 2)
+        );
+        let ev = make_engram(&[&["d", &d], &["p", &p]], &too_large);
+        let err = validate_engram_envelope(&ev).unwrap_err();
+        assert!(err.contains("maximum"), "got: {err}");
     }
 
     #[test]
@@ -6823,6 +6854,196 @@ mod postgres_tests {
         .await
         .expect("count production ingest rows");
         assert_eq!(stored, 1);
+    }
+
+    /// Owner memory retains the existing encrypted 30174 envelope and LWW
+    /// semantics while source freshness and durable exact retries use the
+    /// shared fenced-ingest transaction.
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn fenced_owner_memory_uses_production_ingest_and_parameterized_lww() {
+        use buzz_core::engram::{conversation_key, d_tag};
+        use buzz_db::channel::{ChannelType, ChannelUpdate, ChannelVisibility};
+        use nostr::nips::nip44::{self, Version};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("connect test Postgres");
+        let state = build_canvas_ingest_state(&db_url, &pool).await;
+        let host = format!("ifc-memory-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        for keys in [&agent, &owner] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().as_bytes())
+                .await
+                .expect("ensure memory principal");
+        }
+        assert!(state
+            .db
+            .set_agent_owner(
+                community,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .expect("set memory owner"));
+        let source = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                source,
+                &format!("ifc-memory-{}", source.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                agent.public_key().as_bytes(),
+                None,
+            )
+            .await
+            .expect("create source channel");
+
+        let slug = "mem/production-seam";
+        let memory_key = conversation_key(agent.secret_key(), &owner.public_key());
+        let d = d_tag(&memory_key, slug);
+        let owner_hex = owner.public_key().to_hex();
+        let community_text = community.to_string();
+        let source_text = source.to_string();
+        let expiry = (Utc::now().timestamp() + 120).to_string();
+        let encrypt = |value: &str| {
+            nip44::encrypt(
+                agent.secret_key(),
+                &owner.public_key(),
+                format!(r#"{{"slug":"{slug}","value":"{value}"}}"#),
+                Version::V2,
+            )
+            .expect("encrypt memory")
+        };
+        let memory = |created_at: u64, value: &str, extra: &[Tag]| {
+            let mut tags = vec![
+                Tag::parse(["d", d.as_str()]).expect("d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
+                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("owner-memory tag"),
+            ];
+            tags.extend_from_slice(extra);
+            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), encrypt(value))
+                .tags(tags)
+                .custom_created_at(Timestamp::from(created_at))
+                .sign_with_keys(&agent)
+                .expect("sign fenced memory")
+        };
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+        let http = || IngestAuth::Http {
+            pubkey: agent.public_key(),
+            scopes: vec![Scope::UsersWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        let websocket = || IngestAuth::Nip42 {
+            pubkey: agent.public_key(),
+            scopes: vec![Scope::UsersWrite],
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        let now = Utc::now().timestamp() as u64;
+        let first = memory(now, "first", &[]);
+        ingest_event_inner(&state, &tracer, &tenant, first.clone(), http())
+            .await
+            .expect("insert first memory");
+        let second = memory(now + 1, "second", &[]);
+        ingest_event_inner(&state, &tracer, &tenant, second.clone(), websocket())
+            .await
+            .expect("insert second memory");
+        let stale = memory(now - 1, "stale", &[]);
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, stale.clone(), http()).await,
+            Err(IngestError::CanvasConflict(message))
+                if message == "conflict: stale owner-memory replacement"
+        ));
+
+        state
+            .db
+            .update_channel(
+                community,
+                source,
+                ChannelUpdate {
+                    visibility: Some("open".to_owned()),
+                    ..ChannelUpdate::default()
+                },
+            )
+            .await
+            .expect("advance source policy");
+        let retry = ingest_event_inner(&state, &tracer, &tenant, first.clone(), websocket())
+            .await
+            .expect("historic memory retry");
+        assert_eq!(retry.message, "duplicate:");
+
+        let stale_source = memory(now + 2, "stale source", &[]);
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, stale_source.clone(), http()).await,
+            Err(IngestError::CanvasConflict(message)) if message == "ifc-policy-changed"
+        ));
+
+        let destination =
+            Tag::parse(["ifc-destination", source_text.as_str(), "2"]).expect("destination tag");
+        let malformed = memory(now + 2, "malformed", &[destination]);
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, malformed.clone(), http()).await,
+            Err(IngestError::Rejected(message)) if message == "ifc-invalid"
+        ));
+        let bad_cipher = EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), "not-nip44")
+            .tags(memory(now + 3, "template", &[]).tags)
+            .custom_created_at(Timestamp::from(now + 3))
+            .sign_with_keys(&agent)
+            .expect("sign malformed ciphertext");
+        assert!(matches!(
+            ingest_event_inner(&state, &tracer, &tenant, bad_cipher.clone(), http()).await,
+            Err(IngestError::Rejected(message)) if message.starts_with("invalid: agent-engram content")
+        ));
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE community_id=$1 AND id = ANY($2::bytea[])",
+        )
+        .bind(community.as_uuid())
+        .bind(vec![
+            first.id.as_bytes().as_slice(),
+            second.id.as_bytes().as_slice(),
+            stale.id.as_bytes().as_slice(),
+            stale_source.id.as_bytes().as_slice(),
+            malformed.id.as_bytes().as_slice(),
+            bad_cipher.id.as_bytes().as_slice(),
+        ])
+        .fetch_one(&pool)
+        .await
+        .expect("count memory production rows");
+        assert_eq!(stored, 2);
+        let active: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_AGENT_ENGRAM as i32)
+        .bind(agent.public_key().as_bytes())
+        .bind(d)
+        .fetch_all(&pool)
+        .await
+        .expect("read memory head");
+        assert_eq!(active, vec![(second.id.as_bytes().to_vec(),)]);
     }
 
     /// End-to-end CAS dispatch wiring: a tagged write inserts, a stale same-head

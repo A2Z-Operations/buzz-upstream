@@ -441,7 +441,7 @@ fn ifc_descriptor(has_stable_relay_key: bool) -> Option<serde_json::Value> {
             "max_response_bytes": crate::ifc::MAX_RESPONSE_BYTES,
             "query_timeout_ms": crate::ifc::QUERY_DEADLINE.as_millis(),
             "history_access": ["all_current_members"],
-            "fenced_kinds": buzz_core::ifc::IFC_CHANNEL_PUBLICATION_KINDS,
+            "fenced_kinds": buzz_core::ifc::IFC_PUBLICATION_KINDS,
         })
     })
 }
@@ -557,7 +557,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ifc_descriptor_requires_stable_key_and_omits_owner_memory() {
+    fn ifc_descriptor_requires_stable_key_and_advertises_closed_owner_memory() {
         assert!(ifc_descriptor(false).is_none());
         let descriptor = ifc_descriptor(true).expect("stable relay key advertises IFC");
         assert_eq!(descriptor["version"], 1);
@@ -567,8 +567,9 @@ mod tests {
         );
         assert_eq!(
             descriptor["fenced_kinds"],
-            serde_json::json!(buzz_core::ifc::IFC_CHANNEL_PUBLICATION_KINDS)
+            serde_json::json!(buzz_core::ifc::IFC_PUBLICATION_KINDS)
         );
+        assert!(descriptor.to_string().contains("30174"));
         assert!(!descriptor.to_string().contains("30078"));
     }
 

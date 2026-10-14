@@ -1,13 +1,43 @@
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use nostr::nips::nip44::v2;
+use nostr::secp256k1::rand::RngCore;
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+struct FixedNonce(u8);
+
+impl RngCore for FixedNonce {
+    fn next_u32(&mut self) -> u32 {
+        u32::from_le_bytes([self.0; 4])
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        u64::from_le_bytes([self.0; 8])
+    }
+
+    fn fill_bytes(&mut self, destination: &mut [u8]) {
+        destination.fill(self.0);
+    }
+
+    fn try_fill_bytes(
+        &mut self,
+        destination: &mut [u8],
+    ) -> Result<(), nostr::secp256k1::rand::Error> {
+        self.fill_bytes(destination);
+        Ok(())
+    }
+}
+
+impl nostr::secp256k1::rand::CryptoRng for FixedNonce {}
+
 fn main() -> anyhow::Result<()> {
     let relay_secret = "0000000000000000000000000000000000000000000000000000000000000001";
-    let requester_secret = "0000000000000000000000000000000000000000000000000000000000000002";
+    let human_secret = "0000000000000000000000000000000000000000000000000000000000000002";
     let broker_secret = "0000000000000000000000000000000000000000000000000000000000000003";
     let relay = Keys::parse(relay_secret)?;
-    let requester = Keys::parse(requester_secret)?;
+    let human = Keys::parse(human_secret)?;
     let broker = Keys::parse(broker_secret)?;
     let community = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let source = "11111111-1111-4111-8111-111111111111";
@@ -19,17 +49,15 @@ fn main() -> anyhow::Result<()> {
     let resource = EventBuilder::new(Kind::Custom(40002), "fixture source message")
         .tags([Tag::parse(["h", source])?])
         .custom_created_at(Timestamp::from(1_791_999_700u64))
-        .sign_with_keys(&requester)?;
+        .build(human.public_key())
+        .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x21), &human)?;
     let digest = hex::encode(Sha256::digest(request_body.as_bytes()));
-    let mut members = [
-        requester.public_key().to_hex(),
-        broker.public_key().to_hex(),
-    ];
+    let mut members = [human.public_key().to_hex(), broker.public_key().to_hex()];
     members.sort();
     let content = json!({
         "version": 1,
         "community_id": community,
-        "requester": requester.public_key().to_hex(),
+        "requester": broker.public_key().to_hex(),
         "nonce": nonce,
         "request_sha256": digest,
         "policy": {
@@ -49,11 +77,12 @@ fn main() -> anyhow::Result<()> {
     });
     let attestation = EventBuilder::new(Kind::Custom(45900), serde_json::to_string(&content)?)
         .tags([
-            Tag::parse(["p", requester.public_key().to_hex().as_str()])?,
+            Tag::parse(["p", broker.public_key().to_hex().as_str()])?,
             Tag::parse(["h", source])?,
         ])
         .custom_created_at(Timestamp::from(1_791_999_800u64))
-        .sign_with_keys(&relay)?;
+        .build(relay.public_key())
+        .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x22), &relay)?;
     let publication = EventBuilder::new(Kind::Custom(40002), "fixture remote-agent output")
         .tags([
             Tag::parse(["h", destination])?,
@@ -62,22 +91,60 @@ fn main() -> anyhow::Result<()> {
             Tag::parse(["ifc-destination", destination, "23"])?,
         ])
         .custom_created_at(Timestamp::from(1_791_999_900u64))
-        .sign_with_keys(&broker)?;
+        .build(broker.public_key())
+        .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x23), &broker)?;
+    let memory_slug = "mem/fixture";
+    let memory_key = v2::ConversationKey::derive(broker.secret_key(), &human.public_key())?;
+    let mut memory_address =
+        <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(memory_key.as_bytes())?;
+    memory_address.update(b"agent-memory/v1/d-tag");
+    memory_address.update(&[0]);
+    memory_address.update(memory_slug.as_bytes());
+    let memory_d = hex::encode(memory_address.finalize().into_bytes());
+    let memory_plaintext = format!(
+        "{{\"slug\":\"{memory_slug}\",\"value\":\"fixture protected memory\",\"ifc\":{{\"version\":1,\"community_id\":\"{community}\",\"sources\":[{{\"channel_id\":\"{source}\",\"generation\":\"17\"}}],\"provenance\":[{{\"event_id\":\"{}\"}}]}}}}",
+        resource.id.to_hex()
+    );
+    let memory_payload = v2::encrypt_to_bytes_with_rng(
+        &mut FixedNonce(0x44),
+        &memory_key,
+        memory_plaintext.as_bytes(),
+    )?;
+    let memory_ciphertext = base64::engine::general_purpose::STANDARD.encode(memory_payload);
+    let owner = human.public_key().to_hex();
+    let owner_memory = EventBuilder::new(Kind::Custom(30174), memory_ciphertext)
+        .tags([
+            Tag::parse(["d", memory_d.as_str()])?,
+            Tag::parse(["p", owner.as_str()])?,
+            Tag::parse(["ifc", "1", community, "1792000000"])?,
+            Tag::parse(["ifc-source", source, "17"])?,
+            Tag::parse(["ifc-owner-memory", owner.as_str()])?,
+        ])
+        .custom_created_at(Timestamp::from(1_791_999_920u64))
+        .build(broker.public_key())
+        .sign_with_ctx(nostr::SECP256K1, &mut FixedNonce(0x24), &broker)?;
     let fixture = json!({
         "contract": "buzz-ifc-v1",
         "test_keys": {
             "relay_secret_hex": relay_secret,
             "relay_pubkey": relay.public_key().to_hex(),
-            "requester_secret_hex": requester_secret,
-            "requester_pubkey": requester.public_key().to_hex(),
+            "human_secret_hex": human_secret,
+            "human_pubkey": human.public_key().to_hex(),
             "broker_secret_hex": broker_secret,
-            "broker_pubkey": broker.public_key().to_hex()
+            "broker_pubkey": broker.public_key().to_hex(),
+            "query_requester_pubkey": broker.public_key().to_hex()
         },
         "request_body_utf8": request_body,
         "request_sha256": digest,
         "response": {"ifc": 1, "attestation": attestation},
         "channel_publication_event": publication,
-        "owner_memory": {"enabled": false, "reason": "awaiting the backend's existing memory address grammar"}
+        "owner_memory": {
+            "event": owner_memory,
+            "canonical_slug": memory_slug,
+            "d_tag": memory_d,
+            "plaintext_utf8": memory_plaintext,
+            "application_metadata_status": "illustrative until the Kotlin protected IFC object is frozen"
+        }
     });
     println!("{}", serde_json::to_string_pretty(&fixture)?);
     Ok(())

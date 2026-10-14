@@ -5,32 +5,89 @@
     "id": "102e1649791d5b6f0d77101571b9cabdafbbdcf3e8da82745c1e5e7b5f486e33",
     "kind": 40002,
     "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
-    "sig": "f053bcacbcea6778646d9b794acade4ef7d7b1f8ae5bb2921100723f9ca8d5cf13d83d0829447ddea22656c6c71304996ea81eb408d2d63734de71f4c9353aa5",
+    "sig": "94a7663b6c3dcc81281dbb78102d426b22cfeb9cc3cd05e709452fc20dc5d26e15a19448f0095046892ae7a8861e5d05f5b3f0d870dceaad3747cca9baacea4b",
     "tags": [
-      ["h", "22222222-2222-4222-8222-222222222222"],
-      ["ifc", "1", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "1792000000"],
-      ["ifc-source", "11111111-1111-4111-8111-111111111111", "17"],
-      ["ifc-destination", "22222222-2222-4222-8222-222222222222", "23"]
+      [
+        "h",
+        "22222222-2222-4222-8222-222222222222"
+      ],
+      [
+        "ifc",
+        "1",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "1792000000"
+      ],
+      [
+        "ifc-source",
+        "11111111-1111-4111-8111-111111111111",
+        "17"
+      ],
+      [
+        "ifc-destination",
+        "22222222-2222-4222-8222-222222222222",
+        "23"
+      ]
     ]
   },
   "contract": "buzz-ifc-v1",
   "owner_memory": {
-    "enabled": false,
-    "reason": "awaiting the backend's existing memory address grammar"
+    "application_metadata_status": "illustrative until the Kotlin protected IFC object is frozen",
+    "canonical_slug": "mem/fixture",
+    "d_tag": "f623062cf437be71089248e67e49f3bddbf016a90d6bd555cada32e065eb6296",
+    "event": {
+      "content": "AkREREREREREREREREREREREREREREREREREREREREREQpFvZ/ygpdh8oBcoxHeFvIPj5KMRE7gj18SwdfeX5Qsv8BDW9VIdrJoWkmnz0nw78QBsb7HFbjDX21PMHa8CL5ot5ULx1c/BOEU4tarpV0XACUUICh9rMtp5BFgXoJMTNbe5ZRRuUFpO1UP1lU9yYNIbuLE7J+jKQLGalyDNe5liOxmA0Zs4V54zLCOuf7PWQvBdeDTgrhWcu7IFe+uJe3pm6qBv7wu9e5/882VunBBPRQN/bI2m18Wn+w+aAmLqkewdsw6JzeahGt9lbBVVRO8mgFG4yIK/OAe7XP6czR9O/vj3Aoysuh5NI06W9SNjPjNyKTgZAyjS9NE9WmCLD4MiMZs4zeuaT3QF5eu1YwLyPGbXv3PVaqeR6eszCqJF1y6BZ52HqcLm0VKkjc0KFRJLcCqImqyDaBQGBbmfEpa7YfyOLKEmXFloSjxdTP6cBxeHMojOogDpSih1xha8+6Hy",
+      "created_at": 1791999920,
+      "id": "1386ef4d498595826ff186e25fa7324c7f41ec0d1af8e43d506cf8c5d7879c3d",
+      "kind": 30174,
+      "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "sig": "de03b626272d1608821b846e2d2d43e53cc3845820fea23da4f34e64135d01e584d6f7bb7ae1504a6ca4e7a193cf0e92abb0fa4d8b754a2edb6a731ec9e18653",
+      "tags": [
+        [
+          "d",
+          "f623062cf437be71089248e67e49f3bddbf016a90d6bd555cada32e065eb6296"
+        ],
+        [
+          "p",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ],
+        [
+          "ifc",
+          "1",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "1792000000"
+        ],
+        [
+          "ifc-source",
+          "11111111-1111-4111-8111-111111111111",
+          "17"
+        ],
+        [
+          "ifc-owner-memory",
+          "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        ]
+      ]
+    },
+    "plaintext_utf8": "{\"slug\":\"mem/fixture\",\"value\":\"fixture protected memory\",\"ifc\":{\"version\":1,\"community_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"sources\":[{\"channel_id\":\"11111111-1111-4111-8111-111111111111\",\"generation\":\"17\"}],\"provenance\":[{\"event_id\":\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\"}]}}"
   },
   "request_body_utf8": "[{\"kinds\":[9,40002,40100],\"#h\":[\"11111111-1111-4111-8111-111111111111\"],\"limit\":13,\"ifc\":{\"version\":1,\"nonce\":\"0123456789abcdef0123456789abcdef\",\"expected_generation\":\"17\"}}]",
   "request_sha256": "6f1fbcbe47a1165230b8b9c622748af4c0a1fcc55374425e7b5688c5b0a6aa44",
   "response": {
     "attestation": {
-      "content": "{\"community_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"nonce\":\"0123456789abcdef0123456789abcdef\",\"policy\":{\"archived\":false,\"channel_id\":\"11111111-1111-4111-8111-111111111111\",\"channel_type\":\"dm\",\"generation\":\"17\",\"history_access\":\"all_current_members\",\"members\":[\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\"],\"visibility\":\"private\"},\"request_sha256\":\"6f1fbcbe47a1165230b8b9c622748af4c0a1fcc55374425e7b5688c5b0a6aa44\",\"requester\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"resources\":[{\"effective_generation\":\"17\",\"event\":{\"content\":\"fixture source message\",\"created_at\":1791999700,\"id\":\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\",\"kind\":40002,\"pubkey\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"sig\":\"fa9624d82d13441e51f8de031f706b646aec33e6aee50dd31f6cb6f1cff2b47cd2282ec3abeedc8f8fa447fab264224d42bc613c78f4efcd452d24ed47be9ffb\",\"tags\":[[\"h\",\"11111111-1111-4111-8111-111111111111\"]]},\"origin_generation\":null}],\"version\":1}",
+      "content": "{\"community_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"nonce\":\"0123456789abcdef0123456789abcdef\",\"policy\":{\"archived\":false,\"channel_id\":\"11111111-1111-4111-8111-111111111111\",\"channel_type\":\"dm\",\"generation\":\"17\",\"history_access\":\"all_current_members\",\"members\":[\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\"],\"visibility\":\"private\"},\"request_sha256\":\"6f1fbcbe47a1165230b8b9c622748af4c0a1fcc55374425e7b5688c5b0a6aa44\",\"requester\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"resources\":[{\"effective_generation\":\"17\",\"event\":{\"content\":\"fixture source message\",\"created_at\":1791999700,\"id\":\"9d66eb8ad4dbc6990b835f895dc7a0c4bb4bec7535848cd56f3c03ff59e67226\",\"kind\":40002,\"pubkey\":\"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\",\"sig\":\"6fc2748193a805eb2b6b3eb7cc86b1ef2869130c6e744a28ce3abd158fc66d4b7a0e585a077fe9da3887dc3807f95edd01d868dfd35c0ffb0e27af7eb8c3a44b\",\"tags\":[[\"h\",\"11111111-1111-4111-8111-111111111111\"]]},\"origin_generation\":null}],\"version\":1}",
       "created_at": 1791999800,
-      "id": "de2d939e7e9f596ab5b03a28c1dd2af0515416d83cb71e9a6cc2a976f6619f58",
+      "id": "80c7f8a25ab36009afaad04dc4604e9b986fbdaaeac3909af0b35ba042deced6",
       "kind": 45900,
       "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-      "sig": "e54811cca3d75343a424673f79e86c8d1ae05009f683a073cc5f9f0236eaa7cdaa13defa2070dd36a238f0a4a83203bf1cc3dcd85af70f7fb223553b1e8ee94c",
+      "sig": "f0d696baa4cfee24d6321e2427d4990b162145e3e03d22b6793cea87d00a201932e97fe2a1825f9bdcf4b3daa9f2816763bdaf82fa72345e8d7e32dfc33c012a",
       "tags": [
-        ["p", "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"],
-        ["h", "11111111-1111-4111-8111-111111111111"]
+        [
+          "p",
+          "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+        ],
+        [
+          "h",
+          "11111111-1111-4111-8111-111111111111"
+        ]
       ]
     },
     "ifc": 1
@@ -38,9 +95,10 @@
   "test_keys": {
     "broker_pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
     "broker_secret_hex": "0000000000000000000000000000000000000000000000000000000000000003",
+    "human_pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "human_secret_hex": "0000000000000000000000000000000000000000000000000000000000000002",
+    "query_requester_pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
     "relay_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    "relay_secret_hex": "0000000000000000000000000000000000000000000000000000000000000001",
-    "requester_pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-    "requester_secret_hex": "0000000000000000000000000000000000000000000000000000000000000002"
+    "relay_secret_hex": "0000000000000000000000000000000000000000000000000000000000000001"
   }
 }
