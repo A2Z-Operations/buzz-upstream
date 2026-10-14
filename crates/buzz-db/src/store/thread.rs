@@ -300,6 +300,29 @@ pub(crate) async fn get_thread_replies_on(
     limit: u32,
     cursor: Option<&[u8]>,
 ) -> Result<Vec<ThreadReply>> {
+    get_thread_replies_filtered_on(
+        conn,
+        community_id,
+        root_event_id,
+        depth_limit,
+        limit,
+        cursor,
+        None,
+    )
+    .await
+}
+
+/// [`get_thread_replies_on`] with an optional event-kind restriction applied
+/// before ordering and limiting.
+pub(crate) async fn get_thread_replies_filtered_on(
+    conn: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    root_event_id: &[u8],
+    depth_limit: Option<u32>,
+    limit: u32,
+    cursor: Option<&[u8]>,
+    kinds: Option<&[i32]>,
+) -> Result<Vec<ThreadReply>> {
     // Decode cursor bytes -> keyset (timestamp, optional event_id) for the
     // WHERE condition. Layout: 8-byte BE i64 seconds, then the raw event_id.
     // An 8-byte-only cursor is legacy timestamp-only paging (no tiebreak).
@@ -363,6 +386,10 @@ pub(crate) async fn get_thread_replies_on(
             sql.push_str(&format!(" AND tm.depth <= ${param_idx}"));
             param_idx += 1;
         }
+        if kinds.is_some() {
+            sql.push_str(&format!(" AND e.kind = ANY(${param_idx}::int[])"));
+            param_idx += 1;
+        }
         match &cursor_key {
             Some((_, Some(_))) => {
                 // Composite keyset: strict row comparison with an event_id tiebreak
@@ -392,6 +419,9 @@ pub(crate) async fn get_thread_replies_on(
 
         if let Some(dl) = depth_limit {
             q = q.bind(dl as i32);
+        }
+        if let Some(kinds) = kinds {
+            q = q.bind(kinds);
         }
         match &cursor_key {
             Some((ts, Some(id))) => {

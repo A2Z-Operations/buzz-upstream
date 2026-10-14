@@ -7,7 +7,7 @@ use buzz_core::kind::{
     KIND_CANVAS, KIND_IFC_ATTESTATION, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
 };
 use buzz_core::{CommunityId, TenantContext};
-use buzz_db::ifc::IfcError;
+use buzz_db::ifc::{IfcError, IfcThreadQuery};
 use buzz_db::EventQuery;
 use chrono::{DateTime, Utc};
 use nostr::{Event, EventBuilder, Kind, PublicKey, Tag};
@@ -32,6 +32,7 @@ struct Request {
     expected_generation: Option<i64>,
     policy_only: bool,
     query: EventQuery,
+    thread_query: Option<IfcThreadQuery>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +101,17 @@ fn decode_hex32(value: &str, field: &str) -> Result<Vec<u8>, (StatusCode, String
     hex::decode(value).map_err(|_| bad(format!("{field} entries must be hex")))
 }
 
+fn decode_canonical_hex32(value: &str, field: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(bad(format!("{field} must be 64 lowercase hex characters")));
+    }
+    hex::decode(value).map_err(|_| bad(format!("{field} must be hex")))
+}
+
 fn parse_request(body: &[u8], community_id: CommunityId) -> Result<Request, (StatusCode, String)> {
     let value = strict_json(body).map_err(|error| bad(format!("invalid IFC query: {error}")))?;
     let filters = value
@@ -110,7 +122,20 @@ fn parse_request(body: &[u8], community_id: CommunityId) -> Result<Request, (Sta
         .as_object()
         .ok_or_else(|| bad("IFC filter must be an object"))?;
     let allowed = [
-        "kinds", "#h", "limit", "since", "until", "ids", "authors", "#e", "ifc",
+        "kinds",
+        "#h",
+        "limit",
+        "since",
+        "until",
+        "before_id",
+        "ids",
+        "authors",
+        "#e",
+        "depth_limit",
+        "thread_cursor",
+        "thread_cursor_id",
+        "consistency",
+        "ifc",
     ];
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(bad("IFC filter contains an unsupported field"));
@@ -182,6 +207,12 @@ fn parse_request(body: &[u8], community_id: CommunityId) -> Result<Request, (Sta
     {
         return Err(bad("policy-only IFC query contains history filters"));
     }
+    if object
+        .get("consistency")
+        .is_some_and(|value| value.as_str() != Some("strong"))
+    {
+        return Err(bad("IFC consistency must be strong"));
+    }
 
     let mut query = EventQuery::for_community(community_id);
     query.channel_id = Some(channel_id);
@@ -200,6 +231,18 @@ fn parse_request(body: &[u8], community_id: CommunityId) -> Result<Request, (Sta
         .get("until")
         .map(|value| parse_timestamp(value, "until"))
         .transpose()?;
+    query.before_id = object
+        .get("before_id")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| bad("before_id must be a string"))
+                .and_then(|value| decode_canonical_hex32(value, "before_id"))
+        })
+        .transpose()?;
+    if query.before_id.is_some() && query.until.is_none() {
+        return Err(bad("before_id requires until"));
+    }
     query.ids = object
         .get("ids")
         .map(|value| {
@@ -222,13 +265,94 @@ fn parse_request(body: &[u8], community_id: CommunityId) -> Result<Request, (Sta
         .get("#e")
         .map(|value| string_array(value, "#e"))
         .transpose()?;
+    let depth_limit = object
+        .get("depth_limit")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= i32::MAX as u32)
+                .ok_or_else(|| bad("depth_limit is outside the supported range"))
+        })
+        .transpose()?;
+    let thread_cursor = object.get("thread_cursor");
+    let thread_cursor_id = object.get("thread_cursor_id");
+    if thread_cursor.is_some() != thread_cursor_id.is_some() {
+        return Err(bad("thread cursor fields must be supplied together"));
+    }
+    let cursor = match (thread_cursor, thread_cursor_id) {
+        (Some(timestamp), Some(event_id)) => {
+            let seconds = timestamp
+                .as_i64()
+                .filter(|seconds| *seconds >= 0)
+                .ok_or_else(|| bad("thread_cursor must be a nonnegative integer"))?;
+            let event_id = event_id
+                .as_str()
+                .ok_or_else(|| bad("thread_cursor_id must be a string"))
+                .and_then(|value| decode_canonical_hex32(value, "thread_cursor_id"))?;
+            let mut cursor = seconds.to_be_bytes().to_vec();
+            cursor.extend(event_id);
+            Some(cursor)
+        }
+        (None, None) => None,
+        _ => return Err(bad("thread cursor fields must be supplied together")),
+    };
+    let thread_query = if let Some(depth_limit) = depth_limit {
+        let root = query
+            .e_tags
+            .as_ref()
+            .filter(|roots| roots.len() == 1)
+            .and_then(|roots| roots.first())
+            .ok_or_else(|| bad("thread traversal requires exactly one #e root"))?;
+        let root_event_id = decode_canonical_hex32(root, "#e")?;
+        if query.ids.is_some()
+            || query.authors.is_some()
+            || query.since.is_some()
+            || query.until.is_some()
+            || query.before_id.is_some()
+            || kinds.is_empty()
+            || kinds
+                .iter()
+                .any(|kind| ![KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2].contains(kind))
+        {
+            return Err(bad("unsupported IFC thread traversal"));
+        }
+        Some(IfcThreadQuery {
+            root_event_id,
+            depth_limit,
+            cursor,
+            kinds: kinds.iter().map(|kind| *kind as i32).collect(),
+        })
+    } else {
+        if cursor.is_some() {
+            return Err(bad("thread cursor requires depth_limit"));
+        }
+        None
+    };
     Ok(Request {
         channel_id,
         nonce,
         expected_generation,
         policy_only,
         query,
+        thread_query,
     })
+}
+
+fn wire_channel_type(value: &str) -> Result<&'static str, (StatusCode, String)> {
+    match value {
+        "stream" | "forum" | "workflow" => Ok("channel"),
+        "dm" => Ok("dm"),
+        _ => Err((StatusCode::SERVICE_UNAVAILABLE, "ifc-invalid".to_owned())),
+    }
+}
+
+fn wire_visibility(value: &str) -> Result<&'static str, (StatusCode, String)> {
+    match value {
+        "open" => Ok("public"),
+        "private" => Ok("private"),
+        _ => Err((StatusCode::SERVICE_UNAVAILABLE, "ifc-invalid".to_owned())),
+    }
 }
 
 fn parse_timestamp(value: &Value, field: &str) -> Result<DateTime<Utc>, (StatusCode, String)> {
@@ -287,6 +411,7 @@ async fn query_inner(
             &requester_hex,
             request.expected_generation,
             &request.query,
+            request.thread_query.as_ref(),
         )
         .await
         .map_err(map_db_error)?;
@@ -294,15 +419,17 @@ async fn query_inner(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "ifc-invalid".to_owned()));
     }
     for resource in &cut.resources {
-        if resource.channel_id != Some(request.channel_id)
-            || !HISTORY_KINDS.contains(&(resource.event.kind.as_u16() as u32))
-            || !resource.event.verify_id()
-            || !resource.event.verify_signature()
+        if resource.event.channel_id != Some(request.channel_id)
+            || !HISTORY_KINDS.contains(&(resource.event.event.kind.as_u16() as u32))
+            || !resource.event.event.verify_id()
+            || !resource.event.event.verify_signature()
         {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "ifc-invalid".to_owned()));
         }
     }
     let generation = cut.policy.generation.to_string();
+    let channel_type = wire_channel_type(&cut.policy.channel_type)?;
+    let visibility = wire_visibility(&cut.policy.visibility)?;
     let content = Content {
         version: 1,
         community_id: tenant.community().to_string(),
@@ -312,8 +439,8 @@ async fn query_inner(
         policy: Policy {
             channel_id: cut.policy.channel_id.to_string(),
             generation: generation.clone(),
-            channel_type: &cut.policy.channel_type,
-            visibility: &cut.policy.visibility,
+            channel_type,
+            visibility,
             history_access: &cut.policy.history_access,
             archived: cut.policy.archived,
             members: &cut.policy.members,
@@ -322,9 +449,9 @@ async fn query_inner(
             .resources
             .iter()
             .map(|resource| Resource {
-                event: &resource.event,
+                event: &resource.event.event,
                 effective_generation: generation.clone(),
-                origin_generation: None,
+                origin_generation: resource.origin_generation.map(|value| value.to_string()),
             })
             .collect(),
     };
@@ -480,6 +607,50 @@ mod tests {
         assert!(!request.policy_only);
         assert_eq!(request.query.limit, Some(13));
         assert_eq!(request.query.kinds, Some(vec![9, 40002, 40100]));
+    }
+
+    #[test]
+    fn adapter_pagination_and_strong_read_fields_are_applied() {
+        let body = br##"[{"kinds":[40100],"#h":["11111111-1111-4111-8111-111111111111"],"limit":1,"until":42,"before_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","consistency":"strong","ifc":{"version":1,"nonce":"0123456789abcdef0123456789abcdef"}}]"##;
+        let request = parse_request(body, CommunityId::from_uuid(Uuid::nil())).expect("request");
+        assert_eq!(request.query.until.map(|value| value.timestamp()), Some(42));
+        assert_eq!(request.query.before_id, Some(vec![0xaa; 32]));
+        assert!(request.thread_query.is_none());
+
+        for rejected in [
+            br##"[{"kinds":[40100],"#h":["11111111-1111-4111-8111-111111111111"],"limit":1,"consistency":"eventual","ifc":{"version":1,"nonce":"0123456789abcdef0123456789abcdef"}}]"##.as_slice(),
+            br##"[{"kinds":[9],"#h":["11111111-1111-4111-8111-111111111111"],"limit":1,"before_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ifc":{"version":1,"nonce":"0123456789abcdef0123456789abcdef"}}]"##.as_slice(),
+        ] {
+            assert!(parse_request(rejected, CommunityId::from_uuid(Uuid::nil())).is_err());
+        }
+    }
+
+    #[test]
+    fn adapter_thread_cursor_is_composite_and_requires_depth_traversal() {
+        let root = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let body = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"11111111-1111-4111-8111-111111111111\"],\"#e\":[\"{root}\"],\"limit\":13,\"depth_limit\":2147483647,\"thread_cursor\":42,\"thread_cursor_id\":\"{after}\",\"ifc\":{{\"version\":1,\"nonce\":\"0123456789abcdef0123456789abcdef\"}}}}]"
+        );
+        let request = parse_request(body.as_bytes(), CommunityId::from_uuid(Uuid::nil()))
+            .expect("thread request");
+        let thread = request.thread_query.expect("thread traversal");
+        assert_eq!(thread.root_event_id, vec![0xaa; 32]);
+        assert_eq!(thread.depth_limit, i32::MAX as u32);
+        assert_eq!(&thread.cursor.expect("cursor")[..8], &42i64.to_be_bytes());
+        assert_eq!(thread.kinds, vec![9, 40002]);
+    }
+
+    #[test]
+    fn policy_wire_mapping_is_closed_and_canonical() {
+        for database_value in ["stream", "forum", "workflow"] {
+            assert_eq!(wire_channel_type(database_value), Ok("channel"));
+        }
+        assert_eq!(wire_channel_type("dm"), Ok("dm"));
+        assert_eq!(wire_visibility("open"), Ok("public"));
+        assert_eq!(wire_visibility("private"), Ok("private"));
+        assert!(wire_channel_type("unknown").is_err());
+        assert!(wire_visibility("unknown").is_err());
     }
 
     #[test]

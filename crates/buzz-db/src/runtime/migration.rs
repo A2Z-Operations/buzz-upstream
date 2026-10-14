@@ -705,7 +705,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 61);
+        assert_eq!(migrations.len(), 62);
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
@@ -718,6 +718,14 @@ mod postgres_tests {
         assert!(ifc.contains("CREATE TABLE channel_policy_generations"));
         assert!(ifc.contains("CREATE TABLE ifc_event_acceptances"));
         assert!(ifc.contains("CREATE FUNCTION prune_ifc_acceptances_after_insert"));
+        assert_eq!(migrations[61].version, 62);
+        let origin = migrations[61].sql.as_str();
+        assert!(origin.contains("ADD COLUMN origin_generation BIGINT"));
+        assert!(origin.contains("CREATE FUNCTION guard_event_origin_generation"));
+        let desired = crate::test_support::desired_state_schema_sql();
+        assert!(desired.contains("origin_generation BIGINT"));
+        assert!(desired.contains("CREATE FUNCTION guard_event_origin_generation"));
+        assert!(desired.contains("trg_events_guard_origin_generation"));
         assert!(ifc.contains("CREATE TRIGGER trg_channels_ifc_policy_update"));
         assert!(ifc.contains("CREATE TRIGGER trg_channel_members_ifc_policy_update"));
         assert!(ifc.contains("CREATE TRIGGER trg_ifc_acceptance_prune"));

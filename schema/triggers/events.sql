@@ -9,6 +9,9 @@ FOR EACH ROW EXECUTE FUNCTION refresh_channel_ttl_after_event_insert();
 CREATE TRIGGER trg_events_guard_channel_roster_snapshot
     BEFORE INSERT ON events
     FOR EACH ROW EXECUTE FUNCTION guard_channel_roster_snapshot();
+CREATE TRIGGER trg_events_guard_origin_generation
+    BEFORE INSERT OR UPDATE OF origin_generation ON events
+    FOR EACH ROW EXECUTE FUNCTION guard_event_origin_generation();
 
 -- INSERT OR UPDATE OF: an UPDATE can move a previously exempt row into the
 -- guarded set (channel_id NULL -> NOT NULL) or move a channel row's

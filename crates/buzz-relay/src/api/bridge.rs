@@ -8295,6 +8295,8 @@ pub(crate) mod postgres_tests {
         assert!(attestation.verify_signature());
         let content: Value = serde_json::from_str(&attestation.content).expect("parse proof");
         assert_eq!(content["requester"], broker.public_key().to_hex());
+        assert_eq!(content["policy"]["channel_type"], "channel");
+        assert_eq!(content["policy"]["visibility"], "private");
         assert_ne!(content["requester"], human.public_key().to_hex());
         assert_eq!(
             attestation
@@ -8331,6 +8333,429 @@ pub(crate) mod postgres_tests {
         assert!(
             !response.starts_with(b"["),
             "unknown IFC input must not fall back to a legacy event array"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn ifc_policy_route_maps_stream_forum_and_dm_and_allows_public_nonmembers() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use buzz_db::channel_members::MemberRole;
+        use nostr::Event;
+        use uuid::Uuid;
+
+        let state = nip_fi_off_test_state()
+            .await
+            .expect("build HTTP query state");
+        let host = format!("ifc-policy-map-{}.local", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let creator = Keys::generate();
+        let requester = Keys::generate();
+        for keys in [&creator, &requester] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().as_bytes())
+                .await
+                .expect("ensure policy principal");
+        }
+
+        for (index, channel_type, visibility, wire_type, wire_visibility) in [
+            (
+                0,
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                "channel",
+                "private",
+            ),
+            (
+                1,
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                "channel",
+                "public",
+            ),
+            (
+                2,
+                ChannelType::Forum,
+                ChannelVisibility::Private,
+                "channel",
+                "private",
+            ),
+            (
+                3,
+                ChannelType::Forum,
+                ChannelVisibility::Open,
+                "channel",
+                "public",
+            ),
+            (
+                4,
+                ChannelType::Dm,
+                ChannelVisibility::Private,
+                "dm",
+                "private",
+            ),
+        ] {
+            let channel = Uuid::new_v4();
+            state
+                .db
+                .create_channel_with_id(
+                    community,
+                    channel,
+                    &format!("ifc-policy-map-{index}-{channel}"),
+                    channel_type,
+                    visibility,
+                    None,
+                    creator.public_key().as_bytes(),
+                    None,
+                )
+                .await
+                .expect("create mapped channel");
+            if visibility == ChannelVisibility::Private {
+                state
+                    .db
+                    .add_member(
+                        community,
+                        channel,
+                        requester.public_key().as_bytes(),
+                        MemberRole::Member,
+                        Some(creator.public_key().as_bytes()),
+                    )
+                    .await
+                    .expect("authorize private reader");
+            }
+            let generation: i64 = sqlx::query_scalar(
+                "SELECT generation FROM channel_policy_generations \
+                 WHERE community_id=$1 AND channel_id=$2",
+            )
+            .bind(community.as_uuid())
+            .bind(channel)
+            .fetch_one(state.db.pool())
+            .await
+            .expect("read policy generation");
+            let body = format!(
+                "[{{\"kinds\":[45900],\"#h\":[\"{channel}\"],\"limit\":1,\"ifc\":{{\"version\":1,\"nonce\":\"{index:032x}\",\"expected_generation\":\"{generation}\"}}}}]"
+            );
+            let url = format!("https://{host}/query");
+            let headers = make_nip98_headers(&requester, &url, "POST", body.as_bytes());
+            let (status, _, response) = oneshot_request_full(
+                state.clone(),
+                "POST",
+                "/query",
+                &host,
+                headers,
+                body.as_bytes(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            let response: Value = serde_json::from_slice(&response).expect("parse IFC response");
+            let attestation: Event = serde_json::from_value(response["attestation"].clone())
+                .expect("parse policy attestation");
+            let content: Value =
+                serde_json::from_str(&attestation.content).expect("parse policy content");
+            assert_eq!(content["policy"]["channel_type"], wire_type);
+            assert_eq!(content["policy"]["visibility"], wire_visibility);
+            let members = content["policy"]["members"]
+                .as_array()
+                .expect("policy members");
+            assert_eq!(
+                members
+                    .iter()
+                    .any(|member| member == &Value::String(requester.public_key().to_hex())),
+                visibility == ChannelVisibility::Private
+            );
+            if channel_type == ChannelType::Dm {
+                let dm = EventBuilder::new(
+                    Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+                    "dm bootstrap",
+                )
+                .tags([Tag::parse(["h", channel.to_string().as_str()]).expect("h tag")])
+                .sign_with_keys(&creator)
+                .expect("sign DM message");
+                state
+                    .db
+                    .insert_event_with_thread_metadata(community, &dm, Some(channel), None)
+                    .await
+                    .expect("insert DM message");
+                let history_body = format!(
+                    "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"limit\":10,\"ifc\":{{\"version\":1,\"nonce\":\"d0000000000000000000000000000000\",\"expected_generation\":\"{generation}\"}}}}]"
+                );
+                let headers = make_nip98_headers(&requester, &url, "POST", history_body.as_bytes());
+                let (status, _, response) = oneshot_request_full(
+                    state.clone(),
+                    "POST",
+                    "/query",
+                    &host,
+                    headers,
+                    history_body.as_bytes(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let response: Value =
+                    serde_json::from_slice(&response).expect("parse DM IFC response");
+                let attestation: Event = serde_json::from_value(response["attestation"].clone())
+                    .expect("parse DM attestation");
+                let content: Value =
+                    serde_json::from_str(&attestation.content).expect("parse DM proof");
+                assert_eq!(content["resources"][0]["event"]["id"], dm.id.to_hex());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn ifc_query_route_applies_message_thread_and_strong_canvas_cursors() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use buzz_db::event::ThreadMetadataParams;
+        use chrono::{DateTime, Utc};
+        use nostr::Event;
+        use uuid::Uuid;
+
+        async fn post_ifc(
+            state: Arc<crate::state::AppState>,
+            host: &str,
+            requester: &Keys,
+            body: &str,
+        ) -> Value {
+            let url = format!("https://{host}/query");
+            let headers = make_nip98_headers(requester, &url, "POST", body.as_bytes());
+            let (status, _, response) =
+                oneshot_request_full(state, "POST", "/query", host, headers, body.as_bytes()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            let response: Value = serde_json::from_slice(&response).expect("parse IFC response");
+            let attestation: Event = serde_json::from_value(response["attestation"].clone())
+                .expect("parse IFC attestation");
+            serde_json::from_str(&attestation.content).expect("parse IFC content")
+        }
+
+        let state = nip_fi_off_test_state()
+            .await
+            .expect("build HTTP query state");
+        let host = format!("ifc-query-cursors-{}.local", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let requester = Keys::generate();
+        state
+            .db
+            .ensure_user(community, requester.public_key().as_bytes())
+            .await
+            .expect("ensure requester");
+        let channel = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel,
+                &format!("ifc-query-cursors-{channel}"),
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                requester.public_key().as_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let timestamp = Utc::now().timestamp();
+        let channel_text = channel.to_string();
+        let mut messages = Vec::new();
+        for content in ["page-a", "page-b", "page-c"] {
+            let event = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+                content,
+            )
+            .tags([Tag::parse(["h", channel_text.as_str()]).expect("h tag")])
+            .custom_created_at(nostr::Timestamp::from(timestamp as u64))
+            .sign_with_keys(&requester)
+            .expect("sign paged event");
+            state
+                .db
+                .insert_event_with_thread_metadata(community, &event, Some(channel), None)
+                .await
+                .expect("insert paged event");
+            messages.push(event);
+        }
+        messages.sort_by_key(|event| event.id);
+        let first_page = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"limit\":1,\"until\":{timestamp},\"ifc\":{{\"version\":1,\"nonce\":\"10000000000000000000000000000000\"}}}}]"
+        );
+        let first = post_ifc(state.clone(), &host, &requester, &first_page).await;
+        assert_eq!(
+            first["resources"][0]["event"]["id"],
+            messages[0].id.to_hex()
+        );
+        let next_page = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"limit\":1,\"until\":{timestamp},\"before_id\":\"{}\",\"ifc\":{{\"version\":1,\"nonce\":\"20000000000000000000000000000000\"}}}}]",
+            messages[0].id.to_hex()
+        );
+        let next = post_ifc(state.clone(), &host, &requester, &next_page).await;
+        assert_eq!(next["resources"][0]["event"]["id"], messages[1].id.to_hex());
+
+        let root = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            "root",
+        )
+        .tags([Tag::parse(["h", channel_text.as_str()]).expect("h tag")])
+        .custom_created_at(nostr::Timestamp::from((timestamp + 1) as u64))
+        .sign_with_keys(&requester)
+        .expect("sign root");
+        let root_created =
+            DateTime::<Utc>::from_timestamp(timestamp + 1, 0).expect("valid root timestamp");
+        state
+            .db
+            .insert_event_with_thread_metadata(
+                community,
+                &root,
+                Some(channel),
+                Some(ThreadMetadataParams {
+                    event_id: root.id.as_bytes(),
+                    event_created_at: root_created,
+                    channel_id: channel,
+                    parent_event_id: None,
+                    parent_event_created_at: None,
+                    root_event_id: None,
+                    root_event_created_at: None,
+                    depth: 0,
+                    broadcast: true,
+                }),
+            )
+            .await
+            .expect("insert root");
+        let reply_timestamp = timestamp + 2;
+        let reply_created =
+            DateTime::<Utc>::from_timestamp(reply_timestamp, 0).expect("valid reply timestamp");
+        let mut replies = Vec::new();
+        for content in ["reply-a", "reply-b"] {
+            let reply = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+                content,
+            )
+            .tags([
+                Tag::parse(["h", channel_text.as_str()]).expect("h tag"),
+                Tag::parse(["e", root.id.to_hex().as_str()]).expect("root tag"),
+            ])
+            .custom_created_at(nostr::Timestamp::from(reply_timestamp as u64))
+            .sign_with_keys(&requester)
+            .expect("sign reply");
+            state
+                .db
+                .insert_event_with_thread_metadata(
+                    community,
+                    &reply,
+                    Some(channel),
+                    Some(ThreadMetadataParams {
+                        event_id: reply.id.as_bytes(),
+                        event_created_at: reply_created,
+                        channel_id: channel,
+                        parent_event_id: Some(root.id.as_bytes()),
+                        parent_event_created_at: Some(root_created),
+                        root_event_id: Some(root.id.as_bytes()),
+                        root_event_created_at: Some(root_created),
+                        depth: 1,
+                        broadcast: false,
+                    }),
+                )
+                .await
+                .expect("insert reply");
+            replies.push(reply);
+        }
+        replies.sort_by_key(|event| event.id);
+        let nested = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            "nested",
+        )
+        .tags([
+            Tag::parse(["h", channel_text.as_str()]).expect("h tag"),
+            Tag::parse(["e", root.id.to_hex().as_str()]).expect("root tag"),
+        ])
+        .custom_created_at(nostr::Timestamp::from((reply_timestamp + 1) as u64))
+        .sign_with_keys(&requester)
+        .expect("sign nested reply");
+        state
+            .db
+            .insert_event_with_thread_metadata(
+                community,
+                &nested,
+                Some(channel),
+                Some(ThreadMetadataParams {
+                    event_id: nested.id.as_bytes(),
+                    event_created_at: DateTime::<Utc>::from_timestamp(reply_timestamp + 1, 0)
+                        .expect("valid nested timestamp"),
+                    channel_id: channel,
+                    parent_event_id: Some(replies[0].id.as_bytes()),
+                    parent_event_created_at: Some(reply_created),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(root_created),
+                    depth: 2,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .expect("insert nested reply");
+
+        let root_id = root.id.to_hex();
+        let thread_first = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"#e\":[\"{root_id}\"],\"limit\":1,\"depth_limit\":1,\"ifc\":{{\"version\":1,\"nonce\":\"30000000000000000000000000000000\"}}}}]"
+        );
+        let first = post_ifc(state.clone(), &host, &requester, &thread_first).await;
+        assert_eq!(first["resources"][0]["event"]["id"], replies[0].id.to_hex());
+        let thread_after = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"#e\":[\"{root_id}\"],\"limit\":1,\"depth_limit\":1,\"thread_cursor\":{reply_timestamp},\"thread_cursor_id\":\"{}\",\"ifc\":{{\"version\":1,\"nonce\":\"40000000000000000000000000000000\"}}}}]",
+            replies[0].id.to_hex()
+        );
+        let after = post_ifc(state.clone(), &host, &requester, &thread_after).await;
+        assert_eq!(after["resources"][0]["event"]["id"], replies[1].id.to_hex());
+        let selected = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"ids\":[\"{}\"],\"limit\":1,\"ifc\":{{\"version\":1,\"nonce\":\"50000000000000000000000000000000\"}}}}]",
+            nested.id.to_hex()
+        );
+        let selected = post_ifc(state.clone(), &host, &requester, &selected).await;
+        assert_eq!(selected["resources"][0]["event"]["id"], nested.id.to_hex());
+        let root_lookup = format!(
+            "[{{\"kinds\":[9,40002],\"#h\":[\"{channel}\"],\"ids\":[\"{root_id}\"],\"limit\":1,\"ifc\":{{\"version\":1,\"nonce\":\"60000000000000000000000000000000\"}}}}]"
+        );
+        let root_result = post_ifc(state.clone(), &host, &requester, &root_lookup).await;
+        assert_eq!(root_result["resources"][0]["event"]["id"], root_id);
+
+        let canvas = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CANVAS as u16),
+            "strong canvas",
+        )
+        .tags([Tag::parse(["h", channel_text.as_str()]).expect("h tag")])
+        .custom_created_at(nostr::Timestamp::from((reply_timestamp + 2) as u64))
+        .sign_with_keys(&requester)
+        .expect("sign canvas");
+        state
+            .db
+            .insert_event_with_thread_metadata(community, &canvas, Some(channel), None)
+            .await
+            .expect("insert canvas");
+        let canvas_query = format!(
+            "[{{\"kinds\":[40100],\"#h\":[\"{channel}\"],\"ids\":[\"{}\"],\"limit\":1,\"consistency\":\"strong\",\"ifc\":{{\"version\":1,\"nonce\":\"70000000000000000000000000000000\"}}}}]",
+            canvas.id.to_hex()
+        );
+        let canvas_result = post_ifc(state, &host, &requester, &canvas_query).await;
+        assert_eq!(
+            canvas_result["resources"][0]["event"]["id"],
+            canvas.id.to_hex()
         );
     }
 

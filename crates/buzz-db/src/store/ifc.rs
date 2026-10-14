@@ -1,6 +1,6 @@
 //! Canonical policy cuts and atomic fenced publication.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use buzz_core::ifc::{IfcMemoryExpectedHead, IfcPublicationFence, IfcPublicationTarget};
 use buzz_core::{CommunityId, StoredEvent};
@@ -47,7 +47,29 @@ pub struct IfcReadCut {
     /// Canonical policy.
     pub policy: IfcPolicySnapshot,
     /// Exact signed resources selected by the supported query.
-    pub resources: Vec<StoredEvent>,
+    pub resources: Vec<IfcReadResource>,
+}
+
+/// One signed resource and its relay-authenticated publication origin, when known.
+#[derive(Debug)]
+pub struct IfcReadResource {
+    /// Exact signed event stored by the relay.
+    pub event: StoredEvent,
+    /// Destination policy generation atomically recorded for a fenced publication.
+    pub origin_generation: Option<i64>,
+}
+
+/// Existing thread traversal semantics applied inside an IFC policy read cut.
+#[derive(Debug)]
+pub struct IfcThreadQuery {
+    /// Selected thread root event ID.
+    pub root_event_id: Vec<u8>,
+    /// Maximum reply nesting depth.
+    pub depth_limit: u32,
+    /// Composite ascending cursor: timestamp seconds followed by event ID.
+    pub cursor: Option<Vec<u8>>,
+    /// Message kinds admitted by the caller's signed filter.
+    pub kinds: Vec<i32>,
 }
 
 /// Result of one fenced publication transaction.
@@ -215,10 +237,13 @@ impl Db {
         principal_hex: &str,
         expected_generation: Option<i64>,
         query: &EventQuery,
+        thread_query: Option<&IfcThreadQuery>,
     ) -> Result<IfcReadCut, IfcError> {
         if query.community_id != community_id
             || query.channel_id != Some(channel_id)
             || query.limit.unwrap_or(IFC_MAX_RESOURCES) > IFC_MAX_RESOURCES
+            || (thread_query.is_some()
+                && !matches!(query.limit, Some(limit) if limit > 0 && limit <= IFC_MAX_RESOURCES))
         {
             return Err(IfcError::Invalid);
         }
@@ -244,7 +269,62 @@ impl Db {
         if expected_generation.is_some_and(|generation| generation != policy.generation) {
             return Err(IfcError::PolicyChanged);
         }
-        let resources = crate::event::query_events_on(tx.conn(), query).await?;
+        let events = if let Some(thread) = thread_query {
+            if thread.root_event_id.len() != 32
+                || thread.depth_limit > i32::MAX as u32
+                || thread.kinds.is_empty()
+                || thread
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.len() != 40)
+            {
+                return Err(IfcError::Invalid);
+            }
+            crate::thread::get_thread_replies_filtered_on(
+                tx.conn(),
+                community_id,
+                &thread.root_event_id,
+                Some(thread.depth_limit),
+                query.limit.ok_or(IfcError::Invalid)? as u32,
+                thread.cursor.as_deref(),
+                Some(&thread.kinds),
+            )
+            .await?
+            .into_iter()
+            .map(|reply| reply.stored_event)
+            .collect()
+        } else {
+            crate::event::query_events_on(tx.conn(), query).await?
+        };
+        let event_ids = events
+            .iter()
+            .map(|resource| resource.event.id.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let origins = if event_ids.is_empty() {
+            HashMap::new()
+        } else {
+            sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(
+                "SELECT id, origin_generation FROM events \
+                 WHERE community_id = $1 AND id = ANY($2::bytea[]) AND deleted_at IS NULL",
+            )
+            .bind(community_id.as_uuid())
+            .bind(&event_ids)
+            .fetch_all(tx.conn())
+            .await
+            .map_err(DbError::from)?
+            .into_iter()
+            .collect()
+        };
+        let resources = events
+            .into_iter()
+            .map(|event| IfcReadResource {
+                origin_generation: origins
+                    .get(event.event.id.as_bytes().as_slice())
+                    .copied()
+                    .flatten(),
+                event,
+            })
+            .collect();
         tx.rollback().await?;
         Ok(IfcReadCut { policy, resources })
     }
@@ -546,6 +626,23 @@ impl Db {
             IfcPublicationTarget::OwnerTelemetry { .. } => return Err(IfcError::Invalid),
         };
 
+        if let IfcPublicationTarget::Channel(destination) = &fence.target {
+            let updated = sqlx::query(
+                "UPDATE events SET origin_generation = $3 \
+                 WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
+                   AND origin_generation IS NULL",
+            )
+            .bind(community_id.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .bind(destination.generation)
+            .execute(tx.conn())
+            .await
+            .map_err(DbError::from)?;
+            if updated.rows_affected() != 1 {
+                return Err(IfcError::Invalid);
+            }
+        }
+
         let expires_at =
             DateTime::<Utc>::from_timestamp(fence.expires_at, 0).ok_or(IfcError::Invalid)?;
         sqlx::query(
@@ -574,7 +671,7 @@ impl Db {
     /// Verify that the required generation catalog and database triggers exist.
     pub async fn verify_ifc_policy_catalog(&self) -> Result<(), DbError> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT tgname FROM pg_trigger \
+            "SELECT DISTINCT tgname FROM pg_trigger \
              WHERE NOT tgisinternal AND tgenabled = 'O' AND tgname = ANY($1::text[]) ORDER BY tgname",
         )
         .bind([
@@ -586,6 +683,7 @@ impl Db {
             "trg_channels_ifc_policy_identity",
             "trg_channels_ifc_policy_insert",
             "trg_channels_ifc_policy_update",
+            "trg_events_guard_origin_generation",
         ])
         .fetch_all(&self.pool)
         .await?;
@@ -595,12 +693,16 @@ impl Db {
                  AND EXISTS (SELECT 1 FROM information_schema.columns \
                              WHERE table_schema='public' AND table_name='channels' \
                                AND column_name='history_access') \
+                 AND EXISTS (SELECT 1 FROM information_schema.columns \
+                             WHERE table_schema='public' AND table_name='events' \
+                               AND column_name='origin_generation') \
                  AND to_regprocedure('channel_policy_lock_key(uuid,uuid)') IS NOT NULL \
                  AND to_regprocedure('initialize_channel_policy_generation()') IS NOT NULL \
                  AND to_regprocedure('advance_channel_policy_for_channel_update()') IS NOT NULL \
                  AND to_regprocedure('advance_channel_policy_for_member_update()') IS NOT NULL \
                  AND to_regprocedure('guard_channel_policy_generation_row()') IS NOT NULL \
                  AND to_regprocedure('guard_ifc_acceptance_row()') IS NOT NULL \
+                 AND to_regprocedure('guard_event_origin_generation()') IS NOT NULL \
                  AND to_regprocedure('enforce_ifc_acceptance_expiry()') IS NOT NULL \
                  AND to_regprocedure('prune_ifc_acceptances_after_insert()') IS NOT NULL \
                  AND EXISTS (SELECT 1 FROM pg_trigger \
@@ -614,7 +716,7 @@ impl Db {
         )
         .fetch_one(&self.pool)
         .await?;
-        if rows.len() != 8 || !catalog_ready {
+        if rows.len() != 9 || !catalog_ready {
             return Err(DbError::InvalidData(
                 "IFC policy catalog is incomplete".to_owned(),
             ));
@@ -1362,12 +1464,14 @@ mod postgres_tests {
                 &added.public_key().to_hex(),
                 Some(2),
                 &query,
+                None,
             )
             .await
             .expect("current full-history grant");
         assert_eq!(cut.policy.generation, 2);
         assert_eq!(cut.resources.len(), 1);
-        assert_eq!(cut.resources[0].event.id, legacy.id);
+        assert_eq!(cut.resources[0].event.event.id, legacy.id);
+        assert_eq!(cut.resources[0].origin_generation, None);
         let outsider = Keys::generate();
         assert!(matches!(
             db.ifc_read_cut(
@@ -1375,11 +1479,217 @@ mod postgres_tests {
                 channel,
                 &outsider.public_key().to_hex(),
                 Some(2),
-                &query
+                &query,
+                None,
             )
             .await,
             Err(IfcError::AccessDenied)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn fenced_origin_survives_policy_rotation_and_is_immutable() {
+        let db = connect().await;
+        let (community, channel, keys) = fixture(db.pool()).await;
+        let event = fenced_event(
+            &keys,
+            community,
+            channel,
+            1,
+            Utc::now().timestamp() + 120,
+            "known origin",
+        );
+        let fence = parse_publication_fence(&event)
+            .expect("parse")
+            .expect("fence");
+        assert!(matches!(
+            db.publish_ifc_event(
+                community,
+                &event,
+                &fence,
+                &keys.public_key().to_hex(),
+                None,
+                None,
+            )
+            .await
+            .expect("publish at generation one"),
+            IfcPublishOutcome::Inserted(_)
+        ));
+        sqlx::query("UPDATE channels SET visibility='open' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(channel)
+            .execute(db.pool())
+            .await
+            .expect("rotate policy");
+
+        let mut query = EventQuery::for_community(community);
+        query.channel_id = Some(channel);
+        query.kinds = Some(vec![KIND_STREAM_MESSAGE as i32]);
+        query.ids = Some(vec![event.id.as_bytes().to_vec()]);
+        query.limit = Some(1);
+        let cut = db
+            .ifc_read_cut(
+                community,
+                channel,
+                &keys.public_key().to_hex(),
+                Some(2),
+                &query,
+                None,
+            )
+            .await
+            .expect("read after rotation");
+        assert_eq!(cut.policy.generation, 2);
+        assert_eq!(cut.resources.len(), 1);
+        assert_eq!(cut.resources[0].origin_generation, Some(1));
+
+        let error =
+            sqlx::query("UPDATE events SET origin_generation=2 WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(event.id.as_bytes().as_slice())
+                .execute(db.pool())
+                .await
+                .expect_err("known origin must be immutable");
+        assert!(error
+            .to_string()
+            .contains("event origin generation is immutable"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn locked_read_cut_applies_thread_depth_and_composite_cursor() {
+        let db = connect().await;
+        let (community, channel, keys) = fixture(db.pool()).await;
+        let channel_text = channel.to_string();
+        let timestamp = Utc::now().timestamp();
+        let created_at = DateTime::<Utc>::from_timestamp(timestamp, 0).expect("valid timestamp");
+        let root = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "root")
+            .tags([Tag::parse(["h", channel_text.as_str()]).expect("h tag")])
+            .custom_created_at(Timestamp::from(timestamp as u64))
+            .sign_with_keys(&keys)
+            .expect("sign root");
+        db.insert_event_with_thread_metadata(
+            community,
+            &root,
+            Some(channel),
+            Some(ThreadMetadataParams {
+                event_id: root.id.as_bytes(),
+                event_created_at: created_at,
+                channel_id: channel,
+                parent_event_id: None,
+                parent_event_created_at: None,
+                root_event_id: None,
+                root_event_created_at: None,
+                depth: 0,
+                broadcast: true,
+            }),
+        )
+        .await
+        .expect("insert root");
+        let mut replies = Vec::new();
+        for content in ["same-second-a", "same-second-b"] {
+            let reply = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+                .tags([
+                    Tag::parse(["h", channel_text.as_str()]).expect("h tag"),
+                    Tag::parse(["e", root.id.to_hex().as_str()]).expect("root tag"),
+                ])
+                .custom_created_at(Timestamp::from(timestamp as u64))
+                .sign_with_keys(&keys)
+                .expect("sign reply");
+            db.insert_event_with_thread_metadata(
+                community,
+                &reply,
+                Some(channel),
+                Some(ThreadMetadataParams {
+                    event_id: reply.id.as_bytes(),
+                    event_created_at: created_at,
+                    channel_id: channel,
+                    parent_event_id: Some(root.id.as_bytes()),
+                    parent_event_created_at: Some(created_at),
+                    root_event_id: Some(root.id.as_bytes()),
+                    root_event_created_at: Some(created_at),
+                    depth: 1,
+                    broadcast: false,
+                }),
+            )
+            .await
+            .expect("insert reply");
+            replies.push(reply);
+        }
+        replies.sort_by_key(|event| event.id);
+
+        let nested = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "nested")
+            .tags([
+                Tag::parse(["h", channel_text.as_str()]).expect("h tag"),
+                Tag::parse(["e", root.id.to_hex().as_str()]).expect("root tag"),
+            ])
+            .custom_created_at(Timestamp::from((timestamp + 1) as u64))
+            .sign_with_keys(&keys)
+            .expect("sign nested reply");
+        db.insert_event_with_thread_metadata(
+            community,
+            &nested,
+            Some(channel),
+            Some(ThreadMetadataParams {
+                event_id: nested.id.as_bytes(),
+                event_created_at: DateTime::<Utc>::from_timestamp(timestamp + 1, 0)
+                    .expect("valid nested timestamp"),
+                channel_id: channel,
+                parent_event_id: Some(replies[0].id.as_bytes()),
+                parent_event_created_at: Some(created_at),
+                root_event_id: Some(root.id.as_bytes()),
+                root_event_created_at: Some(created_at),
+                depth: 2,
+                broadcast: false,
+            }),
+        )
+        .await
+        .expect("insert nested reply");
+
+        let mut query = EventQuery::for_community(community);
+        query.channel_id = Some(channel);
+        query.kinds = Some(vec![KIND_STREAM_MESSAGE as i32]);
+        query.limit = Some(1);
+        let thread = IfcThreadQuery {
+            root_event_id: root.id.as_bytes().to_vec(),
+            depth_limit: 1,
+            cursor: None,
+            kinds: vec![KIND_STREAM_MESSAGE as i32],
+        };
+        let first = db
+            .ifc_read_cut(
+                community,
+                channel,
+                &keys.public_key().to_hex(),
+                Some(1),
+                &query,
+                Some(&thread),
+            )
+            .await
+            .expect("first thread page");
+        assert_eq!(first.resources.len(), 1);
+        assert_eq!(first.resources[0].event.event.id, replies[0].id);
+
+        let mut cursor = timestamp.to_be_bytes().to_vec();
+        cursor.extend(replies[0].id.as_bytes());
+        let after = IfcThreadQuery {
+            cursor: Some(cursor),
+            ..thread
+        };
+        let second = db
+            .ifc_read_cut(
+                community,
+                channel,
+                &keys.public_key().to_hex(),
+                Some(1),
+                &query,
+                Some(&after),
+            )
+            .await
+            .expect("second thread page");
+        assert_eq!(second.resources.len(), 1);
+        assert_eq!(second.resources[0].event.event.id, replies[1].id);
+        assert_ne!(second.resources[0].event.event.id, nested.id);
     }
 
     #[tokio::test]
@@ -1531,6 +1841,15 @@ mod postgres_tests {
             .await,
             Ok(IfcPublishOutcome::Inserted(_))
         ));
+        let origin: Option<i64> = sqlx::query_scalar(
+            "SELECT origin_generation FROM events WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(second.id.as_bytes().as_slice())
+        .fetch_one(db.pool())
+        .await
+        .expect("read canvas origin");
+        assert_eq!(origin, Some(1));
     }
 
     #[tokio::test]
@@ -1931,7 +2250,7 @@ mod postgres_tests {
         let reader = keys.public_key().to_hex();
         let read = tokio::spawn(async move {
             read_db
-                .ifc_read_cut(community, channel, &reader, None, &query)
+                .ifc_read_cut(community, channel, &reader, None, &query, None)
                 .await
         });
         let write_db = db.clone();
