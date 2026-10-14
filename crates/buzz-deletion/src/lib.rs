@@ -1409,6 +1409,18 @@ where
     Ok(output)
 }
 
+fn validate_approved_schema(
+    live: &buzz_db::deletion::SchemaManifest,
+    frozen: &FrozenInventory,
+) -> Result<()> {
+    if live.scoped_tables != frozen.schema.scoped_tables {
+        return Err(permanent(
+            "approved structural catalog drifted before fencing",
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_stage(
     services: &Services,
     claim: &ClaimedDeletion,
@@ -1467,13 +1479,7 @@ async fn execute_stage(
                 .inventory_schema(request.community_id)
                 .await?;
             let frozen = validate_frozen_inventory(request)?;
-            if live_schema.scoped_tables != frozen.schema.scoped_tables
-                || live_schema.fenced_tables != frozen.schema.fenced_tables
-            {
-                return Err(permanent(
-                    "approved structural catalog drifted before fencing",
-                ));
-            }
+            validate_approved_schema(&live_schema, &frozen)?;
             services.store.begin_quiescing(&token).await?;
             match services.store.fence(&token).await {
                 Ok(_) => {}
@@ -2415,6 +2421,36 @@ mod postgres_tests {
             .await
             .expect("load fenced request");
         assert_eq!(fenced.stage, DeletionStage::Fenced);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approved_legacy_fence_inventory_accepts_current_catalog() {
+        let (_, services, mut claim) = claimed_test_deletion("deletion-legacy-fences").await;
+        let mut frozen = validate_frozen_inventory(&claim.request).expect("frozen inventory");
+        frozen.schema.fenced_tables = buzz_db::deletion::EXPECTED_SCOPED_TABLES
+            .iter()
+            .map(|table| (*table).to_owned())
+            .collect();
+        claim.request.inventory_digest = Some(hex::encode(frozen.digest().expect("legacy digest")));
+        claim.request.inventory_manifest =
+            Some(serde_json::to_value(&frozen).expect("encode legacy inventory"));
+
+        let decoded =
+            validate_frozen_inventory(&claim.request).expect("legacy digest remains valid");
+        let mut live = services
+            .store
+            .inventory_schema(claim.request.community_id)
+            .await
+            .expect("live catalog");
+        // Simulate the retired catalog while retaining the legacy digest above.
+        // B1 itself must still report live fences for old executors during rollout.
+        live.fenced_tables.clear();
+        validate_approved_schema(&live, &decoded)
+            .expect("legacy fence list is no longer structural");
+
+        live.scoped_tables.push("unknown_tenant_table".to_string());
+        assert!(validate_approved_schema(&live, &decoded).is_err());
     }
 
     #[tokio::test]
