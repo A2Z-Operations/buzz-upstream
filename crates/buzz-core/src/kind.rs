@@ -161,14 +161,17 @@ pub fn k_tag_kinds(event: &nostr::Event) -> impl Iterator<Item = u32> + '_ {
     })
 }
 
-/// Kinds that require a result-level read gate beyond the filter-layer
-/// `#p` check: even a reader who knows an event id MUST match the event's
-/// `#p` tag to receive the event. This closes the kindless `{ids:[…]}` read
-/// path for events whose existence must not be leaked.
+/// Kinds that require a result-level read gate beyond filter admission. Even a
+/// reader who knows an event id must satisfy that kind's event predicate. This
+/// closes the kindless `{ids:[…]}` path for private content or metadata.
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_AGENT_TURN_METRIC,
+    KIND_AGENT_ENGRAM,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.

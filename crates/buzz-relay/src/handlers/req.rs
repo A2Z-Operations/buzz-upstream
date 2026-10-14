@@ -1633,14 +1633,13 @@ pub(crate) fn filter_can_match_shared_gated_kinds(filter: &Filter) -> bool {
 
 /// Returns `true` if the filter CAN match result-gated kinds — meaning it
 /// either has no `kinds` constraint (wildcard) or includes at least one kind
-/// that carries a per-event result-level read gate (currently
-/// `KIND_DM_VISIBILITY` and `KIND_AGENT_TURN_METRIC`).
+/// that carries a per-event result-level read gate (`KIND_DM_VISIBILITY`,
+/// `KIND_AGENT_TURN_METRIC`, and fenced `KIND_AGENT_ENGRAM` events).
 ///
 /// Used by the COUNT handler to force the per-event fallback path instead of
-/// the fast SQL `count_events()`, which cannot enforce the owner-only result
-/// gate. An existence count leaks private event activity even though no content
-/// is returned, violating the NIP-AM / NIP-DM requirement that knowing an id
-/// MUST NOT grant access.
+/// the fast SQL `count_events()`, which cannot enforce the per-event result
+/// gate. An existence count can leak private event activity even though no
+/// content is returned.
 pub(crate) fn filter_can_match_result_gated_kinds(filter: &Filter) -> bool {
     filter.kinds.as_ref().is_none_or(|ks| {
         ks.iter()
@@ -1691,8 +1690,8 @@ pub(crate) fn is_author_only_event(event: &nostr::Event, requester_pubkey_bytes:
 /// 2. **Shared-gate** (`SHARED_GATED_KINDS`, e.g. kind 30175/30178 without
 ///    `["shared","true"]`): the event is only visible to the author unless
 ///    explicitly opted into sharing.
-/// 3. **Result-gated kinds** (kind 44200/30622 etc.): `reader_authorized_for_event`
-///    carries the per-event ownership check.
+/// 3. **Result-gated kinds** (kind 44200/30622 and fenced 30174):
+///    `reader_authorized_for_event` carries the per-event ownership check.
 ///
 /// The hex representation required by `reader_authorized_for_event` is derived
 /// internally so callers cannot supply inconsistent byte/hex identities.
@@ -3246,6 +3245,12 @@ mod tests {
         let f = Filter::new().kind(nostr::Kind::Custom(
             buzz_core::kind::KIND_DM_VISIBILITY as u16,
         ));
+        assert!(filter_can_match_result_gated_kinds(&f));
+    }
+
+    #[test]
+    fn result_gated_explicit_30174_can_match() {
+        let f = Filter::new().kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16));
         assert!(filter_can_match_result_gated_kinds(&f));
     }
 

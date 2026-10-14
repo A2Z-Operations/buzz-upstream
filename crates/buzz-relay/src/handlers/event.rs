@@ -175,14 +175,11 @@ pub async fn filter_fanout_by_access(
         matches
     };
 
-    // Owner-only kinds (kind:30622 DM visibility, kind:44200 agent turn
-    // metrics) reach only the pubkey named in their `p` tag. Same predicate as
-    // the pull paths, applied here so local and Redis delivery share it — a
-    // kindless `ids:[…]` subscription can otherwise match these events.
+    // Result-gated kinds use the same per-event predicate as pull and count.
+    // This runs before the channel-less return so local and Redis delivery
+    // cannot bypass private metadata checks on global events.
     let kind = event_kind_u32(&stored_event.event);
-    let matches = if kind == buzz_core::kind::KIND_DM_VISIBILITY
-        || kind == buzz_core::kind::KIND_AGENT_TURN_METRIC
-    {
+    let matches = if buzz_core::kind::RESULT_GATED_KINDS.contains(&kind) {
         matches
             .into_iter()
             .filter(|(conn_id, _)| {
@@ -2739,7 +2736,8 @@ mod tests {
         use axum::extract::ws::Message;
         use buzz_core::kind::{KIND_MEMBER_ADDED_NOTIFICATION, KIND_PRESENCE_UPDATE};
         use buzz_pubsub::{ChannelEvent, EventTopic};
-        use nostr::{EventBuilder, Filter, Keys, Kind};
+        use nostr::nips::nip44::{self, Version};
+        use nostr::{EventBuilder, Filter, Keys, Kind, Tag};
         use tokio::sync::{mpsc, Mutex};
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
@@ -2825,6 +2823,49 @@ mod tests {
                 ])
                 .sign_with_keys(&Keys::generate())
                 .expect("sign membership notification")
+        }
+
+        fn fenced_memory_event(agent: &Keys, owner: &Keys, source: Uuid) -> nostr::Event {
+            let owner_hex = owner.public_key().to_hex();
+            let source_text = source.to_string();
+            let community_text = Uuid::nil().to_string();
+            let expiry = (chrono::Utc::now().timestamp() + 120).to_string();
+            let key = buzz_core::engram::conversation_key(agent.secret_key(), &owner.public_key());
+            let d = buzz_core::engram::d_tag(&key, "fanout/read-gate");
+            let ciphertext = nip44::encrypt(
+                agent.secret_key(),
+                &owner.public_key(),
+                r#"{"slug":"fanout/read-gate","value":"private"}"#,
+                Version::V2,
+            )
+            .expect("encrypt memory");
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
+                ciphertext,
+            )
+            .tags([
+                Tag::parse(["d", d.as_str()]).expect("d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+                Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                    .expect("ifc tag"),
+                Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
+                Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+            ])
+            .sign_with_keys(agent)
+            .expect("sign memory")
+        }
+
+        fn unfenced_memory_event(agent: &Keys, owner: &Keys) -> nostr::Event {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
+                "legacy ciphertext",
+            )
+            .tags([
+                Tag::parse(["d", &"a".repeat(64)]).expect("d tag"),
+                Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
+            ])
+            .sign_with_keys(agent)
+            .expect("sign legacy memory")
         }
 
         fn event_from_ws_message(msg: Message) -> nostr::Event {
@@ -2953,6 +2994,69 @@ mod tests {
                     stranger_rx.try_recv().is_err(),
                     "kind {kind}: stranger must not receive"
                 );
+            }
+        }
+
+        #[tokio::test]
+        async fn local_and_pubsub_fanout_gate_fenced_memory_but_not_legacy_memory() {
+            for local in [false, true] {
+                let state = test_state().await;
+                let tenant = buzz_core::tenant::TenantContext::resolved(
+                    buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                    "memory-fanout.test",
+                );
+                let agent = Keys::generate();
+                let owner = Keys::generate();
+                let stranger = Keys::generate();
+                let fenced = fenced_memory_event(&agent, &owner, Uuid::new_v4());
+                let legacy = unfenced_memory_event(&agent, &owner);
+                let subscribe = |who: &Keys| {
+                    register_global_sub(
+                        &state,
+                        "ids",
+                        Filter::new().ids([fenced.id, legacy.id]),
+                        Some(who.public_key().to_bytes().to_vec()),
+                    )
+                    .1
+                };
+                let mut agent_rx = subscribe(&agent);
+                let mut owner_rx = subscribe(&owner);
+                let mut stranger_rx = subscribe(&stranger);
+
+                for event in [fenced.clone(), legacy.clone()] {
+                    if local {
+                        super::super::dispatch_persistent_event_inner(
+                            &tenant,
+                            &state,
+                            &buzz_core::StoredEvent::new(event.clone(), None),
+                            buzz_core::kind::KIND_AGENT_ENGRAM,
+                            &event.pubkey.to_hex(),
+                            false,
+                            None,
+                        )
+                        .await;
+                    } else {
+                        fan_out_pubsub_event(
+                            &state,
+                            ChannelEvent {
+                                community_id: tenant.community(),
+                                topic: EventTopic::Global,
+                                event,
+                            },
+                        )
+                        .await;
+                    }
+                }
+
+                for receiver in [&mut agent_rx, &mut owner_rx] {
+                    let first = event_from_ws_message(receiver.try_recv().expect("fenced memory"));
+                    let second = event_from_ws_message(receiver.try_recv().expect("legacy memory"));
+                    assert_eq!([first.id, second.id], [fenced.id, legacy.id]);
+                }
+                let delivered =
+                    event_from_ws_message(stranger_rx.try_recv().expect("legacy memory"));
+                assert_eq!(delivered.id, legacy.id);
+                assert!(stranger_rx.try_recv().is_err());
             }
         }
 
@@ -3171,6 +3275,75 @@ mod tests {
                     .await
                     .is_err(),
                 "origin relay suppresses the Redis echo after local fan-out"
+            );
+
+            origin_subscriber.abort();
+            receiver_subscriber.abort();
+            origin_fanout.abort();
+            receiver_fanout.abort();
+        }
+
+        #[tokio::test]
+        async fn redis_round_trip_withholds_fenced_memory_from_stranger() {
+            let Some(redis_url) = redis_url_if_available().await else {
+                eprintln!("skipping Redis memory fan-out test: Redis unavailable");
+                return;
+            };
+            let origin = super::fanout_access::test_state_with_redis_url(&redis_url).await;
+            let receiver = super::fanout_access::test_state_with_redis_url(&redis_url).await;
+            let origin_subscriber = tokio::spawn(origin.pubsub.clone().run_subscriber());
+            let receiver_subscriber = tokio::spawn(receiver.pubsub.clone().run_subscriber());
+            let origin_fanout = spawn_pubsub_fanout_loop(origin.clone());
+            let receiver_fanout = spawn_pubsub_fanout_loop(receiver.clone());
+            let tenant = buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "memory-redis.test",
+            );
+            origin
+                .pubsub
+                .retain_topic(&tenant, EventTopic::Global)
+                .await;
+            receiver
+                .pubsub
+                .retain_topic(&tenant, EventTopic::Global)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let agent = Keys::generate();
+            let owner = Keys::generate();
+            let stranger = Keys::generate();
+            let event = fenced_memory_event(&agent, &owner, Uuid::new_v4());
+            let subscribe = |who: &Keys| {
+                register_global_sub(
+                    &receiver,
+                    "memory",
+                    Filter::new().id(event.id),
+                    Some(who.public_key().to_bytes().to_vec()),
+                )
+                .1
+            };
+            let mut agent_rx = subscribe(&agent);
+            let mut owner_rx = subscribe(&owner);
+            let mut stranger_rx = subscribe(&stranger);
+
+            origin
+                .pubsub
+                .publish_event(&tenant, EventTopic::Global, &event)
+                .await
+                .expect("publish memory through Redis");
+            for receiver in [&mut agent_rx, &mut owner_rx] {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                        .await
+                        .expect("authorized Redis delivery")
+                        .expect("connection open");
+                assert_eq!(event_from_ws_message(message).id, event.id);
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(250), stranger_rx.recv(),)
+                    .await
+                    .is_err(),
+                "stranger must not receive fenced memory metadata"
             );
 
             origin_subscriber.abort();

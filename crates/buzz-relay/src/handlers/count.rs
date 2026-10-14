@@ -134,9 +134,9 @@ pub async fn handle_count(
         // shared-tag check. A fast count over those kinds would include foreign
         // unshared events, leaking the existence of private agent activity.
         let needs_shared_gate_filtering = filter_can_match_shared_gated_kinds(filter);
-        // Determine if this filter can match result-gated kinds (44200, 30622)
-        // that require a per-event owner check. When the fast SQL path would
-        // count matching rows without calling reader_authorized_for_event, a
+        // Determine if this filter can match result-gated kinds (44200, 30622,
+        // or fenced 30174) that require a per-event check. When the fast SQL
+        // path would count matching rows without calling reader_authorized_for_event, a
         // non-owner learns the existence of events they are not allowed to see.
         // The only safe pushdown is when #p is pinned to the authenticated
         // reader's own pubkey.

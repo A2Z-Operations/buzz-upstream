@@ -2055,8 +2055,8 @@ async fn count_events_authed(
         let needs_author_only_filtering =
             crate::handlers::req::filter_can_match_author_only_kinds(filter);
         // Same result-gated guard as the WS COUNT handler: force the per-event
-        // fallback for filters that can match 44200 or 30622 unless #p=[self]
-        // is safely pushed down (existence leak otherwise).
+        // fallback for filters that can match 44200, 30622, or fenced 30174
+        // unless #p=[self] is safely pushed down (existence leak otherwise).
         let needs_result_gated_filtering =
             crate::handlers::req::filter_can_match_result_gated_kinds(filter)
                 && !crate::handlers::req::result_gated_count_safe_for_pushdown(
@@ -7603,6 +7603,335 @@ pub(crate) mod postgres_tests {
             .await
             .expect("read body");
         (status, bytes)
+    }
+
+    async fn post_read_route(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        route: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+    ) -> (axum::http::StatusCode, axum::body::Bytes) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let response = crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header(header::HOST, host)
+                    .header("x-pubkey", pubkey_hex)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_vec()))
+                    .expect("build read request"),
+            )
+            .await
+            .expect("read route response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read route body");
+        (status, bytes)
+    }
+
+    async fn ws_read_frames(
+        state: Arc<crate::state::AppState>,
+        tenant: TenantContext,
+        reader: &Keys,
+        delegated_owner: Option<nostr::PublicKey>,
+        filter: nostr::Filter,
+        count: bool,
+    ) -> Vec<String> {
+        use tokio_util::sync::CancellationToken;
+
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel(32);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let connection = Arc::new(crate::connection::ConnectionState {
+            conn_id: uuid::Uuid::new_v4(),
+            tenant,
+            remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: reader.public_key(),
+                    scopes: Vec::new(),
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: delegated_owner,
+                },
+            )),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel),
+        });
+        if count {
+            crate::handlers::count::handle_count(
+                "memory-count".to_owned(),
+                vec![filter],
+                connection,
+                state,
+            )
+            .await;
+        } else {
+            crate::handlers::req::handle_req(
+                "memory-read".to_owned(),
+                vec![filter],
+                vec![None],
+                connection,
+                state,
+            )
+            .await;
+        }
+        let mut frames = Vec::new();
+        while let Ok(message) = send_rx.try_recv() {
+            if let axum::extract::ws::Message::Text(text) = message {
+                frames.push(text.to_string());
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn fenced_memory_production_reads_hide_envelope_and_count_from_strangers() {
+        use buzz_core::engram::{conversation_key, d_tag};
+        use buzz_core::kind::KIND_AGENT_ENGRAM;
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::nips::nip44::{self, Version};
+
+        let Some(state) = bridge_handler_test_state().await else {
+            eprintln!("skipping fenced memory read test: Postgres or Redis unavailable");
+            return;
+        };
+        let host = format!("ifc-memory-read-{}.test", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        for principal in [&agent, &owner, &stranger] {
+            state
+                .db
+                .ensure_user(community, principal.public_key().as_bytes())
+                .await
+                .expect("ensure test principal");
+        }
+        assert!(state
+            .db
+            .set_agent_owner(
+                community,
+                agent.public_key().as_bytes(),
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .expect("set delegated owner"));
+        let source = uuid::Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                source,
+                &format!("ifc-memory-read-{}", source.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                agent.public_key().as_bytes(),
+                None,
+            )
+            .await
+            .expect("create source channel");
+
+        let owner_hex = owner.public_key().to_hex();
+        let source_text = source.to_string();
+        let community_text = community.to_string();
+        let expiry = (chrono::Utc::now().timestamp() + 120).to_string();
+        let memory_key = conversation_key(agent.secret_key(), &owner.public_key());
+        let memory_event = |slug: &str, fenced: bool| {
+            let d = d_tag(&memory_key, slug);
+            let ciphertext = nip44::encrypt(
+                agent.secret_key(),
+                &owner.public_key(),
+                format!(r#"{{"slug":"{slug}","value":"private"}}"#),
+                Version::V2,
+            )
+            .expect("encrypt owner memory");
+            let mut tags = vec![
+                Tag::parse(["d", d.as_str()]).expect("d tag"),
+                Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+            ];
+            if fenced {
+                tags.extend([
+                    Tag::parse(["ifc", "1", community_text.as_str(), expiry.as_str()])
+                        .expect("ifc tag"),
+                    Tag::parse(["ifc-source", source_text.as_str(), "1"]).expect("source tag"),
+                    Tag::parse(["ifc-owner-memory", owner_hex.as_str()]).expect("memory target"),
+                ]);
+            }
+            EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), ciphertext)
+                .tags(tags)
+                .sign_with_keys(&agent)
+                .expect("sign memory")
+        };
+        let fenced = memory_event("read/fenced", true);
+        let legacy = memory_event("read/legacy", false);
+        for event in [&fenced, &legacy] {
+            let body = serde_json::to_vec(event).expect("serialize memory");
+            let (status, response) =
+                post_events_with_body(state.clone(), &host, &agent.public_key().to_hex(), &body)
+                    .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{response}");
+            assert!(response.contains(r#""accepted":true"#), "{response}");
+        }
+
+        let no_kind = serde_json::to_vec(&[serde_json::json!({
+            "ids": [fenced.id.to_hex()]
+        })])
+        .expect("serialize exact-id filter");
+        let with_kind = serde_json::to_vec(&[serde_json::json!({
+            "ids": [fenced.id.to_hex()],
+            "kinds": [KIND_AGENT_ENGRAM]
+        })])
+        .expect("serialize exact-id kind filter");
+        for (reader, body) in [(&agent, &no_kind), (&owner, &with_kind)] {
+            let (status, bytes) = post_read_route(
+                state.clone(),
+                &host,
+                "/query",
+                &reader.public_key().to_hex(),
+                body,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let events: Vec<nostr::Event> = serde_json::from_slice(&bytes).expect("query events");
+            assert_eq!(
+                events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                [fenced.id]
+            );
+            let (status, bytes) = post_read_route(
+                state.clone(),
+                &host,
+                "/count",
+                &reader.public_key().to_hex(),
+                body,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let count: serde_json::Value = serde_json::from_slice(&bytes).expect("count response");
+            assert_eq!(count["count"], 1);
+        }
+        for body in [&no_kind, &with_kind] {
+            let (status, bytes) = post_read_route(
+                state.clone(),
+                &host,
+                "/query",
+                &stranger.public_key().to_hex(),
+                body,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(bytes.as_ref(), b"[]");
+            let (status, bytes) = post_read_route(
+                state.clone(),
+                &host,
+                "/count",
+                &stranger.public_key().to_hex(),
+                body,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let count: serde_json::Value = serde_json::from_slice(&bytes).expect("count response");
+            assert_eq!(count["count"], 0);
+        }
+
+        let broad = serde_json::to_vec(&[serde_json::json!({
+            "kinds": [KIND_AGENT_ENGRAM]
+        })])
+        .expect("serialize broad filter");
+        let (status, _) = post_read_route(
+            state.clone(),
+            &host,
+            "/query",
+            &stranger.public_key().to_hex(),
+            &broad,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        let legacy_filter = serde_json::to_vec(&[serde_json::json!({
+            "ids": [legacy.id.to_hex()]
+        })])
+        .expect("serialize legacy filter");
+        let (status, bytes) = post_read_route(
+            state.clone(),
+            &host,
+            "/query",
+            &stranger.public_key().to_hex(),
+            &legacy_filter,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let events: Vec<nostr::Event> = serde_json::from_slice(&bytes).expect("legacy query");
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [legacy.id]
+        );
+
+        let id_filter = nostr::Filter::new().id(fenced.id);
+        let agent_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &agent,
+            Some(owner.public_key()),
+            id_filter.clone(),
+            false,
+        )
+        .await;
+        assert!(agent_frames
+            .iter()
+            .any(|frame| frame.contains(&fenced.id.to_hex())));
+        let owner_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &owner,
+            None,
+            id_filter.clone(),
+            false,
+        )
+        .await;
+        assert!(owner_frames
+            .iter()
+            .any(|frame| frame.contains(&fenced.id.to_hex())));
+        let stranger_frames = ws_read_frames(
+            state.clone(),
+            tenant.clone(),
+            &stranger,
+            None,
+            id_filter.clone(),
+            false,
+        )
+        .await;
+        assert!(!stranger_frames
+            .iter()
+            .any(|frame| frame.contains("ifc-source")));
+        let count_frames = ws_read_frames(state, tenant, &stranger, None, id_filter, true).await;
+        assert!(count_frames
+            .iter()
+            .any(|frame| frame.contains(r#""count":0"#)));
     }
 
     #[tokio::test]

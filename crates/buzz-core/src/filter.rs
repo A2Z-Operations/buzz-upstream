@@ -11,10 +11,11 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
     filters.iter().any(|f| filter_match_one(f, event))
 }
 
-/// Result-level read authorization for relay-signed events whose content is
-/// private to a single viewer. Currently gates `KIND_DM_VISIBILITY` and
-/// `KIND_AGENT_TURN_METRIC`: the reader MUST equal the event's `#p` tag
-/// (owner). Returns `true` for every other kind.
+/// Result-level read authorization for events carrying private metadata.
+/// `KIND_DM_VISIBILITY` and `KIND_AGENT_TURN_METRIC` require the reader to
+/// equal the event's `#p` tag. A fenced `KIND_AGENT_ENGRAM` additionally
+/// permits its author, while an unfenced engram retains its legacy behavior.
+/// Returns `true` for every other kind.
 ///
 /// This guards every delivery surface — WS historical pull (`req.rs`), HTTP
 /// bridge (`bridge.rs`), and live fan-out (`event.rs`) — so a query that
@@ -22,6 +23,19 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
+    if kind == crate::kind::KIND_AGENT_ENGRAM && crate::ifc::has_ifc_tag(event) {
+        if event
+            .pubkey
+            .to_hex()
+            .eq_ignore_ascii_case(reader_pubkey_hex)
+        {
+            return true;
+        }
+        return event
+            .tags
+            .public_keys()
+            .any(|pubkey| pubkey.to_hex().eq_ignore_ascii_case(reader_pubkey_hex));
+    }
     if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
         return true;
     }
@@ -318,5 +332,45 @@ mod tests {
             !reader_authorized_for_event(&metric, &agent_keys.public_key().to_hex()),
             "the authoring agent must NOT be authorized to read its own metric event (owner-only)"
         );
+    }
+
+    #[test]
+    fn reader_authorized_for_event_gates_only_fenced_engrams() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let fenced = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_AGENT_ENGRAM as u16),
+            "ciphertext",
+        )
+        .tags([
+            Tag::parse(["p", owner_hex.as_str()]).expect("p tag"),
+            Tag::parse(["ifc-unknown", "reserved"]).expect("reserved tag"),
+        ])
+        .sign_with_keys(&agent)
+        .expect("sign fenced engram");
+
+        assert!(reader_authorized_for_event(
+            &fenced,
+            &agent.public_key().to_hex()
+        ));
+        assert!(reader_authorized_for_event(&fenced, &owner_hex));
+        assert!(!reader_authorized_for_event(
+            &fenced,
+            &stranger.public_key().to_hex()
+        ));
+
+        let unfenced = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_AGENT_ENGRAM as u16),
+            "ciphertext",
+        )
+        .tags([Tag::parse(["p", owner_hex.as_str()]).expect("p tag")])
+        .sign_with_keys(&agent)
+        .expect("sign unfenced engram");
+        assert!(reader_authorized_for_event(
+            &unfenced,
+            &stranger.public_key().to_hex()
+        ));
     }
 }
