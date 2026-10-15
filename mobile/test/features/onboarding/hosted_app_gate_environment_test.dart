@@ -77,6 +77,18 @@ void main() {
       expect(await pending, isTrue);
       expect(flow.started, isNull);
     }
+    final dotted = dispatcher.onboardingHandler!(
+      context,
+      const InviteDeepLink(
+        relayUrl: 'wss://team.communities.public.builderlabstaging.xyz.',
+        code: 'fixture',
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Community setup unavailable'), findsOneWidget);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+    expect(await dotted, isTrue);
     expect(
       await dispatcher.onboardingHandler!(
         context,

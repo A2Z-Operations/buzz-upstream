@@ -5,7 +5,7 @@ abstract final class HostedEnvironment {
   /// Reserved domains cannot fall back to Nostr-only onboarding, even when
   /// this build does not support their account environment.
   static bool isReservedHost(String host) {
-    final normalized = host.toLowerCase();
+    final normalized = host.toLowerCase().replaceFirst(RegExp(r'\.+$'), '');
     return [
       'buzz.xyz',
       'builderlab.xyz',
@@ -34,6 +34,7 @@ abstract final class HostedEnvironment {
     return null;
   }
 
+  /// Whether this build can use its account session for this relay.
   static bool supportsRelay(Uri relay) => accountOriginFor(relay) == origin;
 
   static Uri _origin() {

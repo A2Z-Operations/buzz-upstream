@@ -40,6 +40,7 @@ void main() {
       'buzz.xyz',
       'app.builderlab.xyz',
       'TEAM.builderlabstaging.xyz',
+      'team.communities.public.builderlabstaging.xyz.',
     ]) {
       expect(HostedEnvironment.isReservedHost(host), isTrue);
     }
