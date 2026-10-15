@@ -4,15 +4,18 @@ class _NewMeChat extends HookConsumerWidget {
   const _NewMeChat();
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final name = useTextEditingController();
-    final selected = useState<String?>(null);
-    final channelId = useMemoized(() => const Uuid().v4());
-    final frozenName = useState<String?>(null);
-    final frozenAgent = useState<String?>(null);
-    final busy = useState(false);
-    final error = useState<String?>(null);
-    final directory = ref.watch(meAssistantsProvider);
     final sync = ref.watch(meSyncProvider);
+    final pending = useMemoized(() => MeChatCreation.pending(sync));
+    final name = useTextEditingController(text: pending?.name ?? '');
+    final selected = useState<String?>(pending?.agent);
+    final channelId = useMemoized(() => pending?.id ?? const Uuid().v4());
+    final frozenName = useState<String?>(pending?.name);
+    final frozenAgent = useState<String?>(pending?.agent);
+    final busy = useState(false);
+    final error = useState<String?>(
+      pending == null ? null : 'Resume your unfinished chat.',
+    );
+    final directory = ref.watch(meAssistantsProvider);
     final originalScope = useMemoized(() => (sync.community, sync.pubkey));
     if (originalScope != (sync.community, sync.pubkey)) {
       return const Padding(
@@ -134,6 +137,9 @@ class _NewMeChat extends HookConsumerWidget {
                         ).pop((created, frozenAgent.value!));
                       }
                     } catch (e) {
+                      if (e is MeRecoveryConflict && context.mounted) {
+                        await _offerMeRecovery(context, sync);
+                      }
                       if (context.mounted) {
                         error.value =
                             '${e.toString().replaceFirst('Bad state: ', '')}\nRetry continues this same chat.';

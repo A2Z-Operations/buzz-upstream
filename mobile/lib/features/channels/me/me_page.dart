@@ -12,7 +12,9 @@ import 'me_assistant_list.dart';
 import 'me_section.dart';
 import '../../../shared/widgets/avatar_image.dart';
 import '../../../shared/me/me_groups.dart';
+import '../../../shared/me/me_chat_creation.dart';
 import '../../../shared/me/me_sync.dart';
+import '../../../shared/me/me_recovery.dart';
 import '../../../shared/me/me_assistants.dart';
 import '../../../shared/theme/theme.dart';
 import '../../../shared/theme/buzz_icons.dart';
@@ -65,6 +67,9 @@ class MePage extends HookConsumerWidget {
       try {
         await action();
       } catch (error) {
+        if (error is MeRecoveryConflict && context.mounted) {
+          await _offerMeRecovery(context, ref.read(meSyncProvider));
+        }
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(

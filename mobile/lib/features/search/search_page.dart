@@ -4,7 +4,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 import '../../shared/identity_names/identity_names_provider.dart';
-import '../../shared/me/me_sync.dart';
+import '../../shared/me/me_search_placement.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/mentions/mention_tags.dart';
 import '../../shared/theme/theme.dart';
@@ -768,14 +768,14 @@ Future<void> _openSearchChannel(
   Channel channel,
 ) async {
   try {
-    final groups = await ref.read(meGroupsProvider.future);
+    final personal = await ref.read(
+      meSearchPlacementProvider(channel.id).future,
+    );
     if (!context.mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => ChannelDetailPage(
-          channel: channel,
-          personalChat: groups.channels.contains(channel.id),
-        ),
+        builder: (_) =>
+            ChannelDetailPage(channel: channel, personalChat: personal),
       ),
     );
   } catch (_) {

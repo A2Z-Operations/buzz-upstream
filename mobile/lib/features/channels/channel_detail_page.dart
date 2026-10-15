@@ -803,6 +803,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                           ),
                           data: (events) {
                             return _MessageList(
+                              notifier: ref.watch(messagesProvider.notifier),
                               inlineTyping: personalChat
                                   ? typingEntries
                                   : const [],

@@ -574,7 +574,7 @@ private final class NativeProfileTextEditorViewController:
       cell.contentConfiguration = content
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = fieldsLocked || assistants.isEmpty ? .none : .default
-      cell.accessibilityTraits = .button
+      cell.accessibilityTraits = fieldsLocked || assistants.isEmpty ? .notEnabled : .button
     } else if isChannelEditor && indexPath.section >= 2 {
       var content = cell.defaultContentConfiguration()
       content.textProperties.font = .preferredFont(forTextStyle: .body)

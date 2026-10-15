@@ -6,11 +6,12 @@ Future<(Channel, String)?> _showNewMeChat(
 ) async {
   if (defaultTargetPlatform == TargetPlatform.iOS) {
     final sync = ref.read(meSyncProvider);
-    final id = const Uuid().v4();
-    String name = '';
-    String? assistant;
-    String? error;
-    var retry = false;
+    final pending = MeChatCreation.pending(sync);
+    final id = pending?.id ?? const Uuid().v4();
+    String name = pending?.name ?? '';
+    String? assistant = pending?.agent;
+    String? error = pending == null ? null : 'Resume your unfinished chat.';
+    var retry = pending != null;
     while (context.mounted) {
       sync.check();
       final directory = await ref.read(meAssistantsProvider.future);
@@ -71,6 +72,9 @@ Future<(Channel, String)?> _showNewMeChat(
         final created = await _createMeChat(ref, sync, id, name, assistant);
         return (created, assistant);
       } catch (failure) {
+        if (failure is MeRecoveryConflict && context.mounted) {
+          await _offerMeRecovery(context, sync);
+        }
         error =
             '${failure.toString().replaceFirst('Bad state: ', '')}\nRetry continues this same chat.';
       }
@@ -103,23 +107,30 @@ Future<Channel> _createMeChat(
   (head == null ? const MeGroups() : sync.decode(head))
       .place(channelId)
       .encode(sync.community);
-  final all = await ref.read(channelsProvider.future);
-  sync.check();
-  final existing = all.where((c) => c.id == channelId).firstOrNull;
-  final channel =
-      existing ??
-      await actions.createChannel(
-        channelId: channelId,
-        name: name,
-        channelType: 'stream',
-        visibility: 'private',
-      );
-  sync.check();
-  final members = await ref.read(channelMembersProvider(channelId).future);
-  if (!members.any((m) => m.pubkey == assistant)) {
-    await actions.addMembers(channelId: channelId, pubkeys: [assistant]);
-  }
-  sync.check();
-  await sync.update((current) => current.place(channelId));
-  return channel;
+  return MeChatCreation(channelId, name, assistant).complete<Channel>(
+    sync,
+    findChannel: () async {
+      ref.invalidate(channelsProvider);
+      final all = await ref.read(channelsProvider.future);
+      return all.where((c) => c.id == channelId).firstOrNull;
+    },
+    createChannel: () => actions.createChannel(
+      channelId: channelId,
+      name: name,
+      channelType: 'stream',
+      visibility: 'private',
+    ),
+    hasAgent: () async {
+      ref.invalidate(channelMembersProvider(channelId));
+      final members = await ref.read(channelMembersProvider(channelId).future);
+      return members.any((m) => m.pubkey == assistant);
+    },
+    addAgent: () =>
+        actions.addMembers(channelId: channelId, pubkeys: [assistant]),
+    isPlaced: () async {
+      final latest = await sync.head();
+      return latest != null && sync.decode(latest).channels.contains(channelId);
+    },
+    place: () => sync.update((current) => current.place(channelId)),
+  );
 }

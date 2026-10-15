@@ -10,6 +10,7 @@ import '../theme/theme_provider.dart';
 import '../crypto/nip44.dart';
 import '../relay/relay.dart';
 import 'me_groups.dart';
+import 'me_recovery.dart';
 
 /// A live, account/community-scoped reader for desktop's encrypted Me record.
 final meGroupsProvider = StreamProvider<MeGroups>((ref) {
@@ -163,35 +164,82 @@ class MeSync {
     return event;
   }
 
+  /// Discard only the pending snapshot the user explicitly reviewed.
+  Future<void> discardPending(String expected) async {
+    check();
+    if (_saving || prefs?.getString(pendingKey) != expected) {
+      throw StateError('The pending save changed. Review it again.');
+    }
+    if (!await prefs!.remove(pendingKey)) {
+      throw StateError('Couldn’t discard the pending save. Try again.');
+    }
+  }
+
   /// Refresh before applying an intent, then confirm the selected signed event.
   Future<void> update(MeGroups Function(MeGroups) change) async {
     check();
     if (_saving) throw StateError('A Me change is still being saved.');
     _saving = true;
     try {
+      MeGroups? recovered;
+      String? recoveredHead;
       final pending = prefs?.getString(pendingKey);
       if (pending != null) {
+        final stored = jsonDecode(pending) as Map<String, dynamic>;
         final event = NostrEvent.fromJson(
-          jsonDecode(pending) as Map<String, dynamic>,
+          (stored['event'] as Map<String, dynamic>?) ?? stored,
         );
-        decode(event);
-        if ((await head())?.id != event.id) {
-          check();
-          await session.publish(event);
-          if ((await head())?.id != event.id) {
-            throw StateError(
-              'A previous Me save is still unconfirmed. Refresh before making another change.',
-            );
+        final local = decode(event);
+        final remote = await head();
+        if (remote != null &&
+            remote.id != event.id &&
+            meEventIsNewer(remote, event)) {
+          if (!stored.containsKey('event')) {
+            // Older clients did not persist a base, so a safe rebase is unknown.
+            throw MeRecoveryConflict();
           }
+          recoveredHead = remote.id;
+          final baseEvent = stored['base'] as Map<String, dynamic>?;
+          recovered = rebaseMeGroups(
+            baseEvent == null
+                ? const MeGroups()
+                : decode(NostrEvent.fromJson(baseEvent)),
+            local,
+            decode(remote),
+          );
+        } else {
+          if (remote?.id != event.id) {
+            check();
+            await session.publish(event);
+            if ((await head())?.id != event.id) {
+              throw StateError(
+                'A previous Me save is still unconfirmed. Try again.',
+              );
+            }
+          }
+          await prefs?.remove(pendingKey);
+          throw StateError(
+            'Your previous Me save is confirmed. Review your projects before making another change.',
+          );
         }
-        await prefs?.remove(pendingKey);
-        throw StateError(
-          'Your previous Me save is confirmed. Review your projects before making another change.',
-        );
       }
       final before = await head();
-      final value = change(before == null ? const MeGroups() : decode(before));
-      final content = nip44Encrypt(key, value.encode(community));
+      if (recovered != null && before?.id != recoveredHead) {
+        throw StateError(
+          'Me changed again. Your pending change is saved; try again.',
+        );
+      }
+      final value =
+          recovered ??
+          change(before == null ? const MeGroups() : decode(before));
+      final String encoded;
+      try {
+        encoded = value.encode(community);
+      } on FormatException {
+        if (recovered != null) throw MeRecoveryConflict();
+        rethrow;
+      }
+      final content = nip44Encrypt(key, encoded);
       final current = await head();
       if (before?.id != current?.id) {
         throw StateError(
@@ -216,7 +264,10 @@ class MeSync {
         ).toMap(),
       );
       if (prefs != null &&
-          !await prefs!.setString(pendingKey, jsonEncode(signed.toJson()))) {
+          !await prefs!.setString(
+            pendingKey,
+            jsonEncode({'event': signed.toJson(), 'base': before?.toJson()}),
+          )) {
         throw StateError('Couldn’t save this change on your phone. Try again.');
       }
       check();
@@ -228,6 +279,11 @@ class MeSync {
         );
       }
       await prefs?.remove(pendingKey);
+      if (recovered != null) {
+        throw StateError(
+          'Your previous Me save was recovered alongside the desktop changes. Review your projects before making another change.',
+        );
+      }
     } finally {
       _saving = false;
     }

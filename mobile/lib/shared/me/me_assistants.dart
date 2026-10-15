@@ -43,22 +43,32 @@ Future<List<AgentDirectoryEntry>> _loadAssistants(
   final profiles = <String, NostrEvent>{};
   final seen = <String>{};
   const pageSize = 100;
-  for (var page = 1; ; page++) {
+  const maxPages = 10;
+  for (var page = 1; page <= maxPages; page++) {
     sync.check();
     final events = await session.queryRelay([
       NostrFilter(
         kinds: const [0],
         authors: pubkey == null ? null : [pubkey],
+        tags: pubkey == null
+            ? {
+                '#auth': [sync.pubkey],
+              }
+            : const {},
         limit: pageSize,
         extensions: {'page': page},
       ),
     ]);
     sync.check();
+    if (events.length > pageSize) {
+      throw StateError('Agent directory exceeded the requested page size.');
+    }
     var added = false;
     for (final event in events) {
       if (event.kind != 0 || (pubkey != null && event.pubkey != pubkey)) {
         continue;
       }
+      if (seen.contains(event.id)) continue;
       try {
         nostr.Event.fromJson(jsonEncode(event.toJson()));
       } catch (_) {
@@ -75,13 +85,13 @@ Future<List<AgentDirectoryEntry>> _loadAssistants(
       }
     }
     if (events.length < pageSize) break;
-    if (!added) {
+    if (!added || page == maxPages) {
       throw StateError('Could not finish loading assistants. Try again.');
     }
   }
   return [
     for (final event in profiles.values)
-      if (verifiedOaOwnerPubkey(event.tags, event.pubkey) == sync.pubkey)
+      if (verifiedProfileOaOwnerPubkey(event) == sync.pubkey)
         AgentDirectoryEntry.fromEvent(event),
   ];
 }

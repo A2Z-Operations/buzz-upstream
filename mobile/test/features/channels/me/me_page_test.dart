@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:buzz/shared/me/me_chat_creation.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:nostr/nostr.dart' as nostr;
@@ -217,6 +219,86 @@ void main() {
     expect(calls.single.method, 'presentChat');
     final args = calls.single.arguments as Map;
     expect(args['title'], 'New chat');
+    expect(args['placeholder'], 'Chat name');
+    expect(args['assistants'], isEmpty);
+    expect(args['containerCornerRadius'], Radii.container);
+    expect(find.byType(BottomSheet), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('iOS new chat restores a durable creation after restart', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    const channel = MethodChannel('buzz/profile_text_editor');
+    final calls = <MethodCall>[];
+    var directoryLoads = 0;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      call,
+    ) async {
+      calls.add(call);
+      return null;
+    });
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      ),
+    );
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    final sync = MeSync(
+      RelaySessionNotifier(),
+      RelayConfig(
+        baseUrl: 'https://relay.test',
+        nsec: nostr.Nip19.encode(
+          prefix: nostr.Nip19Prefix.nsec,
+          data:
+              '0000000000000000000000000000000000000000000000000000000000000001',
+        ),
+      ),
+      prefs: prefs,
+    );
+    await const MeChatCreation(
+      'same-id',
+      'Unfinished chat',
+      'agent',
+    ).save(sync);
+    final restarted = MeSync(RelaySessionNotifier(), sync.config, prefs: prefs);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          meGroupsProvider.overrideWith(
+            (ref) => Stream.value(const MeGroups()),
+          ),
+          meSyncProvider.overrideWithValue(restarted),
+          channelsProvider.overrideWith(FakeChannels.new),
+          meAssistantsProvider.overrideWith((ref) async {
+            directoryLoads++;
+            return [];
+          }),
+        ],
+        child: MaterialApp(theme: AppTheme.light(), home: const MePage()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final bar = tester.widget<FrostedAppBar>(find.byType(FrostedAppBar));
+    bar.nativeActions!
+        .firstWhere((action) => action.label == 'New chat')
+        .onPressed!();
+    await tester.pumpAndSettle();
+    expect(directoryLoads, 1);
+    expect(calls, hasLength(1));
+    expect(calls.single.method, 'presentChat');
+    final args = calls.single.arguments as Map;
+    expect(args['title'], 'New chat');
+    expect(args['initialValue'], 'Unfinished chat');
+    expect(args['selectedAssistant'], 'agent');
+    expect(args['fieldsLocked'], isTrue);
+    expect(args['error'], contains('Resume'));
     expect(args['placeholder'], 'Chat name');
     expect(args['assistants'], isEmpty);
     expect(args['containerCornerRadius'], Radii.container);

@@ -303,17 +303,17 @@ Widget _buildTestable({
             ),
           ),
         ),
-        meMessagesProvider(
-          _channelId,
-        ).overrideWith(() => _FakeMessagesNotifier(messages)),
+        meMessagesProvider(_channelId).overrideWith(() => fakeMessagesNotifier),
         meAssistantsProvider.overrideWith((ref) async => []),
         meGroupsProvider.overrideWith((ref) => Stream.value(const MeGroups())),
       ],
       if (videoPreviewLoader != null)
         videoPreviewFrameLoaderProvider.overrideWithValue(videoPreviewLoader),
-      channelMessagesProvider(
-        _channelId,
-      ).overrideWith(() => fakeMessagesNotifier),
+      channelMessagesProvider(_channelId).overrideWith(
+        () => personalChat
+            ? _FakeMessagesNotifier(messages)
+            : fakeMessagesNotifier,
+      ),
       channelTypingProvider(
         _channelId,
       ).overrideWith(() => typingNotifier ?? _FakeTypingNotifier(typing)),
@@ -3805,78 +3805,155 @@ void main() {
       expect(find.byTooltip('Jump to latest message'), findsOneWidget);
     });
 
-    testWidgets('loads history through the oldest unread boundary', (
-      tester,
-    ) async {
-      final newestPage = [
-        for (var i = 50; i < 100; i++)
-          _textMsg(
-            id: 'msg$i',
-            pubkey: 'alice',
-            content: 'Message $i',
-            createdAt: 1000 + i,
-          ),
-      ];
-      final olderPage = [
-        for (var i = 0; i < 50; i++)
-          _textMsg(
-            id: 'msg$i',
-            pubkey: 'alice',
-            content: 'Message $i',
-            createdAt: 1000 + i,
-          ),
-      ];
-      final messagesNotifier = _FakeMessagesNotifier(
-        newestPage,
-        olderPages: [olderPage],
-      );
-      final channelsNotifier = _FakeChannelsNotifier(
-        [_testChannel],
-        observedUnread: {
-          _channelId: [
-            makeObservedUnreadEvent(
-              id: 'msg21',
-              createdAt: 1021,
-              rootId: null,
-              highPriority: false,
-              channelType: 'stream',
-              isThreadedReply: false,
+    for (final gesture in ['status bar', 'scroll']) {
+      testWidgets(
+        'Me history uses selected provider for $gesture',
+        (tester) async {
+          final notifier = _FakeMessagesNotifier(
+            [
+              for (var i = 50; i < 250; i++)
+                _textMsg(
+                  id: 'msg$i',
+                  pubkey: 'alice',
+                  content: 'Message $i',
+                  createdAt: 1000 + i,
+                ),
+            ],
+            olderPages: [
+              [
+                for (var i = 0; i < 50; i++)
+                  _textMsg(
+                    id: 'msg$i',
+                    pubkey: 'alice',
+                    content: 'Message $i',
+                    createdAt: 1000 + i,
+                  ),
+              ],
+            ],
+          );
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: const [],
+              messagesNotifier: notifier,
+              personalChat: true,
+              disableAnimations: true,
             ),
-          ],
+          );
+          await tester.pumpAndSettle();
+          if (gesture == 'status bar') {
+            await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+              'flutter/status_bar',
+              const JSONMethodCodec().encodeMethodCall(
+                const MethodCall('handleScrollToTop'),
+              ),
+              (_) {},
+            );
+            await tester.pumpAndSettle();
+          } else {
+            final list = tester.widget<ScrollablePositionedList>(
+              find.byType(ScrollablePositionedList),
+            );
+            list.itemScrollController!.jumpTo(index: 195);
+            await tester.pumpAndSettle();
+            await tester.drag(
+              find.byType(ScrollablePositionedList),
+              const Offset(0, 350),
+            );
+            await tester.pumpAndSettle();
+          }
+          expect(notifier.fetchOlderCalls, greaterThan(0));
+          if (gesture == 'status bar') {
+            expect(findRichText('Message 0'), findsOneWidget);
+          } else {
+            // Scroll pagination extends the visible provider, even if the user
+            // has not scrolled through every newly loaded row yet.
+            expect(
+              ProviderScope.containerOf(
+                tester.element(find.byType(ChannelDetailPage)),
+              ).read(meMessagesProvider(_channelId)).requireValue.first.id,
+              'msg0',
+            );
+          }
+        },
+        variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+      );
+    }
+
+    for (final personal in [false, true]) {
+      testWidgets(
+        'loads history through the oldest unread boundary personal=$personal',
+        (tester) async {
+          final newestPage = [
+            for (var i = 50; i < 250; i++)
+              _textMsg(
+                id: 'msg$i',
+                pubkey: 'alice',
+                content: 'Message $i',
+                createdAt: 1000 + i,
+              ),
+          ];
+          final olderPage = [
+            for (var i = 0; i < 50; i++)
+              _textMsg(
+                id: 'msg$i',
+                pubkey: 'alice',
+                content: 'Message $i',
+                createdAt: 1000 + i,
+              ),
+          ];
+          final messagesNotifier = _FakeMessagesNotifier(
+            newestPage,
+            olderPages: [olderPage],
+          );
+          final channelsNotifier = _FakeChannelsNotifier(
+            [_testChannel],
+            observedUnread: {
+              _channelId: [
+                makeObservedUnreadEvent(
+                  id: 'msg21',
+                  createdAt: 1021,
+                  rootId: null,
+                  highPriority: false,
+                  channelType: 'stream',
+                  isThreadedReply: false,
+                ),
+              ],
+            },
+          );
+          final readState = _SynchronousReadStateNotifier(
+            const ReadStateState(
+              isReady: true,
+              pubkey: 'self',
+              contexts: {_channelId: 1020},
+              version: 0,
+            ),
+          );
+
+          await tester.pumpWidget(
+            _buildTestable(
+              personalChat: personal,
+              messages: const [],
+              messagesNotifier: messagesNotifier,
+              channelsNotifier: channelsNotifier,
+              readStateNotifier: readState,
+              users: const {
+                'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+              },
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.tap(
+            find.byKey(const ValueKey('channel-jump-to-oldest-unread')),
+          );
+          await tester.pumpAndSettle();
+
+          expect(findRichText('Message 21'), findsOneWidget);
+          expect(findRichText('Message 50'), findsNothing);
+          expect(messagesNotifier.fetchOlderCalls, 1);
         },
       );
-      final readState = _SynchronousReadStateNotifier(
-        const ReadStateState(
-          isReady: true,
-          pubkey: 'self',
-          contexts: {_channelId: 1020},
-          version: 0,
-        ),
-      );
-
-      await tester.pumpWidget(
-        _buildTestable(
-          messages: const [],
-          messagesNotifier: messagesNotifier,
-          channelsNotifier: channelsNotifier,
-          readStateNotifier: readState,
-          users: const {
-            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
-          },
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      await tester.tap(
-        find.byKey(const ValueKey('channel-jump-to-oldest-unread')),
-      );
-      await tester.pumpAndSettle();
-
-      expect(findRichText('Message 21'), findsOneWidget);
-      expect(findRichText('Message 50'), findsNothing);
-      expect(messagesNotifier.fetchOlderCalls, 1);
-    });
-
+    }
     testWidgets('does not load history for threaded-only unread events', (
       tester,
     ) async {

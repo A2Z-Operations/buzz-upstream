@@ -11,6 +11,7 @@ import 'package:pointycastle/digests/sha256.dart';
 class _Relay extends RelaySessionNotifier {
   final List<List<NostrEvent>> pages;
   final requestedPages = <int>[];
+  final requestedTags = <Map<String, dynamic>>[];
   final requestedAuthors = <List<String>?>[];
   _Relay(this.pages);
   @override
@@ -21,6 +22,7 @@ class _Relay extends RelaySessionNotifier {
     Duration timeout = const Duration(seconds: 8),
   }) async {
     expect(filters.single.kinds, [0]);
+    requestedTags.add(filters.single.toJson());
     requestedAuthors.add(filters.single.authors);
     final page = filters.single.toJson()['page'] as int;
     requestedPages.add(page);
@@ -32,10 +34,17 @@ void main() {
   final owner = nostr.Keys.generate();
   final other = nostr.Keys.generate();
   final agent = nostr.Keys.generate();
-  NostrEvent profile(nostr.Keys signer, {nostr.Keys? ownedBy, int time = 1}) {
+  NostrEvent profile(
+    nostr.Keys signer, {
+    nostr.Keys? ownedBy,
+    int time = 1,
+    String conditions = '',
+  }) {
     final digest = SHA256Digest()
         .process(
-          Uint8List.fromList(utf8.encode('nostr:agent-auth:${signer.public}:')),
+          Uint8List.fromList(
+            utf8.encode('nostr:agent-auth:${signer.public}:$conditions'),
+          ),
         )
         .map((v) => v.toRadixString(16).padLeft(2, '0'))
         .join();
@@ -50,7 +59,7 @@ void main() {
             [
               'auth',
               ownedBy.public,
-              '',
+              conditions,
               nostr.Schnorr.sign(secretKey: ownedBy.secret, message: digest),
             ],
         ],
@@ -115,6 +124,46 @@ void main() {
     );
     expect(relay.requestedPages, [1, 2]);
   });
+  test(
+    'owner discovery is scoped and bounded even when the relay keeps paging',
+    () async {
+      final repeated = [
+        for (var i = 0; i < 99; i++) profile(agent, ownedBy: owner, time: i),
+      ];
+      final relay = _Relay([
+        for (var page = 0; page < 11; page++)
+          [...repeated, profile(agent, ownedBy: owner, time: 100 + page)],
+      ]);
+      await expectLater(
+        setup(relay).read(meAssistantsProvider.future),
+        throwsStateError,
+      );
+      expect(relay.requestedPages.length, 10);
+      for (final filter in relay.requestedTags) {
+        expect(filter['#auth'], [owner.public]);
+        expect(filter['limit'], 100);
+      }
+    },
+  );
+  for (final conditions in ['kind=1', 'created_at>1', 'created_at<1']) {
+    test(
+      'discovery and send revalidation reject inapplicable $conditions',
+      () async {
+        final relay = _Relay([
+          [profile(agent, ownedBy: owner, conditions: conditions)],
+        ]);
+        final container = setup(relay);
+        expect(await container.read(meAssistantsProvider.future), isEmpty);
+        expect(
+          await isOwnedMeAssistant(
+            container.read(meSyncProvider),
+            agent.public,
+          ),
+          isFalse,
+        );
+      },
+    );
+  }
   test('creation revalidates only the chosen assistant', () async {
     final relay = _Relay([
       [profile(agent, ownedBy: owner)],

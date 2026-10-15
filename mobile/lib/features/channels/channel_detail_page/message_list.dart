@@ -13,6 +13,7 @@ class _MessageList extends HookConsumerWidget {
   final Set<String> initialForcedUnreadMessageIds;
   final bool hasInitialUnread;
   final String channelId;
+  final ChannelMessagesNotifier notifier;
   final String? currentPubkey;
   final bool isMember;
   final bool isArchived;
@@ -34,6 +35,7 @@ class _MessageList extends HookConsumerWidget {
     required this.initialForcedUnreadMessageIds,
     required this.hasInitialUnread,
     required this.channelId,
+    required this.notifier,
     required this.currentPubkey,
     required this.isMember,
     required this.isArchived,
@@ -89,7 +91,6 @@ class _MessageList extends HookConsumerWidget {
     final unreadBoundaryFetchCount = useRef(0);
     final hasUnreadDeepLink =
         initialMessageId != null || initialThreadRootId != null;
-    final notifier = ref.read(channelMessagesProvider(channelId).notifier);
     final dayTimestampByReversedIndex = <int, int>{};
     final dayStartByReversedIndex = <int, int>{};
     final dayHeaderTimestampByReversedIndex = <int, int>{};
@@ -526,9 +527,6 @@ class _MessageList extends HookConsumerWidget {
               olderFetchPaused.value) {
             return;
           }
-          final notifier = ref.read(
-            channelMessagesProvider(channelId).notifier,
-          );
           if (notifier.reachedOldest) return;
           isLoadingOlder.value = true;
           notifier
