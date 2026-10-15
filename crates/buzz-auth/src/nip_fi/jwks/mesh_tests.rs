@@ -1,4 +1,4 @@
-//! Regression tests for the explicit deployment-authenticated JWKS transport.
+//! Regression tests for the explicit mesh JWKS transport.
 
 use super::*;
 
@@ -9,12 +9,11 @@ fn minimal_jwks_json(kid: &str) -> String {
 }
 
 fn mesh_contract(uri: &str) -> JwksSourceContract {
-    JwksSourceContract::new_deployment_authenticated(uri.to_owned(), 300, 3600)
-        .expect("valid mesh contract")
+    JwksSourceContract::new_mesh(uri.to_owned(), 300, 3600).expect("valid mesh contract")
 }
 
 #[test]
-fn deployment_authenticated_contract_rejects_invalid_uri_and_timing() {
+fn mesh_contract_rejects_invalid_uri_and_timing() {
     for uri in [
         "https://mesh.example.test/jwks.json",
         "http://127.0.0.1/jwks.json",
@@ -31,7 +30,7 @@ fn deployment_authenticated_contract_rejects_invalid_uri_and_timing() {
         "http:\\\\mesh.example.test\\jwks.json",
     ] {
         assert!(
-            JwksSourceContract::new_deployment_authenticated(uri.to_owned(), 300, 3600).is_none(),
+            JwksSourceContract::new_mesh(uri.to_owned(), 300, 3600).is_none(),
             "mesh contract must reject {uri}"
         );
     }
@@ -45,8 +44,7 @@ fn deployment_authenticated_contract_rejects_invalid_uri_and_timing() {
         (1, MAX_JWKS_TIMING_SECONDS + 1),
     ] {
         assert!(
-            JwksSourceContract::new_deployment_authenticated(uri.clone(), refresh, deadline)
-                .is_none(),
+            JwksSourceContract::new_mesh(uri.clone(), refresh, deadline).is_none(),
             "mesh contract must reject timing ({refresh}, {deadline})"
         );
     }
@@ -79,55 +77,150 @@ fn mesh_contract_canonicalizes_and_transport_participates_in_equality() {
 }
 
 #[test]
-fn resolved_address_policy_separates_public_https_from_mesh_http() {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+fn mesh_address_allow_list_covers_range_boundaries_and_embedded_ipv6() {
+    let cases = [
+        ("127.0.0.0", true),
+        ("127.255.255.255", true),
+        ("126.255.255.255", false),
+        ("128.0.0.0", false),
+        ("10.0.0.0", true),
+        ("10.255.255.255", true),
+        ("9.255.255.255", false),
+        ("11.0.0.0", false),
+        ("172.16.0.0", true),
+        ("172.31.255.255", true),
+        ("172.15.255.255", false),
+        ("172.32.0.0", false),
+        ("192.168.0.0", true),
+        ("192.168.255.255", true),
+        ("192.167.255.255", false),
+        ("192.169.0.0", false),
+        ("100.64.0.0", true),
+        ("100.127.255.255", true),
+        ("100.63.255.255", false),
+        ("100.128.0.0", false),
+        ("240.0.0.0", true),
+        ("255.255.255.254", true),
+        ("239.255.255.255", false),
+        ("255.255.255.255", false),
+        ("169.254.0.1", false),
+        ("0.0.0.0", false),
+        ("224.0.0.1", false),
+        ("198.18.0.1", false),
+        ("192.0.2.1", false),
+        ("198.51.100.1", false),
+        ("203.0.113.1", false),
+        ("192.88.99.1", false),
+        ("fc00::", true),
+        ("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+        ("fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+        ("fe00::", false),
+        ("::1", true),
+        ("::", false),
+        ("fe80::1", false),
+        ("fec0::1", false),
+        ("fe00::1", false),
+        ("ff02::1", false),
+        ("2001:db8::1", false),
+        ("2001:2::1", false),
+        ("2002:a00:1::", false),
+        ("::a00:1", false),
+        ("::ffff:10.0.0.1", false),
+        ("::ffff:0:0:a00:1", false),
+        ("64:ff9b::10.0.0.1", false),
+        ("64:ff9b:1::10.0.0.1", false),
+    ];
 
-    let ip = |v4: [u8; 4]| IpAddr::V4(Ipv4Addr::from(v4));
-    let global = ip([8, 8, 8, 8]);
-    let private = ip([10, 20, 30, 40]);
-    let reserved_240 = ip([240, 0, 0, 1]);
-    let global_v6 = IpAddr::V6("2606:4700::1".parse().expect("valid public IPv6"));
-    let unclassified_v6 = IpAddr::V6("fe00::1".parse().expect("valid IPv6 address"));
-    let loopback_v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
-
-    for address in [private, reserved_240, loopback_v6] {
+    for (address, expected) in cases {
+        let ip = address.parse().expect("valid test IP address");
         assert_eq!(
-            validate_resolved_addresses(&[address], JwksTransport::Mesh),
-            Ok(address),
-            "mesh transport may pin an explicitly non-global address"
+            is_mesh_address_allowed(&ip),
+            expected,
+            "mesh address policy for {address}"
         );
     }
+}
+
+#[tokio::test]
+async fn mesh_resolver_validates_ip_literal_fast_path() {
+    use std::net::IpAddr;
+
+    for (host, expected) in [
+        ("8.8.8.8", Err(JwksFetchError::InvalidUri)),
+        ("2606:4700::1", Err(JwksFetchError::InvalidUri)),
+        (
+            "10.0.0.1",
+            Ok("10.0.0.1".parse::<IpAddr>().expect("valid test IP")),
+        ),
+    ] {
+        assert_eq!(
+            resolve_for_transport(host, 443, JwksTransport::Mesh).await,
+            expected,
+            "mesh resolver result for {host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transport_resolver_checks_every_answer_and_preserves_empty_result_error() {
+    use std::net::IpAddr;
+
+    let allowed = "10.0.0.1".parse::<IpAddr>().expect("valid test IP");
+    let also_allowed = "192.168.0.1".parse::<IpAddr>().expect("valid test IP");
+    let public = "8.8.8.8".parse::<IpAddr>().expect("valid test IP");
+    let public_v6 = "2606:4700::1".parse::<IpAddr>().expect("valid test IP");
+
     assert_eq!(
-        validate_resolved_addresses(&[global], JwksTransport::Mesh),
-        Err(JwksFetchError::InvalidUri)
+        TEST_DNS_ANSWERS
+            .scope(
+                vec![allowed, also_allowed],
+                resolve_for_transport("mesh.example.test", 443, JwksTransport::Mesh),
+            )
+            .await,
+        Ok(allowed),
+        "the first address is pinned only after the complete answer set passes"
     );
+
+    for answers in [
+        vec![allowed, public],
+        vec![public, allowed],
+        vec![also_allowed, public_v6],
+        vec![public_v6, also_allowed],
+    ] {
+        assert_eq!(
+            TEST_DNS_ANSWERS
+                .scope(
+                    answers,
+                    resolve_for_transport("mesh.example.test", 443, JwksTransport::Mesh),
+                )
+                .await,
+            Err(JwksFetchError::InvalidUri),
+            "mesh rejects a mixed answer regardless of address ordering"
+        );
+    }
+
+    for answers in [vec![allowed, public], vec![public, allowed]] {
+        assert_eq!(
+            TEST_DNS_ANSWERS
+                .scope(
+                    answers,
+                    resolve_for_transport("public.example.test", 443, JwksTransport::PublicHttps),
+                )
+                .await,
+            Err(JwksFetchError::InvalidUri),
+            "public HTTPS retains its strict all-answer check"
+        );
+    }
+
     assert_eq!(
-        validate_resolved_addresses(&[global_v6], JwksTransport::Mesh),
-        Err(JwksFetchError::InvalidUri)
-    );
-    assert_eq!(
-        validate_resolved_addresses(&[unclassified_v6], JwksTransport::Mesh),
-        Err(JwksFetchError::InvalidUri),
-        "mesh transport must reject addresses outside the known non-global classes"
-    );
-    assert_eq!(
-        validate_resolved_addresses(&[private, global], JwksTransport::Mesh),
-        Err(JwksFetchError::InvalidUri),
-        "mixed mesh/global DNS answers must fail closed"
-    );
-    assert_eq!(
-        validate_resolved_addresses(&[global, private], JwksTransport::PublicHttps),
-        Err(JwksFetchError::InvalidUri),
-        "public HTTPS keeps rejecting any private DNS answer"
-    );
-    assert_eq!(
-        validate_resolved_addresses(&[reserved_240], JwksTransport::PublicHttps),
-        Err(JwksFetchError::InvalidUri),
-        "public HTTPS keeps rejecting the mesh virtual-address range"
-    );
-    assert_eq!(
-        validate_resolved_addresses(&[], JwksTransport::Mesh),
-        Err(JwksFetchError::NetworkError)
+        TEST_DNS_ANSWERS
+            .scope(
+                Vec::new(),
+                resolve_for_transport("mesh.example.test", 443, JwksTransport::Mesh),
+            )
+            .await,
+        Err(JwksFetchError::NetworkError),
+        "an empty resolver result remains a network error"
     );
 }
 
@@ -256,6 +349,41 @@ async fn production_source_fetches_mesh_contract_and_raw_fetch_stays_public_only
 }
 
 #[tokio::test]
+async fn production_mesh_fetcher_checks_all_dns_answers_before_connecting() {
+    use std::net::IpAddr;
+
+    let listener = bind_localhost_listener().await;
+    let address = listener.local_addr().expect("listener address");
+    let uri = format!("http://mesh.example.test:{}/jwks.json", address.port());
+    let contract = mesh_contract(&uri);
+    let body = minimal_jwks_json("mixed-answer-key");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept fetcher request");
+        let request = read_http_request(&mut stream).await;
+        write_http_response(&mut stream, "200 OK", "", &body).await;
+        request
+    });
+
+    let result = TEST_DNS_ANSWERS
+        .scope(
+            vec![
+                address.ip(),
+                IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            ],
+            HttpJwksFetcher::new().fetch_for_contract(&contract),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(JwksFetchError::InvalidUri),
+        "the production fetcher rejects the mixed DNS answer before connecting"
+    );
+
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn production_mesh_fetcher_denies_redirects_and_non_success_statuses() {
     let listener = bind_localhost_listener().await;
     let port = listener.local_addr().expect("listener address").port();
@@ -313,6 +441,36 @@ async fn production_mesh_fetcher_denies_redirects_and_non_success_statuses() {
     assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn production_fetch_wrapper_deadline_covers_waiting_for_response() {
+    use std::time::Duration;
+
+    let listener = bind_localhost_listener().await;
+    let port = listener.local_addr().expect("listener address").port();
+    let uri = format!("http://localhost:{port}/jwks.json");
+    let contract = mesh_contract(&uri);
+    let fetch =
+        tokio::spawn(async move { HttpJwksFetcher::new().fetch_for_contract(&contract).await });
+
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("fetcher should connect before its whole-request deadline")
+        .expect("accept request");
+    let request = tokio::time::timeout(Duration::from_secs(2), read_http_request(&mut stream))
+        .await
+        .expect("fetcher should send request headers before waiting for response");
+    assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
+
+    tokio::time::advance(Duration::from_secs(JWKS_REQUEST_TIMEOUT_SECS)).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), fetch)
+            .await
+            .expect("fetch wrapper must finish at its whole-request deadline")
+            .expect("fetch task"),
+        Err(JwksFetchError::NetworkError)
+    );
+}
+
 #[tokio::test]
 async fn production_mesh_fetcher_keeps_response_cap() {
     let listener = bind_localhost_listener().await;
@@ -343,65 +501,4 @@ async fn production_mesh_fetcher_keeps_response_cap() {
     );
     let request = server.await.expect("oversized response server task");
     assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
-}
-
-#[tokio::test]
-async fn production_mesh_fetcher_disables_environment_proxies() {
-    use std::ffi::OsString;
-    static PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    struct RestoreEnv(Vec<(&'static str, Option<OsString>)>);
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
-    let _guard = PROXY_ENV_LOCK.lock().await;
-    let names = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ];
-    let restore = RestoreEnv(
-        names
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect(),
-    );
-    for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
-        std::env::set_var(name, "http://127.0.0.1:1");
-    }
-    for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {
-        std::env::remove_var(name);
-    }
-
-    let listener = bind_localhost_listener().await;
-    let port = listener.local_addr().expect("listener address").port();
-    let uri = format!("http://localhost:{port}/jwks.json");
-    let contract = mesh_contract(&uri);
-    let body = minimal_jwks_json("no-proxy-key");
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept local request");
-        let request = read_http_request(&mut stream).await;
-        write_http_response(&mut stream, "200 OK", "", &body).await;
-        request
-    });
-    let response = HttpJwksFetcher::new()
-        .fetch_for_contract(&contract)
-        .await
-        .expect("mesh HTTP request bypasses configured proxy");
-    assert!(response.contains("no-proxy-key"));
-    let request = server.await.expect("local server task");
-    assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
-    drop(restore);
 }

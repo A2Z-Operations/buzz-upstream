@@ -147,9 +147,9 @@ fn enforce_jwks_contract_mismatch_rejects() {
 }
 
 #[test]
-fn enforce_mesh_policy_and_public_jwks_config_mismatch_rejects() {
+fn enforce_policy_and_jwks_source_contract_mismatch_rejects() {
     let issuer = "https://id.example";
-    let mesh_contract = JwksSourceContract::new_deployment_authenticated(
+    let mesh_contract = JwksSourceContract::new_mesh(
         "http://mesh.example.test/.well-known/jwks.json".to_owned(),
         300,
         3600,
@@ -171,7 +171,7 @@ fn enforce_mesh_policy_and_public_jwks_config_mismatch_rejects() {
     registry.insert(mesh_policy);
 
     let error = validate_nip_fi_config(NipFiMode::Enforce, &registry, &[make_jwks_config(issuer)])
-        .expect_err("policy and source transport contracts must match");
+        .expect_err("policy and JWKS source contracts must match");
     assert_eq!(error, NipFiStartupError::JwksContractMismatch);
 }
 

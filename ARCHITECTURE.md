@@ -873,13 +873,20 @@ Every security-sensitive operation uses an explicit, verified pattern. No implic
 Applied in: `buzz-auth` (JWKS boundary), `buzz-workflow` (CallWebhook action),
 desktop `link_preview` (SSRF check).
 
-JWKS uses public HTTPS by default and retains this public-address check. An
-issuer may explicitly delegate HTTP transport authentication to an operator-
-secured service mesh; that mode rejects global, unclassified, or mixed DNS
-answers and pins a non-global result. The relay cannot prove mesh mutual TLS
-peer authentication or integrity protection, so operators must enforce both,
-authorize the endpoint, and restrict egress. Unauthenticated HTTP permits key
-substitution and issuer impersonation.
+JWKS uses `public_https` by default and applies this public-address check to
+every resolved answer before pinning the first permitted address. Explicit
+`mesh` mode accepts HTTP only for a DNS hostname (not an IP literal) without
+userinfo, query, fragment, or backslash. Its complete address allow-list is
+IPv4 RFC 1918 (`10/8`, `172.16/12`, or `192.168/16`), CGNAT (`100.64/10`),
+reserved `240/4` except `255.255.255.255`, and loopback `127/8`; IPv6 ULA
+(`fc00::/7`) and `::1` are also accepted. IPv4-mapped, IPv4-compatible,
+NAT64, 6to4, and SIIT IPv4-translated IPv6 addresses are rejected.
+The relay resolves once, validates every answer, and pins the first allowed
+address; empty or mixed answers deny. Mesh selection is an operator assertion,
+not a transport property the Rust relay verifies. Operators must enforce mutual
+TLS peer authentication and integrity protection, authorize the JWKS endpoint,
+and restrict egress. Unauthenticated HTTP permits key substitution and issuer
+impersonation.
 
 ### Audit Integrity
 

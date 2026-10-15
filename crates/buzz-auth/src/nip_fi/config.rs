@@ -738,11 +738,11 @@ fn derive_assertion_policy_id(policy: &IssuerPolicy) -> AssertionPolicyId {
     // Authenticated key-source contract (NIP-FI.md, "Policy identity and
     // snapshots"): URI selects the key source; mesh mode delegates transport
     // authentication to the deployment; interval defines bounded refresh; and
-    // hard deadline defines the accepted time rule. The public HTTPS contract
-    // keeps its historical bytes; only mesh mode adds an explicit tag.
+    // hard deadline defines the accepted time rule. The mesh transport tag is
+    // present only when that mode is selected.
     hasher.update(b"jwks-source-contract\0");
     hash_field(&mut hasher, jwks_source_contract.jwks_uri().as_bytes());
-    if jwks_source_contract.uses_deployment_authenticated_transport() {
+    if jwks_source_contract.uses_mesh_transport() {
         hasher.update(b"jwks-transport\0");
         hasher.update(b"mesh\0");
     }
@@ -794,7 +794,7 @@ mod jwks_transport_identity_tests {
     }
 
     #[test]
-    fn public_https_policy_id_preserves_pre_mesh_golden() {
+    fn public_https_policy_id_golden_omits_mesh_transport_tag() {
         let contract = JwksSourceContract::new(
             "https://issuer.example/.well-known/jwks.json".to_owned(),
             300,
@@ -805,13 +805,13 @@ mod jwks_transport_identity_tests {
         assert_eq!(
             hex::encode(policy(contract).id().as_bytes()),
             "1f904aaaad1c1db3a22ae50bd2d24cdf7181d5d0b8c5006cc1ae9ac1107f9832",
-            "public policy IDs retain their pre-mesh encoding"
+            "public_https mode omits the mesh transport tag"
         );
     }
 
     #[test]
     fn mesh_transport_policy_id_has_a_separate_golden() {
-        let contract = JwksSourceContract::new_deployment_authenticated(
+        let contract = JwksSourceContract::new_mesh(
             "http://mesh.example.test/.well-known/jwks.json".to_owned(),
             300,
             3600,
