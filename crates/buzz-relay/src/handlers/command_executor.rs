@@ -153,7 +153,10 @@ async fn persist_command_event(
             )
             .await
             .map_err(|e| {
-                IngestError::Internal(format!("error: replace parameterized event: {e}"))
+                IngestError::Internal(format!(
+                    "error: replace parameterized event: {}",
+                    crate::access::db_error_kind(&e)
+                ))
             })?;
 
         return match result.status {

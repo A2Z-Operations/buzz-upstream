@@ -32,11 +32,13 @@ macro_rules! emit {
     };
 }
 
-/// What a REQ or COUNT asked for, merged across its filters. Kinds and
-/// identifiers are de-duplicated unions; `since`/`until`/`limit` take the
+/// What a REQ or COUNT asked for, merged across its filters. `kinds` is the
+/// full de-duplicated union. Identifier lists hold the first [`LIST_CAP`]
+/// distinct values; their `*_count` fields sum the per-filter set sizes, so a
+/// value repeated in two filters counts twice. `since`/`until`/`limit` take the
 /// widest bound and are absent when any filter leaves them open. Only
 /// well-formed channel ids and pubkeys are listed, so client-chosen tag text
-/// never reaches the log; the counts include every distinct value.
+/// never reaches the log.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FilterSummary {
     filters: usize,
@@ -59,16 +61,28 @@ impl FilterSummary {
         let h = SingleLetterTag::lowercase(Alphabet::H);
         let p = SingleLetterTag::lowercase(Alphabet::P);
         let mut kinds = BTreeSet::new();
-        let mut channels = BTreeSet::new();
-        let mut authors = BTreeSet::new();
-        let mut p_tags = BTreeSet::new();
-        let mut ids: BTreeSet<&nostr::EventId> = BTreeSet::new();
+        let (mut channels, mut authors, mut p_tags) =
+            (Listed::default(), Listed::default(), Listed::default());
+        let (mut channel_count, mut author_count, mut p_count, mut ids) = (0, 0, 0, 0);
         for filter in filters {
             kinds.extend(filter.kinds.iter().flatten().map(|k| k.as_u16()));
-            channels.extend(filter.generic_tags.get(&h).into_iter().flatten());
-            authors.extend(filter.authors.iter().flatten().map(PublicKey::to_hex));
-            p_tags.extend(filter.generic_tags.get(&p).into_iter().flatten());
-            ids.extend(filter.ids.iter().flatten());
+            for c in filter.generic_tags.get(&h).into_iter().flatten() {
+                channel_count += 1;
+                if Uuid::parse_str(c).is_ok() {
+                    channels.offer(c);
+                }
+            }
+            for a in filter.authors.iter().flatten() {
+                author_count += 1;
+                authors.offer(a);
+            }
+            for v in filter.generic_tags.get(&p).into_iter().flatten() {
+                p_count += 1;
+                if PublicKey::from_hex(v).is_ok() {
+                    p_tags.offer(v);
+                }
+            }
+            ids += filter.ids.as_ref().map_or(0, |s| s.len());
         }
         let bound = |pick: fn(&Filter) -> Option<u64>, widest: fn(u64, u64) -> u64| {
             let values: Option<Vec<u64>> = filters.iter().map(pick).collect();
@@ -76,14 +90,20 @@ impl FilterSummary {
         };
         Self {
             filters: filters.len(),
-            kinds: join(kinds.iter().map(u16::to_string)),
-            channel_ids: join(channels.iter().filter(|c| Uuid::parse_str(c).is_ok())),
-            channel_count: channels.len(),
-            authors: join(authors.iter()),
-            author_count: authors.len(),
-            p_tags: join(p_tags.iter().filter(|v| PublicKey::from_hex(v).is_ok())),
-            p_count: p_tags.len(),
-            ids: ids.len(),
+            kinds: (!kinds.is_empty()).then(|| {
+                kinds
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            channel_ids: channels.finish(|c| c.to_string()),
+            channel_count,
+            authors: authors.finish(PublicKey::to_hex),
+            author_count,
+            p_tags: p_tags.finish(|v| v.to_string()),
+            p_count,
+            ids,
             since: bound(|f| f.since.map(|t| t.as_secs()), u64::min),
             until: bound(|f| f.until.map(|t| t.as_secs()), u64::max),
             limit: bound(|f| f.limit.map(|l| l as u64), u64::max).map(|l| l as usize),
@@ -92,10 +112,27 @@ impl FilterSummary {
     }
 }
 
-/// Comma-join at most [`LIST_CAP`] values; `None` when there are none.
-fn join<T: ToString>(values: impl Iterator<Item = T>) -> Option<String> {
-    let listed: Vec<String> = values.take(LIST_CAP).map(|v| v.to_string()).collect();
-    (!listed.is_empty()).then(|| listed.join(","))
+/// The first [`LIST_CAP`] distinct values offered, in order. Working state
+/// never exceeds the cap, however long the filter lists are.
+struct Listed<'a, T: ?Sized>(Vec<&'a T>);
+
+impl<T: ?Sized> Default for Listed<'_, T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<'a, T: ?Sized + PartialEq> Listed<'a, T> {
+    fn offer(&mut self, value: &'a T) {
+        if self.0.len() < LIST_CAP && !self.0.contains(&value) {
+            self.0.push(value);
+        }
+    }
+
+    /// Comma-joined, or `None` when nothing was listed.
+    fn finish(self, show: impl Fn(&T) -> String) -> Option<String> {
+        (!self.0.is_empty()).then(|| self.0.iter().map(|v| show(v)).collect::<Vec<_>>().join(","))
+    }
 }
 
 /// How a read ended.
@@ -118,7 +155,9 @@ pub(crate) struct ReadLog {
     sub_id: String,
     summary: FilterSummary,
     outcome: ReadOutcome,
-    results: usize,
+    /// REQ: stored events handed to the connection's writer so far.
+    /// COUNT: the total returned.
+    results: u64,
 }
 
 impl ReadLog {
@@ -136,6 +175,39 @@ impl ReadLog {
         filters: &[Filter],
     ) -> Self {
         Self::new("count", conn, sub_id, filters)
+    }
+
+    /// Log a read refused before its handler ran; other frames log nothing.
+    pub(crate) fn refused(
+        msg: &crate::protocol::ClientMessage,
+        conn: &crate::connection::ConnectionState,
+        reason: &'static str,
+    ) {
+        use crate::protocol::ClientMessage as M;
+        match msg {
+            M::Req {
+                sub_id, filters, ..
+            } => Self::refused_read("req", conn, sub_id, filters, reason),
+            M::Count { sub_id, filters } => {
+                Self::refused_read("count", conn, sub_id, filters, reason)
+            }
+            // The signature is unchecked here, so the key is only claimed.
+            M::Auth(event) => {
+                AuthAttempt::nip42(conn, event.pubkey, false).log(AuthResult::Denied(reason))
+            }
+            _ => {}
+        }
+    }
+
+    /// Log a `event` ("req" or "count") refused before its handler ran.
+    pub(crate) fn refused_read(
+        event: &'static str,
+        conn: &crate::connection::ConnectionState,
+        sub_id: &str,
+        filters: &[Filter],
+        reason: &'static str,
+    ) {
+        Self::new(event, conn, sub_id, filters).deny(reason);
     }
 
     fn new(
@@ -170,10 +242,21 @@ impl ReadLog {
         self.outcome = ReadOutcome::Error(reason);
     }
 
-    /// Completed: `results` stored events sent before EOSE, or the COUNT total.
-    pub(crate) fn served(&mut self, results: usize) {
+    /// One stored event was handed to the writer. Counted as it happens, so
+    /// a read that later fails or is cancelled still logs its progress.
+    pub(crate) fn queued_one(&mut self) {
+        self.results += 1;
+    }
+
+    /// Completed: every stored event was queued before EOSE.
+    pub(crate) fn served(&mut self) {
         self.outcome = ReadOutcome::Served;
-        self.results = results;
+    }
+
+    /// A COUNT completed with `total`.
+    pub(crate) fn counted(&mut self, total: u64) {
+        self.outcome = ReadOutcome::Served;
+        self.results = total;
     }
 }
 
@@ -186,7 +269,7 @@ impl Drop for ReadLog {
             ReadOutcome::Error(r) => ("error", Some(r)),
         };
         let s = &self.summary;
-        let (stored_events, count) = match self.event {
+        let (events_queued, count) = match self.event {
             "count" => (None, Some(self.results)),
             _ => (Some(self.results), None),
         };
@@ -212,7 +295,7 @@ impl Drop for ReadLog {
             search = s.search,
             outcome,
             reason,
-            stored_events,
+            events_queued,
             count,
             "access"
         );
@@ -248,6 +331,8 @@ pub(crate) enum AuthResult {
     Success,
     Denied(&'static str),
     Failed(&'static str),
+    /// Cut off before a decision (connection cancelled or session expired).
+    Aborted(&'static str),
 }
 
 impl AuthResult {
@@ -261,6 +346,42 @@ impl AuthResult {
             O::Invalid => Self::Failed(outcome.as_str()),
             _ => Self::Denied(outcome.as_str()),
         }
+    }
+}
+
+/// One auth attempt whose exits are spread across a long handler: it logs
+/// exactly once, at [`AuthLine::finish`], or on drop as `aborted` if the
+/// handler returned (cancellation, teardown) before deciding.
+pub(crate) struct AuthLine {
+    attempt: AuthAttempt<'static>,
+    done: bool,
+}
+
+impl AuthLine {
+    pub(crate) fn new(attempt: AuthAttempt<'static>) -> Self {
+        Self {
+            attempt,
+            done: false,
+        }
+    }
+
+    /// Record that the signature proved `pubkey`.
+    pub(crate) fn proven(&mut self, pubkey: PublicKey) {
+        self.attempt.pubkey = Some(pubkey);
+        self.attempt.pubkey_verified = true;
+    }
+
+    /// Log the final decision; later calls are no-ops.
+    pub(crate) fn finish(&mut self, result: AuthResult) {
+        if !std::mem::replace(&mut self.done, true) {
+            self.attempt.log(result);
+        }
+    }
+}
+
+impl Drop for AuthLine {
+    fn drop(&mut self) {
+        self.finish(AuthResult::Aborted("connection_closed"));
     }
 }
 
@@ -323,6 +444,23 @@ impl AuthAttempt<'_> {
         }
     }
 
+    /// An HTTP signed-request attempt on `route` (a URL path, never a query).
+    pub(crate) fn http<'r>(
+        method: AuthMethod,
+        route: &'r str,
+        pubkey: Option<PublicKey>,
+        pubkey_verified: bool,
+    ) -> AuthAttempt<'r> {
+        AuthAttempt {
+            method,
+            community: None,
+            conn_id: None,
+            route: Some(url_path(route)),
+            pubkey,
+            pubkey_verified,
+        }
+    }
+
     /// Finish the WebSocket login with `outcome`, logging it only if this
     /// call won the connection's single auth terminal.
     pub(crate) fn reject(
@@ -342,6 +480,7 @@ impl AuthAttempt<'_> {
             AuthResult::Success => (Level::INFO, "success", None),
             AuthResult::Denied(r) => (Level::WARN, "denied", Some(r)),
             AuthResult::Failed(r) => (Level::WARN, "failed", Some(r)),
+            AuthResult::Aborted(r) => (Level::WARN, "aborted", Some(r)),
         };
         let pubkey = self.pubkey.as_ref().map(PublicKey::to_hex);
         emit!(
@@ -360,28 +499,105 @@ impl AuthAttempt<'_> {
     }
 }
 
-/// Frames written to one WebSocket: stored events and live pushes alike.
+/// Frames the connection's writer accepted: stored events and live pushes
+/// alike. A frame counts once its flush succeeds, so a frame the socket
+/// rejects, or one stranded by a failed flush, is never counted. This is not
+/// client delivery confirmation.
 #[derive(Debug, Default)]
-pub(crate) struct SentTotals {
+pub(crate) struct QueuedTotals {
     events: AtomicU64,
     bytes: AtomicU64,
 }
 
-impl SentTotals {
-    /// Count a frame as it is handed to the socket.
-    pub(crate) fn record(&self, frame: &axum::extract::ws::Message) {
-        use axum::extract::ws::Message;
-        let len = match frame {
-            Message::Text(text) => {
-                if text.as_str().starts_with("[\"EVENT\"") {
-                    self.events.fetch_add(1, Ordering::Relaxed);
-                }
-                text.len()
-            }
-            Message::Binary(bytes) => bytes.len(),
-            _ => return,
-        };
-        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+impl QueuedTotals {
+    pub(crate) fn events(&self) -> u64 {
+        self.events.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// `(events, bytes)` a frame contributes to [`QueuedTotals`].
+fn frame_size(frame: &axum::extract::ws::Message) -> (u64, u64) {
+    use axum::extract::ws::Message;
+    match frame {
+        Message::Text(text) => (
+            u64::from(text.as_str().starts_with("[\"EVENT\"")),
+            text.len() as u64,
+        ),
+        Message::Binary(bytes) => (0, bytes.len() as u64),
+        _ => (0, 0),
+    }
+}
+
+/// A WebSocket writer that adds each frame to [`QueuedTotals`] once the
+/// inner sink accepts it and a later flush succeeds.
+pub(crate) struct CountingSink<S> {
+    inner: S,
+    totals: std::sync::Arc<QueuedTotals>,
+    pending: (u64, u64),
+}
+
+impl<S> CountingSink<S> {
+    pub(crate) fn new(inner: S, totals: std::sync::Arc<QueuedTotals>) -> Self {
+        Self {
+            inner,
+            totals,
+            pending: (0, 0),
+        }
+    }
+
+    fn settle<E>(&mut self, flushed: &Result<(), E>) {
+        let (events, bytes) = std::mem::take(&mut self.pending);
+        if flushed.is_ok() {
+            self.totals.events.fetch_add(events, Ordering::Relaxed);
+            self.totals.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<S> futures_util::Sink<axum::extract::ws::Message> for CountingSink<S>
+where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    type Error = S::Error;
+
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_ready(cx)
+    }
+
+    fn start_send(
+        mut self: std::pin::Pin<&mut Self>,
+        item: axum::extract::ws::Message,
+    ) -> Result<(), Self::Error> {
+        let (events, bytes) = frame_size(&item);
+        std::pin::Pin::new(&mut self.inner).start_send(item)?;
+        self.pending.0 += events;
+        self.pending.1 += bytes;
+        Ok(())
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let flushed = futures_util::ready!(std::pin::Pin::new(&mut self.inner).poll_flush(cx));
+        self.settle(&flushed);
+        std::task::Poll::Ready(flushed)
+    }
+
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let closed = futures_util::ready!(std::pin::Pin::new(&mut self.inner).poll_close(cx));
+        self.settle(&closed);
+        std::task::Poll::Ready(closed)
     }
 }
 
@@ -404,7 +620,7 @@ pub(crate) fn log_close(
     peer_addr: SocketAddr,
     pubkey: Option<&PublicKey>,
     duration: Duration,
-    sent: &SentTotals,
+    queued: &QueuedTotals,
 ) {
     let pubkey = pubkey.map(PublicKey::to_hex);
     emit!(
@@ -415,8 +631,8 @@ pub(crate) fn log_close(
         peer_addr = %peer_addr,
         pubkey = pubkey.as_deref(),
         duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-        events_sent = sent.events.load(Ordering::Relaxed),
-        bytes_sent = sent.bytes.load(Ordering::Relaxed),
+        events_queued = queued.events(),
+        bytes_queued = queued.bytes(),
         "access"
     );
 }
@@ -484,6 +700,11 @@ pub(crate) mod tests {
     }
 
     impl Captured {
+        /// Everything written so far, on every target.
+        pub(crate) fn raw(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
         /// Access lines written so far, parsed from the production JSON shape.
         pub(crate) fn lines(&self) -> Vec<serde_json::Value> {
             String::from_utf8(self.0.lock().unwrap().clone())
@@ -495,19 +716,30 @@ pub(crate) mod tests {
         }
     }
 
-    /// Run `f` with JSON logs (flattened, as in production) captured.
-    pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, Captured) {
-        let _lock = crate::test_support::tracing_dispatch_lock();
-        let out = Captured::default();
+    fn json_subscriber(out: &Captured) -> impl tracing::Subscriber + Send + Sync {
         let writer = out.clone();
-        let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .json()
                 .flatten_event(true)
                 .with_writer(move || writer.clone()),
-        );
-        let r = tracing::subscriber::with_default(subscriber, f);
+        )
+    }
+
+    /// Run `f` with JSON logs (flattened, as in production) captured.
+    pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, Captured) {
+        let _lock = crate::test_support::tracing_dispatch_lock();
+        let out = Captured::default();
+        let r = tracing::subscriber::with_default(json_subscriber(&out), f);
         (r, out)
+    }
+
+    /// Capture JSON logs on this thread until the guard drops, for async
+    /// tests on a current-thread runtime that `.await` the code under test
+    /// directly (spawned tasks on other threads are not captured).
+    pub(crate) fn capture_scoped() -> (tracing::subscriber::DefaultGuard, Captured) {
+        let out = Captured::default();
+        (tracing::subscriber::set_default(json_subscriber(&out)), out)
     }
 
     fn filter(json: serde_json::Value) -> Filter {
@@ -542,7 +774,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn summary_caps_lists_and_counts_every_distinct_value() {
+    fn summary_caps_lists_and_counts_every_value() {
         let channels: Vec<String> = (0..14).map(|_| Uuid::new_v4().to_string()).collect();
         let ps: Vec<String> = (0..12).map(|_| pk()).collect();
         let s = FilterSummary::new(&[filter(serde_json::json!({
@@ -556,6 +788,33 @@ pub(crate) mod tests {
             (s.authors.as_deref(), s.author_count, s.ids),
             (Some(PK_A), 1, 1)
         );
+    }
+
+    #[test]
+    fn summary_of_long_lists_lists_ten_distinct_and_sums_counts() {
+        let authors: Vec<String> = (0..5_000).map(|_| pk()).collect();
+        let shared = authors[0].clone();
+        let s = FilterSummary::new(&[
+            filter(serde_json::json!({"authors": authors})),
+            filter(serde_json::json!({"authors": [shared]})),
+        ]);
+        // Cross-filter duplicates count twice.
+        assert_eq!(s.author_count, 5_001);
+        let listed: Vec<&str> = s.authors.as_deref().unwrap().split(',').collect();
+        assert_eq!(listed.len(), LIST_CAP);
+        assert_eq!(listed.iter().collect::<BTreeSet<_>>().len(), LIST_CAP);
+    }
+
+    #[test]
+    fn summary_lists_every_kind_past_the_identifier_cap() {
+        let kinds: Vec<u16> = (1..=25).collect();
+        let s = FilterSummary::new(&[
+            filter(serde_json::json!({"kinds": kinds})),
+            filter(serde_json::json!({"kinds": [40_000, 1]})),
+        ]);
+        let listed = s.kinds.unwrap();
+        assert_eq!(listed.split(',').count(), 26);
+        assert!(listed.ends_with(",25,40000"));
     }
 
     #[test]
@@ -582,7 +841,10 @@ pub(crate) mod tests {
                 outcome: ReadOutcome::Aborted,
                 results: 0,
             };
-            log.served(3);
+            for _ in 0..3 {
+                log.queued_one();
+            }
+            log.served();
         });
         let raw = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         assert!(!raw.contains(needle), "search text leaked: {raw}");
@@ -592,7 +854,7 @@ pub(crate) mod tests {
         assert_eq!(line["event"], "req");
         assert_eq!(line["search"], true);
         assert_eq!(line["outcome"], "served");
-        assert_eq!(line["stored_events"], 3);
+        assert_eq!(line["events_queued"], 3);
         assert_eq!(line["pubkey"], PK_A);
         assert_eq!(line["kinds"], "9");
         assert!(line.get("since").is_none() && line.get("reason").is_none());
@@ -667,6 +929,19 @@ pub(crate) mod tests {
         );
         assert_eq!(line["pubkey_verified"], true);
         assert!(line.get("reason").is_none() && line.get("route").is_none());
+    }
+
+    #[test]
+    fn auth_line_logs_once_and_aborts_when_dropped_undecided() {
+        let attempt = || AuthAttempt::http(AuthMethod::Nip42, "audio", None, false);
+        let ((), out) = capture(|| {
+            let mut line = AuthLine::new(attempt());
+            line.finish(AuthResult::Denied("deny_set"));
+            line.finish(AuthResult::Success);
+            drop(AuthLine::new(attempt()));
+        });
+        let outcomes: Vec<_> = out.lines().iter().map(|l| l["outcome"].clone()).collect();
+        assert_eq!(outcomes, ["denied", "aborted"]);
     }
 
     #[test]

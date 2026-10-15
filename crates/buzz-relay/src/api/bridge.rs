@@ -65,12 +65,13 @@ pub(crate) async fn authenticate_member_post(
         ),
     )?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(path);
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 
     enforce_http_admission(state, &tenant, &pubkey)
         .await
         .map_err(|e| e.into_response())?;
-    check_nip98_replay(state, &tenant, event_id_bytes)
+    check_nip98_replay(state, &tenant, event_id_bytes, auth)
         .await
         .map_err(|e| e.into_response())?;
     super::relay_members::enforce_relay_membership(
@@ -398,7 +399,9 @@ pub(crate) fn verify_nip98_exempt_operator(
     )
 }
 
-/// Check NIP-98 replay and record the event ID atomically.
+/// Check NIP-98 replay and record the event ID atomically, then log `auth`'s
+/// final decision: this check is the last auth step on every surface that
+/// calls it, so it owns the single access line for the attempt.
 ///
 /// The correctness boundary is the shared, community-scoped Redis seen-set on
 /// `AppState`, not process-local memory. Any Redis/guard error fails closed:
@@ -408,15 +411,56 @@ pub(crate) async fn check_nip98_replay(
     state: &AppState,
     tenant: &TenantContext,
     event_id_bytes: [u8; 32],
+    auth: crate::access::AuthAttempt<'_>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    check_nip98_replay_with_guard(state.nip98_replay.as_ref(), tenant, event_id_bytes).await
+    check_and_log_replay(state.nip98_replay.as_ref(), tenant, event_id_bytes, auth).await
+}
+
+async fn check_and_log_replay(
+    replay_guard: &dyn Nip98ReplayGuard,
+    tenant: &TenantContext,
+    event_id_bytes: [u8; 32],
+    auth: crate::access::AuthAttempt<'_>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let checked = check_nip98_replay_with_guard(replay_guard, tenant, event_id_bytes).await;
+    let auth = crate::access::AuthAttempt {
+        community: Some(tenant.community()),
+        ..auth
+    };
+    match &checked {
+        Ok(()) => auth.log(crate::access::AuthResult::Success),
+        Err(ReplayRejection::Replayed) => {
+            auth.log(crate::access::AuthResult::Failed("nip98_replay"))
+        }
+        Err(ReplayRejection::Unavailable) => auth.log(crate::access::AuthResult::Denied(
+            "replay_check_unavailable",
+        )),
+    }
+    checked.map_err(ReplayRejection::into_api_error)
+}
+
+/// Why the replay check refused a proof.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayRejection {
+    Replayed,
+    Unavailable,
+}
+
+impl ReplayRejection {
+    fn into_api_error(self) -> (StatusCode, Json<Value>) {
+        let message = match self {
+            Self::Replayed => "NIP-98: replay detected",
+            Self::Unavailable => "NIP-98: replay check unavailable",
+        };
+        api_error(StatusCode::UNAUTHORIZED, message)
+    }
 }
 
 async fn check_nip98_replay_with_guard(
     replay_guard: &dyn Nip98ReplayGuard,
     tenant: &TenantContext,
     event_id_bytes: [u8; 32],
-) -> Result<(), (StatusCode, Json<Value>)> {
+) -> Result<(), ReplayRejection> {
     // Skip replay detection for dev-mode X-Pubkey auth (zero hash).
     if event_id_bytes == [0u8; 32] {
         return Ok(());
@@ -428,20 +472,14 @@ async fn check_nip98_replay_with_guard(
         .await
     {
         Ok(true) => Ok(()),
-        Ok(false) => Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "NIP-98: replay detected",
-        )),
+        Ok(false) => Err(ReplayRejection::Replayed),
         Err(e) => {
             tracing::warn!(
                 community = %tenant.community(),
                 error = %e,
                 "NIP-98 replay guard failed; rejecting request fail-closed"
             );
-            Err(api_error(
-                StatusCode::UNAUTHORIZED,
-                "NIP-98: replay check unavailable",
-            ))
+            Err(ReplayRejection::Unavailable)
         }
     }
 }
@@ -1090,6 +1128,7 @@ pub async fn submit_event(
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(&url);
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
 
@@ -1104,6 +1143,7 @@ pub async fn submit_event(
         &body,
         pubkey,
         event_id_bytes,
+        auth,
         signed_created_at,
     )
     .await;
@@ -1222,6 +1262,7 @@ async fn submit_event_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    auth: crate::access::AuthAttempt<'_>,
     signed_auth_created_at: Option<u64>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
@@ -1232,7 +1273,7 @@ async fn submit_event_authed(
             response: e,
         };
     }
-    if let Err(e) = check_nip98_replay(state, tenant, event_id_bytes).await {
+    if let Err(e) = check_nip98_replay(state, tenant, event_id_bytes, auth).await {
         return SubmitOutcome::Err {
             status: e.0,
             response: e,
@@ -1442,6 +1483,7 @@ pub async fn query_events(
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(&url);
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
 
@@ -1456,6 +1498,7 @@ pub async fn query_events(
         &body,
         pubkey,
         event_id_bytes,
+        auth,
         signed_created_at,
     )
     .await;
@@ -1494,10 +1537,11 @@ async fn query_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    auth: crate::access::AuthAttempt<'_>,
     signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
-    check_nip98_replay(state, tenant, event_id_bytes).await?;
+    check_nip98_replay(state, tenant, event_id_bytes, auth).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
@@ -2123,6 +2167,7 @@ pub async fn count_events(
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(&url);
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
 
@@ -2137,6 +2182,7 @@ pub async fn count_events(
         &body,
         pubkey,
         event_id_bytes,
+        auth,
         signed_created_at,
     )
     .await;
@@ -2173,10 +2219,11 @@ async fn count_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    auth: crate::access::AuthAttempt<'_>,
     signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
-    check_nip98_replay(state, tenant, event_id_bytes).await?;
+    check_nip98_replay(state, tenant, event_id_bytes, auth).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
@@ -2963,9 +3010,10 @@ async fn authorize_moderation_read(
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(&url);
     let event_id_bytes = admission.into_extra();
 
-    check_nip98_replay(state, &tenant, event_id_bytes)
+    check_nip98_replay(state, &tenant, event_id_bytes, auth)
         .await
         .map_err(|e| e.into_response())?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -3441,10 +3489,10 @@ pub(crate) mod postgres_tests {
             .await
             .expect("first pod should claim fresh NIP-98 event id");
 
-        let (status, _) = check_nip98_replay_with_guard(&pod_b, &tenant_a, event_id_bytes)
+        let rejection = check_nip98_replay_with_guard(&pod_b, &tenant_a, event_id_bytes)
             .await
             .expect_err("second pod must reject same-community replay");
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(rejection, ReplayRejection::Replayed);
 
         check_nip98_replay_with_guard(&pod_b, &tenant_b, event_id_bytes)
             .await
@@ -3466,10 +3514,71 @@ pub(crate) mod postgres_tests {
             .await
             .expect("first claim on a fresh event id must succeed");
 
-        let (status, _) = check_nip98_replay_with_guard(&pod, &tenant, event_id_bytes)
+        let rejection = check_nip98_replay_with_guard(&pod, &tenant, event_id_bytes)
             .await
             .expect_err("same-pod replay of the same id+community must reject");
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(rejection, ReplayRejection::Replayed);
+    }
+
+    /// Replay guard returning a fixed answer, for access-line tests.
+    struct FixedReplayGuard(Option<bool>);
+
+    impl Nip98ReplayGuard for FixedReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            let answer = self.0;
+            Box::pin(async move {
+                answer.ok_or_else(|| buzz_auth::AuthError::Internal("simulated outage".into()))
+            })
+        }
+    }
+
+    async fn replay_auth_lines(answer: Option<bool>) -> Vec<serde_json::Value> {
+        let (_guard, out) = crate::access::tests::capture_scoped();
+        let tenant = fresh_tenant("relay-a.example");
+        let auth = crate::access::AuthAttempt::http(
+            crate::access::AuthMethod::Nip98,
+            "/query?secret=1",
+            Some(Keys::generate().public_key()),
+            true,
+        );
+        let _ = check_and_log_replay(
+            &FixedReplayGuard(answer),
+            &tenant,
+            fresh_nip98_event_id_bytes(),
+            auth,
+        )
+        .await;
+        out.lines()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip98_replay_check_logs_one_terminal_auth_line_per_outcome() {
+        for (answer, outcome, reason) in [
+            (Some(true), "success", None),
+            (Some(false), "failed", Some("nip98_replay")),
+            (None, "denied", Some("replay_check_unavailable")),
+        ] {
+            let lines = replay_auth_lines(answer).await;
+            assert_eq!(lines.len(), 1, "{answer:?}: {lines:?}");
+            let line = &lines[0];
+            assert_eq!(line["event"], "auth");
+            assert_eq!(line["method"], "nip98");
+            assert_eq!(line["outcome"], outcome);
+            assert_eq!(line["route"], "/query", "query string must not be logged");
+            assert!(line["community"].is_string());
+            match reason {
+                Some(r) => assert_eq!(line["reason"], r),
+                None => assert!(line.get("reason").is_none()),
+            }
+            assert!(!line.to_string().contains("simulated outage"));
+        }
     }
 
     mod external_infra_redis_tests {
@@ -3523,9 +3632,11 @@ pub(crate) mod postgres_tests {
         let tenant = fresh_tenant("relay-a.example");
         let event_id_bytes = fresh_nip98_event_id_bytes();
 
-        let (status, body) = check_nip98_replay_with_guard(&guard, &tenant, event_id_bytes)
+        let rejection = check_nip98_replay_with_guard(&guard, &tenant, event_id_bytes)
             .await
             .expect_err("guard error MUST fail closed, never admit");
+        assert_eq!(rejection, ReplayRejection::Unavailable);
+        let (status, body) = rejection.into_api_error();
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -8451,7 +8562,18 @@ pub(crate) mod postgres_tests {
             Arc<crate::connection::ConnectionState>,
             tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
         ) {
-            let (send_tx, send_rx) = tokio::sync::mpsc::channel(64);
+            self.ws_conn_with_capacity(64)
+        }
+
+        /// A connection whose writer queue holds `capacity` frames.
+        fn ws_conn_with_capacity(
+            &self,
+            capacity: usize,
+        ) -> (
+            Arc<crate::connection::ConnectionState>,
+            tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
+        ) {
+            let (send_tx, send_rx) = tokio::sync::mpsc::channel(capacity);
             let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(4);
             let cancel = tokio_util::sync::CancellationToken::new();
             let conn = Arc::new(crate::connection::ConnectionState {
@@ -8601,6 +8723,50 @@ pub(crate) mod postgres_tests {
             "WS COUNT {arm} ordinary error: {frame}"
         );
 
+        fx.drop().await;
+    }
+
+    /// A history read that queues one event and then fails to enqueue the
+    /// next logs `aborted` with the event it already queued, not zero.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn aborted_history_read_logs_events_already_queued() {
+        let fx = cancel_fixture().await;
+        let channel: uuid::Uuid = fx.channel.parse().expect("channel uuid");
+        let author = Keys::generate();
+        for text in ["second", "third"] {
+            let event = EventBuilder::new(Kind::Custom(9), text)
+                .tag(Tag::parse(["h", &fx.channel]).expect("h"))
+                .sign_with_keys(&author)
+                .expect("sign");
+            for pool in [&fx.writer, &fx.replica] {
+                buzz_db::Db::from_pool(pool.clone())
+                    .insert_event(fx.community, &event, Some(channel))
+                    .await
+                    .expect("insert event");
+            }
+        }
+        // The queue holds one frame and nobody drains it: the first EVENT is
+        // queued and the second enqueue fails, ending the read.
+        let (conn, _rx) = fx.ws_conn_with_capacity(1);
+        let filter: nostr::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [9], "#h": [&fx.channel]}))
+                .expect("filter");
+        let (guard, out) = crate::access::tests::capture_scoped();
+        crate::handlers::req::handle_req(
+            "p".into(),
+            vec![filter],
+            vec![None],
+            conn,
+            fx.state.clone(),
+        )
+        .await;
+        drop(guard);
+        let lines = out.lines();
+        let reads: Vec<_> = lines.iter().filter(|l| l["event"] == "req").collect();
+        assert_eq!(reads.len(), 1, "one access line per REQ: {lines:?}");
+        assert_eq!(reads[0]["outcome"], "aborted");
+        assert_eq!(reads[0]["events_queued"], 1);
         fx.drop().await;
     }
 
@@ -8864,6 +9030,12 @@ pub(crate) mod postgres_tests {
                 serde_json::to_vec(&event).expect("event json").as_slice(),
                 agent.public_key(),
                 fresh_nip98_event_id_bytes(),
+                crate::access::AuthAttempt::http(
+                    crate::access::AuthMethod::Nip98,
+                    "/api/events",
+                    Some(agent.public_key()),
+                    true,
+                ),
                 Some(nostr::Timestamp::now().as_secs()),
             )
             .await;

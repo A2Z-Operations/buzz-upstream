@@ -11,6 +11,7 @@
 //!        └─ cleanup: remove peer, broadcast left, emit lifecycle events
 //! ```
 
+use crate::access::{auth_error_code, AuthAttempt, AuthLine, AuthMethod, AuthResult};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -582,6 +583,16 @@ pub(crate) async fn handle_active_audio_connection(
     crate::nip_fi_test_hooks::before_auth_verify(tenant.community()).await;
     // Every exit before the join commit leaves the shadow session unadmitted.
     let shadow_attempt = crate::nip_fi_shadow_session::AuthAttempt(control.nip_fi_shadow());
+    // The audio login's single access line: decided at the final admission
+    // check below; any earlier return without a decision logs `aborted`.
+    let mut auth_line = AuthLine::new(AuthAttempt {
+        method: AuthMethod::Nip42,
+        community: Some(tenant.community()),
+        conn_id: None,
+        route: Some("audio"),
+        pubkey: Some(auth_msg.event.pubkey),
+        pubkey_verified: false,
+    });
 
     let auth_ctx = tokio::select! {
         biased;
@@ -599,7 +610,8 @@ pub(crate) async fn handle_active_audio_connection(
             match result {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    warn!(channel_id = %channel_id, "audio auth failed: {e}");
+                    warn!(channel_id = %channel_id, reason = auth_error_code(&e), "audio auth failed");
+                    auth_line.finish(AuthResult::Failed(auth_error_code(&e)));
                     shadow_attempt.refused();
                     // Under NIP-FI the failure is classified exactly as on the
                     // root route; Off-mode keeps the legacy bespoke frame.
@@ -630,6 +642,7 @@ pub(crate) async fn handle_active_audio_connection(
     };
 
     let pubkey = auth_ctx.pubkey;
+    auth_line.proven(pubkey);
     let pubkey_hex = pubkey.to_hex();
     let pubkey_bytes = pubkey.to_bytes().to_vec();
     let parent_channel_id = auth_msg.parent_channel_id;
@@ -664,6 +677,7 @@ pub(crate) async fn handle_active_audio_connection(
     .await
         == crate::nip_fi_session::PairingOutcome::Denied
     {
+        auth_line.finish(AuthResult::Denied("key_mismatch"));
         return;
     }
 
@@ -678,6 +692,7 @@ pub(crate) async fn handle_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
+            auth_line.finish(AuthResult::Denied("session_expired"));
             deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
@@ -710,6 +725,7 @@ pub(crate) async fn handle_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "NIP-FI deny-set hit at audio post-registration check — denying"
                 );
+                auth_line.finish(AuthResult::Denied("deny_set"));
                 deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
                 return;
             }
@@ -755,6 +771,10 @@ pub(crate) async fn handle_active_audio_connection(
         }
     };
     if let Some(class) = relay_refusal {
+        auth_line.finish(AuthResult::Denied(match class {
+            buzz_auth::DenialClass::AuthorizationUnavailable => "relay_membership_unavailable",
+            _ => "relay_membership_denied",
+        }));
         shadow_attempt.refused();
         #[cfg(test)]
         crate::nip_fi_test_hooks::before_audio_refusal_frames(tenant.community()).await;
@@ -784,6 +804,7 @@ pub(crate) async fn handle_active_audio_connection(
     {
         Ok(admission) => admission,
         Err(refusal) => {
+            auth_line.finish(AuthResult::Denied("channel_membership_denied"));
             shadow_attempt.refused();
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {refusal}");
             exit_authorization_refusal(
@@ -835,6 +856,7 @@ pub(crate) async fn handle_active_audio_connection(
                 .await
         };
         if !linked {
+            auth_line.finish(AuthResult::Denied("nip_oa_owner_unlinked"));
             shadow_attempt.refused();
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, nip_oa_owner = %owner.to_hex(),
                 "audio: NIP-OA owner could not be materialized, denying");
@@ -879,6 +901,7 @@ pub(crate) async fn handle_active_audio_connection(
         }
     };
     if let Some(denial) = denial {
+        auth_line.finish(AuthResult::from_outcome(denial.outcome));
         shadow_attempt.refused();
         let (class, message) = (denial.class, denial.reason);
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, reason = message, "audio: denied at final admission check");
@@ -894,6 +917,9 @@ pub(crate) async fn handle_active_audio_connection(
         return;
     }
     check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
+
+    // Every auth and admission check passed; what follows is room joining.
+    auth_line.finish(AuthResult::Success);
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //

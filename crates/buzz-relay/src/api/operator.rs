@@ -4,6 +4,7 @@
 //! request signing and replay protection, but they do not run through event
 //! ingest, relay membership, channel scoping, storage, or fan-out.
 
+use crate::access::{AuthAttempt, AuthMethod, AuthResult};
 use std::sync::Arc;
 
 use axum::{
@@ -209,7 +210,8 @@ async fn authorize_operator_request(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_operator(headers, method, &url, body)?;
-    check_operator_replay(state, event_id_bytes).await?;
+    let auth = AuthAttempt::http(AuthMethod::Nip98, path, Some(pubkey), true);
+    check_operator_replay(state, event_id_bytes, &auth).await?;
 
     let pubkey_hex = pubkey.to_hex();
     if !state
@@ -218,12 +220,13 @@ async fn authorize_operator_request(
         .iter()
         .any(|pk| pk == &pubkey_hex)
     {
+        auth.log(AuthResult::Denied("not_operator"));
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "actor not authorized: not a relay operator",
         ));
     }
-
+    auth.log(AuthResult::Success);
     Ok(pubkey)
 }
 
@@ -247,17 +250,20 @@ async fn authorize_operator_listener_request(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_operator(headers, method, &url, Some(body))?;
-    check_operator_replay(state, event_id_bytes).await?;
+    let auth = AuthAttempt::http(AuthMethod::Nip98, path, Some(pubkey), true);
+    check_operator_replay(state, event_id_bytes, &auth).await?;
     if !state
         .config
         .operator_listener_delivery_urls
         .contains_key(&pubkey.to_hex())
     {
+        auth.log(AuthResult::Denied("not_operator_listener"));
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "actor not authorized: not a configured operator listener",
         ));
     }
+    auth.log(AuthResult::Success);
     Ok(pubkey)
 }
 
@@ -315,6 +321,7 @@ pub async fn remove_listener_pubkeys(
 async fn check_operator_replay(
     state: &AppState,
     event_id_bytes: [u8; 32],
+    auth: &AuthAttempt<'_>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let event_id = nostr::EventId::from_byte_array(event_id_bytes);
     match state
@@ -327,11 +334,15 @@ async fn check_operator_replay(
         .await
     {
         Ok(true) => Ok(()),
-        Ok(false) => Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "NIP-98: replay detected",
-        )),
+        Ok(false) => {
+            auth.log(AuthResult::Failed("nip98_replay"));
+            Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "NIP-98: replay detected",
+            ))
+        }
         Err(error) => {
+            auth.log(AuthResult::Denied("replay_check_unavailable"));
             tracing::warn!(
                 scope = OPERATOR_REPLAY_SCOPE,
                 error = %error,

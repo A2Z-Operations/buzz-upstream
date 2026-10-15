@@ -3140,7 +3140,9 @@ async fn ingest_event_inner(
                     &labels,
                 )
                 .await
-                .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+                .map_err(|e| {
+                    IngestError::Internal(format!("error: {}", crate::access::db_error_kind(&e)))
+                })?;
 
             if !was_created {
                 return Ok(IngestResult {
@@ -3421,7 +3423,9 @@ async fn ingest_event_inner(
             .db
             .replace_addressable_event(tenant.community(), &event, channel_id)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(|e| {
+                IngestError::Internal(format!("error: {}", crate::access::db_error_kind(&e)))
+            })?
     } else if is_parameterized_replaceable(kind_u32) {
         // NIP-33 parameterized replaceable — keyed by (kind, pubkey, d_tag).
         let d_tag = buzz_db::event::extract_d_tag(&event).unwrap_or_default();
@@ -3436,7 +3440,9 @@ async fn ingest_event_inner(
             .db
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(|e| {
+                IngestError::Internal(format!("error: {}", crate::access::db_error_kind(&e)))
+            })?
     } else if let Some(spec) = canvas_revision_spec.as_ref() {
         // Canvas write carrying an optimistic-concurrency precondition. Plain
         // canvas writes (no `expected-revision` tag) fall through to the generic
@@ -3453,7 +3459,9 @@ async fn ingest_event_inner(
             .db
             .insert_canvas_head_checked(tenant.community(), &event, channel, precondition)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            .map_err(|e| {
+                IngestError::Internal(format!("error: {}", crate::access::db_error_kind(&e)))
+            })?;
         match status {
             buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
                 return Err(IngestError::CanvasConflict(

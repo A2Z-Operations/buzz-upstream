@@ -531,7 +531,6 @@ pub async fn handle_req(
                         error_kind = %crate::access::db_error_kind(&e),
                         "Historical query failed"
                     );
-                    access.served(total_sent);
                     if e.is_statement_cancelled() {
                         access.error("query_timed_out");
                         return true;
@@ -618,6 +617,7 @@ pub async fn handle_req(
                 if !conn.send(msg) {
                     return false;
                 }
+                access.queued_one();
                 total_sent += 1;
                 if total_sent.is_multiple_of(100) {
                     tokio::task::yield_now().await;
@@ -626,7 +626,7 @@ pub async fn handle_req(
         }
 
         conn.send(RelayMessage::eose(&sub_id));
-        access.served(total_sent);
+        access.served();
 
         debug!(
             conn_id = %conn_id,
@@ -785,7 +785,7 @@ async fn handle_search_req(
         && readable_system.is_empty()
     {
         conn.send(RelayMessage::eose(sub_id));
-        access.served(0);
+        access.served();
         return;
     }
 
@@ -917,7 +917,6 @@ async fn handle_search_req(
                     Err(e) if e.is_statement_cancelled() => {
                         // CLOSED (not EOSE) keeps partial results from reading as complete.
                         warn!(sub_id = %sub_id, "NIP-50 batch fetch timed out");
-                        access.served(seen_ids.len());
                         access.error("query_timed_out");
                         close_timed_out_subscription(sub_id, owner, conn, state).await;
                         return;
@@ -1010,6 +1009,7 @@ async fn handle_search_req(
                     if !conn.send(RelayMessage::event(sub_id, &stored.event)) {
                         return;
                     }
+                    access.queued_one();
                     emitted += 1;
                 }
             }
@@ -1021,9 +1021,9 @@ async fn handle_search_req(
     }
 
     conn.send(RelayMessage::eose(sub_id));
-    access.served(seen_ids.len());
-    if let Some(reason) = failure {
-        access.error(reason);
+    match failure {
+        Some(reason) => access.error(reason),
+        None => access.served(),
     }
 }
 
@@ -1474,7 +1474,6 @@ async fn handle_huddle_liveness_req(
         }
     };
 
-    let mut sent = 0;
     for (session_id, parent_channel_id, _creator) in linked_sessions {
         let generation = if let Some(mesh) = state.mesh() {
             match mesh
@@ -1535,11 +1534,11 @@ async fn handle_huddle_liveness_req(
         if !conn.send(RelayMessage::event(sub_id, &event)) {
             return;
         }
-        sent += 1;
+        access.queued_one();
     }
 
     conn.send(RelayMessage::eose(sub_id));
-    access.served(sent);
+    access.served();
 }
 
 /// Claim `sub_id` for a live REQ under the lifecycle lock: record a fresh

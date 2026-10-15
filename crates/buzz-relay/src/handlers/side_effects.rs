@@ -1098,7 +1098,13 @@ pub async fn emit_membership_notification(
     let (stored, was_inserted) = state
         .db
         .insert_event(tenant.community(), &event, None)
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "membership notification insert failed: {}",
+                crate::access::db_error_kind(&e)
+            )
+        })?;
     if !was_inserted {
         return Ok(());
     }
@@ -1184,7 +1190,13 @@ async fn emit_addressable_discovery_event(
     let (stored, was_inserted) = state
         .db
         .replace_addressable_event(tenant.community(), &event, Some(channel_id))
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "channel state write failed: {}",
+                crate::access::db_error_kind(&e)
+            )
+        })?;
     if was_inserted {
         let kind_u32 = event_kind_u32(&stored.event);
         dispatch_persistent_event(tenant, state, &stored, kind_u32, relay_pubkey_hex, None).await;
@@ -3753,7 +3765,13 @@ pub async fn publish_nipia_archival_list(
         let (stored, was_inserted) = state
             .db
             .replace_addressable_event(tenant.community(), &event, None)
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "archive snapshot write failed: {}",
+                    crate::access::db_error_kind(&e)
+                )
+            })?;
         if !was_inserted {
             continue;
         }
@@ -3858,7 +3876,13 @@ pub async fn publish_dm_visibility_snapshot(
     let (stored, was_inserted) = state
         .db
         .replace_parameterized_event(tenant.community(), &event, &viewer_hex, None)
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "DM visibility write failed: {}",
+                crate::access::db_error_kind(&e)
+            )
+        })?;
     if was_inserted {
         dispatch_persistent_event(
             tenant,

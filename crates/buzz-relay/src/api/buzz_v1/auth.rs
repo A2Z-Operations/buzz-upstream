@@ -119,11 +119,12 @@ pub(super) async fn authorize(
         }
     })?;
     let actor = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(uri.path());
     let (event_id, signed_at) = admission.into_extra();
     bridge::enforce_http_admission(state, &tenant, &actor)
         .await
         .map_err(bridge_error)?;
-    bridge::check_nip98_replay(state, &tenant, event_id)
+    bridge::check_nip98_replay(state, &tenant, event_id, auth)
         .await
         .map_err(bridge_error)?;
     let principal = Principal {

@@ -658,12 +658,8 @@ async fn handle_active_connection(
     let (ws_send, ws_recv) = socket.split();
 
     let send_cancel = cancel.child_token();
-    let sent = Arc::new(crate::access::SentTotals::default());
-    let counted = Arc::clone(&sent);
-    let ws_send = ws_send.with(move |frame: WsMessage| {
-        counted.record(&frame);
-        std::future::ready(Ok::<_, axum::Error>(frame))
-    });
+    let queued = Arc::new(crate::access::QueuedTotals::default());
+    let ws_send = crate::access::CountingSink::new(ws_send, Arc::clone(&queued));
     let send_task = tokio::spawn(send_loop(
         ws_send,
         rx,
@@ -784,7 +780,7 @@ async fn handle_active_connection(
         addr,
         closed_as.as_ref(),
         opened.elapsed(),
-        &sent,
+        &queued,
     );
 
     drop(permit);
@@ -1217,7 +1213,8 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
         }
     };
 
-    if !enforce_ws_admission(&msg, &conn, &state).await {
+    if let Err(reason) = enforce_ws_admission(&msg, &conn, &state).await {
+        crate::access::ReadLog::refused(&msg, &conn, reason);
         return;
     }
 
@@ -1226,9 +1223,10 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
             // AUTH remains inline so only one frame can race the connection's
             // pending lifecycle, but cancellation can preempt dependency waits.
             let span = tracing::info_span!("ws.auth", conn_id = %conn.conn_id);
+            let claimed = event.pubkey;
             tokio::select! {
                 biased;
-                _ = conn.cancel.cancelled() => {}
+                _ = conn.cancel.cancelled() => log_aborted_auth(&conn, claimed),
                 _ = handlers::auth::handle_auth(event, Arc::clone(&conn), Arc::clone(&state))
                     .instrument(span) => {}
             }
@@ -1278,6 +1276,13 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                         RejectionTarget::Subscription(&sub_id),
                         "rate-limited: too many concurrent requests",
                     ));
+                    crate::access::ReadLog::refused_read(
+                        "req",
+                        &conn,
+                        &sub_id,
+                        &filters,
+                        "too_many_concurrent_requests",
+                    );
                     return;
                 }
             };
@@ -1300,6 +1305,13 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                         RejectionTarget::Subscription(&sub_id),
                         "rate-limited: too many concurrent requests",
                     ));
+                    crate::access::ReadLog::refused_read(
+                        "count",
+                        &conn,
+                        &sub_id,
+                        &filters,
+                        "too_many_concurrent_requests",
+                    );
                     return;
                 }
             };
@@ -1316,6 +1328,21 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
             handlers::close::handle_close(sub_id, Arc::clone(&conn), Arc::clone(&state)).await;
         }
     }
+}
+
+/// Log an AUTH cut off by cancellation, unless its handler already reached
+/// the connection's single auth terminal.
+fn log_aborted_auth(conn: &ConnectionState, claimed: nostr::PublicKey) {
+    if !matches!(conn.auth_state_snapshot(), AuthState::Pending { .. }) {
+        return;
+    }
+    let reason = if conn.nip_fi_gate.deadline_passed() {
+        "session_expired"
+    } else {
+        "connection_closed"
+    };
+    crate::access::AuthAttempt::nip42(conn, claimed, false)
+        .log(crate::access::AuthResult::Aborted(reason));
 }
 
 #[cfg(test)]
@@ -1981,6 +2008,7 @@ pub(crate) mod tests {
         messages: Vec<WsMessage>,
         flush_count: usize,
         fail_after_flushes: Option<usize>,
+        reject_sends: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -2014,11 +2042,14 @@ pub(crate) mod tests {
         }
 
         fn start_send(self: std::pin::Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
-            self.state
-                .lock()
-                .expect("mock sink poisoned")
-                .messages
-                .push(item);
+            let mut state = self.state.lock().expect("mock sink poisoned");
+            if state.reject_sends {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock send rejected",
+                ));
+            }
+            state.messages.push(item);
             Ok(())
         }
 
@@ -2081,6 +2112,176 @@ pub(crate) mod tests {
         ) -> std::task::Poll<Result<(), Self::Error>> {
             std::task::Poll::Pending
         }
+    }
+
+    /// Run the production writer over a counting `sink` for `frames`, then
+    /// return the close-line totals it recorded.
+    async fn queued_totals(
+        sink: MockSink,
+        state: &Arc<Mutex<MockSinkState>>,
+        frames: &[&str],
+    ) -> Arc<crate::access::QueuedTotals> {
+        let (data_tx, data_rx) = mpsc::channel(frames.len().max(1));
+        for frame in frames {
+            data_tx
+                .send(WsMessage::Text((*frame).into()))
+                .await
+                .expect("queue frame");
+        }
+        let totals = Arc::new(crate::access::QueuedTotals::default());
+        let cancel = CancellationToken::new();
+        let writer = tokio::spawn(send_loop_inner(
+            crate::access::CountingSink::new(sink, Arc::clone(&totals)),
+            data_rx,
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            cancel.clone(),
+            ordinary_disconnect_reason(),
+        ));
+        while state.lock().expect("mock sink poisoned").flush_count == 0
+            && !state.lock().expect("mock sink poisoned").reject_sends
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        writer.await.expect("writer exits");
+        totals
+    }
+
+    const EVENT_FRAME: &str = r#"["EVENT","s",{}]"#;
+
+    #[tokio::test]
+    async fn close_totals_count_frames_the_writer_flushed() {
+        let (sink, state) = MockSink::new(None);
+        let totals =
+            queued_totals(sink, &state, &[EVENT_FRAME, EVENT_FRAME, r#"["EOSE","s"]"#]).await;
+        assert_eq!(totals.events(), 2);
+        assert_eq!(
+            totals.bytes(),
+            (EVENT_FRAME.len() * 2 + r#"["EOSE","s"]"#.len()) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn close_totals_skip_a_frame_the_socket_rejects() {
+        let (sink, state) = MockSink::new(None);
+        state.lock().expect("mock sink poisoned").reject_sends = true;
+        let totals = queued_totals(sink, &state, &[EVENT_FRAME]).await;
+        assert_eq!((totals.events(), totals.bytes()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn close_totals_skip_frames_stranded_by_a_failed_flush() {
+        let (sink, state) = MockSink::new(Some(1));
+        let totals = queued_totals(sink, &state, &[EVENT_FRAME, EVENT_FRAME]).await;
+        assert_eq!(state.lock().expect("mock sink poisoned").messages.len(), 2);
+        assert_eq!((totals.events(), totals.bytes()), (0, 0));
+    }
+
+    /// Feed `frame` through the production frame dispatcher and return the
+    /// read access lines it produced once every spawned handler finished.
+    async fn read_lines_for(
+        frame: &str,
+        auth: AuthState,
+        state: Arc<AppState>,
+    ) -> Vec<serde_json::Value> {
+        let (guard, out) = crate::access::tests::capture_scoped();
+        let (conn, _rx) = test_conn_with_auth(auth);
+        handle_text_message(frame.to_owned(), conn, state).await;
+        let reads = |out: &crate::access::tests::Captured| -> Vec<serde_json::Value> {
+            out.lines()
+                .into_iter()
+                .filter(|l| l["event"] == "req" || l["event"] == "count")
+                .collect()
+        };
+        // A dispatched handler runs as a spawned task on this thread.
+        for _ in 0..1_000 {
+            if !reads(&out).is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Let any duplicate line surface before counting.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        reads(&out)
+    }
+
+    fn assert_one_denial(lines: &[serde_json::Value], event: &str, reason: &str) {
+        assert_eq!(lines.len(), 1, "one access line per read: {lines:?}");
+        assert_eq!(lines[0]["event"], event);
+        assert_eq!(lines[0]["outcome"], "denied");
+        assert_eq!(lines[0]["reason"], reason);
+    }
+
+    #[tokio::test]
+    async fn read_refused_by_unavailable_admission_logs_one_denial() {
+        // The test state has no Redis, so shared admission fails closed.
+        let state = crate::state::tests::test_state().await;
+        for (frame, event) in [
+            (r#"["REQ","s",{"kinds":[9]}]"#, "req"),
+            (r#"["COUNT","c",{"kinds":[9]}]"#, "count"),
+        ] {
+            let lines = read_lines_for(frame, authenticated_state(), Arc::clone(&state)).await;
+            assert_one_denial(&lines, event, "admission_unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_refused_by_a_full_handler_semaphore_logs_one_denial() {
+        let mut state = (*crate::state::tests::test_state().await).clone();
+        state.handler_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(state);
+        for (frame, event) in [
+            (r#"["REQ","s",{"kinds":[9]}]"#, "req"),
+            (r#"["COUNT","c",{"kinds":[9]}]"#, "count"),
+        ] {
+            let lines = read_lines_for(frame, AuthState::Failed, Arc::clone(&state)).await;
+            assert_one_denial(&lines, event, "too_many_concurrent_requests");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_before_login_logs_one_denial_from_the_handler() {
+        let state = crate::state::tests::test_state().await;
+        for (frame, event) in [
+            (r#"["REQ","s",{"kinds":[9]}]"#, "req"),
+            (r#"["COUNT","c",{"kinds":[9]}]"#, "count"),
+        ] {
+            let lines = read_lines_for(frame, AuthState::Failed, Arc::clone(&state)).await;
+            assert_one_denial(&lines, event, "auth_required");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_cut_off_by_cancellation_logs_one_aborted_line() {
+        let state = crate::state::tests::test_state().await;
+        let (conn, _rx) = test_conn_with_auth(pending_state());
+        // A valid AUTH reaches the handler's policy lookups, which wait; the
+        // connection closes while they do.
+        let event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", "test-challenge"]).unwrap())
+            .sign_with_keys(&Keys::generate())
+            .expect("sign auth");
+        let frame = serde_json::json!(["AUTH", event]).to_string();
+        let (guard, out) = crate::access::tests::capture_scoped();
+        let cancel = conn.cancel.clone();
+        tokio::spawn(async move { cancel.cancel() });
+        handle_text_message(frame, conn, state).await;
+        drop(guard);
+        let lines: Vec<_> = out
+            .lines()
+            .into_iter()
+            .filter(|l| l["event"] == "auth")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "aborted");
+        assert_eq!(lines[0]["reason"], "connection_closed");
     }
 
     fn ordinary_disconnect_reason() -> watch::Receiver<Option<CommunityDisconnectReason>> {

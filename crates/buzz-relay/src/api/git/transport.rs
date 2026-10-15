@@ -8,6 +8,7 @@
 //! Auth: NIP-98 on all routes (clone + push). No public repos for v1.
 //! Transport: shells out to `git --stateless-rpc` with `env_clear()`.
 
+use crate::access::{auth_error_code, AuthAttempt, AuthMethod, AuthResult};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -102,8 +103,10 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // must be verified against the tenant-bound host, not a process-global
         // domain.
         let mode = state.config.nip_fi.mode;
+        let route = parts.uri.path().to_owned();
         if !mode.restricts() {
             if let Err(rejection) = parse_git_auth_header(&parts.headers, method) {
+                git_failed(&route, header_failure_code(&parts.headers));
                 // Off returns `rejection` as is; shadow also records the
                 // enforce verdict for the failed proof, still with no DB work.
                 crate::nip_fi_http::observe_failed_proof(state, &parts.headers);
@@ -152,52 +155,19 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
         let headers_clone = parts.headers.clone();
         let method_str = method.to_owned();
-        let admission = crate::nip_fi_http::admit_nip_fi_http_on_state(
-            state,
-            &parts.headers,
-            move || -> Result<crate::nip_fi_http::Nip98Proof<(nostr::Event, u64)>, Response> {
-                // In Off mode `parse_git_auth_header` already ran above and
-                // succeeded, so re-parsing here is purely for the return value.
-                // In Enforce mode it runs for the first time inside this closure
-                // (on the auth-rejection path the NIP-FI layer maps the error).
-                let (event_json, method_for_verify) =
-                    parse_git_auth_header_full(&headers_clone, &method_str)?;
-
-                // SECURITY: method intentionally not verified for git routes. The tautological
-                // check (event.method == event.method) is deliberate — see comment block above.
-                // Git's credential protocol signs once with GET and reuses for POST. The URL tag
-                // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
-                let pubkey = buzz_auth::nip98::verify_nip98_event(
-                    &event_json,
-                    &expected_url,
-                    &method_for_verify,
-                    None,
-                )
-                .map_err(|e| {
-                    warn!(error = %e, "git NIP-98 auth failed");
-                    (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
-                })?;
-
-                // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
-                // Git's credential protocol reuses one signed token across multiple requests
-                // in a session (info_refs GET -> upload-pack/receive-pack POST). Rejecting
-                // replayed event IDs would break normal clone/push operations.
-                // The +-60s timestamp window + URL scoping + HTTPS transport provide sufficient
-                // replay protection for v1. Per-request signing requires protocol changes.
-
-                let event: nostr::Event = serde_json::from_str(&event_json).map_err(|_| {
-                    (StatusCode::UNAUTHORIZED, "invalid auth event").into_response()
-                })?;
-                let signed_auth_created_at = event.created_at.as_secs();
-
-                Ok(crate::nip_fi_http::Nip98Proof::new(
-                    pubkey,
-                    (event, signed_auth_created_at),
-                ))
-            },
-        )?;
+        let closure_route = route.clone();
+        let admission =
+            crate::nip_fi_http::admit_nip_fi_http_on_state(state, &parts.headers, move || {
+                verify_git_proof(&headers_clone, &method_str, &expected_url, &closure_route)
+            })?;
 
         let pubkey = *admission.proven_pubkey();
+        // Git reuses one signed token per session, so there is no replay
+        // step: the membership and ban gates below make the final decision.
+        let attempt = AuthAttempt {
+            community: Some(tenant.community()),
+            ..admission.auth_attempt(&route)
+        };
         let (event, signed_auth_created_at) = admission.into_extra();
 
         // Relay membership gate (NIP-43). Git cannot carry a standalone
@@ -229,6 +199,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         {
             Ok(crate::api::relay_members::MembershipDecision::Denied) => {
                 warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
+                attempt.log(AuthResult::Denied("not_relay_member"));
                 return Err(
                     (StatusCode::FORBIDDEN, "restricted: not a relay member").into_response()
                 );
@@ -236,6 +207,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             Ok(_) => {}
             Err(e) => {
                 warn!(pubkey = %pubkey.to_hex(), error = %e, "git: relay membership lookup failed");
+                attempt.log(AuthResult::Denied("membership_unavailable"));
                 return Err(unavailable(
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -256,12 +228,15 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         .await
         .map_err(|denial| {
             if denial.status() == StatusCode::SERVICE_UNAVAILABLE {
+                attempt.log(AuthResult::Denied("ban_check_unavailable"));
                 unavailable(denial)
             } else {
+                attempt.log(AuthResult::Denied("banned"));
                 denial
             }
         })?;
 
+        attempt.log(AuthResult::Success);
         Ok(GitAuth { pubkey, tenant })
     }
 }
@@ -351,6 +326,67 @@ fn enforce_git_ban_cascade(
     match owner {
         Some(owner) => enforce_git_ban(owner),
         None => Ok(()),
+    }
+}
+
+fn git_failed(route: &str, reason: &'static str) {
+    AuthAttempt::http(AuthMethod::Nip98, route, None, false).log(AuthResult::Failed(reason));
+}
+
+/// Verify a git request's NIP-98 proof (the admission closure). Each failure
+/// logs one `auth` line with a fixed code, never the error text.
+#[allow(clippy::result_large_err)]
+fn verify_git_proof(
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    expected_url: &str,
+    route: &str,
+) -> Result<crate::nip_fi_http::Nip98Proof<(nostr::Event, u64)>, Response> {
+    // In Off mode `parse_git_auth_header` already ran above and
+    // succeeded, so re-parsing here is purely for the return value.
+    // In Enforce mode it runs for the first time inside this closure
+    // (on the auth-rejection path the NIP-FI layer maps the error).
+    let (event_json, method_for_verify) = parse_git_auth_header_full(headers, method)
+        .inspect_err(|_| git_failed(route, header_failure_code(headers)))?;
+
+    // SECURITY: method intentionally not verified for git routes. The tautological
+    // check (event.method == event.method) is deliberate — see comment block above.
+    // Git's credential protocol signs once with GET and reuses for POST. The URL tag
+    // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
+    let pubkey =
+        buzz_auth::nip98::verify_nip98_event(&event_json, expected_url, &method_for_verify, None)
+            .map_err(|e| {
+            // Fixed code only: a URL-mismatch error echoes the
+            // client's whole signed `u` tag.
+            git_failed(route, auth_error_code(&e));
+            (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
+        })?;
+
+    // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
+    // Git's credential protocol reuses one signed token across multiple requests
+    // in a session (info_refs GET -> upload-pack/receive-pack POST). Rejecting
+    // replayed event IDs would break normal clone/push operations.
+    // The +-60s timestamp window + URL scoping + HTTPS transport provide sufficient
+    // replay protection for v1. Per-request signing requires protocol changes.
+
+    let event: nostr::Event = serde_json::from_str(&event_json).map_err(|_| {
+        git_failed(route, "nip98_invalid");
+        (StatusCode::UNAUTHORIZED, "invalid auth event").into_response()
+    })?;
+    let signed_auth_created_at = event.created_at.as_secs();
+
+    Ok(crate::nip_fi_http::Nip98Proof::new(
+        pubkey,
+        (event, signed_auth_created_at),
+    ))
+}
+
+/// The access-log code for a git `Authorization` header that failed to parse.
+fn header_failure_code(headers: &axum::http::HeaderMap) -> &'static str {
+    if headers.contains_key(header::AUTHORIZATION) {
+        "nip98_invalid"
+    } else {
+        "nip98_missing"
     }
 }
 
@@ -5474,5 +5510,47 @@ mod off_mode_precedence_tests {
                 }
             } // closes same-key outer block (test_keys_outer / same_key_assertion)
         }
+    }
+}
+
+#[cfg(test)]
+mod access_log_tests {
+    use super::*;
+
+    // A URL-mismatch failure logs one fixed-code `auth` line; the client's
+    // signed `u` tag (and anything smuggled into it) never reaches the logs.
+    #[test]
+    fn git_url_mismatch_logs_a_fixed_code_without_the_signed_url() {
+        const MARKER: &str = "sentinel-7f3c9a";
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .tag(
+                nostr::Tag::parse(["u", &format!("https://evil.example/x?token={MARKER}")])
+                    .unwrap(),
+            )
+            .tag(nostr::Tag::parse(["method", "GET"]).unwrap())
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(nostr::JsonUtil::as_json(&event));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+
+        let (result, out) = crate::access::tests::capture(|| {
+            verify_git_proof(
+                &headers,
+                "GET",
+                "https://relay.example/git/o/r.git/info/refs",
+                "/git/o/r.git/info/refs",
+            )
+        });
+        assert!(result.is_err());
+        let lines = out.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "failed");
+        assert_eq!(lines[0]["reason"], "nip98_invalid");
+        assert!(!out.raw().contains(MARKER), "marker leaked: {}", out.raw());
     }
 }

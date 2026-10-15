@@ -81,12 +81,13 @@ async fn authorize_workflow_read(
         ),
     )?;
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt(path);
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 
     bridge::enforce_http_admission(state, &tenant, &pubkey)
         .await
         .map_err(|e| e.into_response())?;
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes)
+    bridge::check_nip98_replay(state, &tenant, event_id_bytes, auth)
         .await
         .map_err(|e| e.into_response())?;
 

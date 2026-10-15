@@ -253,7 +253,13 @@ async fn authenticate(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_invite_claim(headers, "POST", &url, Some(body))?;
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
+    let auth = crate::access::AuthAttempt::http(
+        crate::access::AuthMethod::Nip98,
+        path,
+        Some(pubkey),
+        true,
+    );
+    bridge::check_nip98_replay(state, &tenant, event_id_bytes, auth).await?;
 
     Ok((tenant, pubkey))
 }
@@ -322,10 +328,11 @@ async fn mint_invite_checked(
         Err(resp) => return resp,
     };
     let pubkey = *admission.proven_pubkey();
+    let auth = admission.auth_attempt("/api/invites");
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 
     // Replay detection runs after NIP-98+assertion admission (both proofs verified).
-    if let Err(e) = bridge::check_nip98_replay(&state, &tenant, event_id_bytes).await {
+    if let Err(e) = bridge::check_nip98_replay(&state, &tenant, event_id_bytes, auth).await {
         return e.into_response();
     }
 

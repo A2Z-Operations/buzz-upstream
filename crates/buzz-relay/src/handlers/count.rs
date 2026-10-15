@@ -420,7 +420,7 @@ pub async fn handle_count(
         }
     }
     conn.send(RelayMessage::count(&sub_id, total));
-    access.served(usize::try_from(total).unwrap_or(usize::MAX));
+    access.counted(total);
 }
 
 #[cfg(test)]

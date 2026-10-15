@@ -328,6 +328,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             AuthState::Pending { challenge, .. } => (challenge, conn.conn_id),
             AuthState::Authenticated(_) => {
                 debug!(conn_id = %conn.conn_id, "AUTH received but already authenticated");
+                AuthAttempt::nip42(&conn, event.pubkey, false)
+                    .log(AuthResult::Denied("already_authenticated"));
                 crate::metrics::record_post_terminal_auth_frame(
                     AuthPostTerminalState::Authenticated,
                 );
@@ -340,6 +342,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
             AuthState::Failed => {
                 debug!(conn_id = %conn.conn_id, "AUTH received after failed auth");
+                AuthAttempt::nip42(&conn, event.pubkey, false)
+                    .log(AuthResult::Denied("already_failed"));
                 crate::metrics::record_post_terminal_auth_frame(AuthPostTerminalState::Failed);
                 conn.send(RelayMessage::ok(
                     &event_id_hex,
@@ -3531,5 +3535,38 @@ mod tests {
             metric_counter(&snapshot, "buzz_auth_attempts_total", None),
             1
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeat_auth_after_a_terminal_logs_one_denial() {
+        let state = auth_test_state().await;
+        for (auth, reason) in [
+            (
+                crate::connection::tests::authenticated_state(),
+                "already_authenticated",
+            ),
+            (AuthState::Failed, "already_failed"),
+        ] {
+            let (conn, _rx) = test_conn_with_auth(auth);
+            let event = EventBuilder::new(Kind::Authentication, "")
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            let (guard, out) = crate::access::tests::capture_scoped();
+            handle_auth(
+                event,
+                std::sync::Arc::clone(&conn),
+                std::sync::Arc::clone(&state),
+            )
+            .await;
+            drop(guard);
+            let lines: Vec<_> = out
+                .lines()
+                .into_iter()
+                .filter(|l| l["event"] == "auth")
+                .collect();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["outcome"], "denied");
+            assert_eq!(lines[0]["reason"], reason);
+        }
     }
 }

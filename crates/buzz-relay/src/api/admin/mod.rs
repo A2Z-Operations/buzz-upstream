@@ -2934,7 +2934,7 @@ mod postgres_tests {
         let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
-        // Populate relay_operator_pubkeys so resolve_admin_principal can grant
+        // Populate relay_operator_pubkeys so lookup_admin_principal can grant
         // Operator/Config to the test pubkeys without a DB lookup.
         config.relay_operator_pubkeys = pubkeys;
         // Ensure relay_operator_api_origin is set (required when pubkeys is non-empty).

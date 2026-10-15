@@ -93,12 +93,13 @@ pub(crate) fn check_nip_fi_at_upgrade(
         return NipFiUpgradeOutcome::NotRequired;
     }
 
+    use crate::access::{AuthAttempt, AuthResult};
     if mode.denies_unconditionally() {
+        AuthAttempt::nip_fi(None, false).log(AuthResult::Denied("authorization_unavailable"));
         return NipFiUpgradeOutcome::Denied(http_denial(DenialClass::AuthorizationUnavailable));
     }
 
     // Enforce mode: resolve the Host's community, then validate the assertion.
-    use crate::access::{AuthAttempt, AuthResult};
     let community = match resolve_community(headers, communities) {
         Ok(community) => community,
         Err(class) => {
@@ -470,6 +471,24 @@ mod tests {
     //   A) Change `DenyProtected` handler to use `AuthorizationDenied` →
     //      status assertion panics (expected 503, got 403).
     //   B) Body assertion: change the body text → panics.
+    #[test]
+    fn deny_protected_logs_one_denied_auth_line() {
+        let headers = host_headers();
+        let (_, out) = crate::access::tests::capture(|| {
+            check_nip_fi_at_upgrade(
+                ROOT,
+                &headers,
+                &communities(),
+                None,
+                buzz_auth::NipFiMode::DenyProtected,
+            )
+        });
+        let lines = out.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "denied");
+        assert_eq!(lines[0]["reason"], "authorization_unavailable");
+    }
+
     #[test]
     fn deny_protected_returns_503_authorization_unavailable() {
         let headers = host_headers();
