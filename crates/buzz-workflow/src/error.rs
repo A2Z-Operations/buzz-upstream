@@ -81,6 +81,16 @@ impl WorkflowError {
             Self::NotImplemented(_) => "action_not_implemented",
         }
     }
+
+    /// Text safe for logs. A condition error can quote message text through
+    /// the expression context, so it logs as its code; other errors keep
+    /// their diagnostics. The run record still stores the full `Display`.
+    pub fn log_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::ConditionError(_) => self.code().into(),
+            other => other.to_string().into(),
+        }
+    }
 }
 
 impl From<buzz_db::error::DbError> for WorkflowError {

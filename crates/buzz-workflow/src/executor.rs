@@ -1205,7 +1205,12 @@ async fn execute_steps(
                     continue;
                 }
                 Err(e) => {
-                    warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
+                    warn!(
+                        run_id = %run_id,
+                        step = %step.id,
+                        error_kind = e.code(),
+                        "Condition error"
+                    );
                     let progress = crate::error::PartialProgress {
                         step_index: i,
                         trace,
@@ -1534,6 +1539,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WorkflowError::ConditionError(_)));
+    }
+
+    #[tokio::test]
+    async fn condition_error_log_text_omits_message_text() {
+        let mut ctx = make_trigger();
+        ctx.text = "secret-message-7f3a".to_owned();
+        let err = evaluate_condition("trigger_text > 5", &ctx, &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("secret-message-7f3a"));
+        assert_eq!(err.log_text(), "condition_evaluation_failed");
     }
 
     #[tokio::test]

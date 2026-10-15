@@ -421,6 +421,8 @@ test-unit:
         # invocation hits. Enumerated explicitly because nothing in CI runs
         # `cargo test --workspace` — membership buys clippy/check, not tests.
         cargo nextest run -p buzz-sdk --lib
+        # Infra-free: workflow condition errors never log message text.
+        cargo nextest run -p buzz-workflow --lib -E 'test(=executor::tests::condition_error_log_text_omits_message_text)'
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.
         cargo nextest run -p buzz-acp

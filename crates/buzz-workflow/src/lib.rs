@@ -276,7 +276,7 @@ impl WorkflowEngine {
                 }
             }
             Err((e, progress)) => {
-                tracing::error!(run_id = %run_id, "Workflow run failed: {e}");
+                tracing::error!(run_id = %run_id, error = %e.log_text(), "Workflow run failed");
                 let mut full_trace = prefix;
                 full_trace.extend(progress.trace);
                 let trace_json = serde_json::Value::Array(full_trace);
@@ -920,7 +920,8 @@ async fn should_fire_workflow(
             Err(e) => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
-                    "Trigger filter error: {e} — skipping workflow"
+                    error_kind = e.code(),
+                    "Trigger filter error — skipping workflow"
                 );
                 return false;
             }
