@@ -40,7 +40,7 @@ fn mesh_contract_rejects_invalid_uri_and_timing() {
         (0, 3600),
         (300, 0),
         (3600, 3600),
-        (300, 301),
+        (300, 299),
         (1, MAX_JWKS_TIMING_SECONDS + 1),
     ] {
         assert!(
@@ -48,6 +48,11 @@ fn mesh_contract_rejects_invalid_uri_and_timing() {
             "mesh contract must reject timing ({refresh}, {deadline})"
         );
     }
+
+    assert!(
+        JwksSourceContract::new_mesh(uri.clone(), 300, 301).is_some(),
+        "a deadline just above the refresh interval must be accepted"
+    );
 
     assert!(
         JwksSourceContract::new(uri, 300, 3600).is_none(),
