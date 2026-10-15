@@ -10239,7 +10239,7 @@ void main() {
     ) async {
       final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final prompt = _textMsg(
-        id: 'prompt',
+        id: threadIdRoot,
         pubkey: 'self',
         content: 'Hello',
         createdAt: now - 3,
@@ -10259,7 +10259,7 @@ void main() {
       typing.setEntries([
         TypingEntry(
           pubkey: 'alice',
-          threadHeadId: 'prompt',
+          threadHeadId: threadIdRoot,
           expiresAtMs: (now - 1) * 1000 + 8000,
         ),
       ]);
@@ -10280,7 +10280,7 @@ void main() {
           content: 'Here is the reply',
           createdAt: now,
           extraTags: [
-            ['e', 'prompt', '', 'reply'],
+            ['e', threadIdRoot, '', 'reply'],
           ],
         ),
       ]);

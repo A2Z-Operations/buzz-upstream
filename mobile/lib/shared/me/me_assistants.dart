@@ -17,7 +17,7 @@ final meAssistantsProvider = FutureProvider<List<AgentDirectoryEntry>>((
   final sync = ref.watch(meSyncProvider);
   final session = ref.watch(relaySessionProvider.notifier);
   return _loadAssistants(sync, session);
-});
+}, retry: (_, _) => null);
 
 /// Freshness-controlled ownership check for one personal-chat recipient.
 final meAssistantOwnershipProvider = FutureProvider.family<bool, String>((
