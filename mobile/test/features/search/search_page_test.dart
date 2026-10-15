@@ -14,6 +14,7 @@ import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/widgets/concentric_sheet_surface.dart';
 import 'package:buzz/shared/widgets/ios_glass_navigation_button.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
@@ -82,15 +83,7 @@ void main() {
         );
         await tester.enterText(find.byType(TextField), 'design');
         if (platform == TargetPlatform.iOS) {
-          tester
-              .widget<IosGlassNavigationButton>(
-                find.byWidgetPredicate(
-                  (widget) =>
-                      widget is IosGlassNavigationButton &&
-                      widget.label == 'Channels',
-                ),
-              )
-              .onPressed!();
+          await _pressNativeFilter(tester, 'Channels');
         } else {
           await tester.tap(find.text('Channels'));
         }
@@ -115,6 +108,77 @@ void main() {
       });
     }
   }
+
+  testWidgets('iOS native filter press selects Channels and filters results', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final state = SearchState(
+      query: 'design',
+      channelResults: [
+        Channel(
+          id: 'design',
+          name: 'design',
+          channelType: 'stream',
+          visibility: 'open',
+          description: 'Design discussion',
+          memberCount: 4,
+          createdBy: 'test',
+          createdAt: DateTime(2025),
+          isMember: true,
+        ),
+      ],
+      userResults: const [DirectoryUser(pubkey: 'maya', displayName: 'Maya')],
+    );
+    await tester.pumpWidget(
+      WidgetHelpers.testable(
+        overrides: [
+          searchProvider.overrideWith(() => _FakeSearchNotifier(state)),
+          recentSearchesProvider.overrideWith(
+            () => _FakeRecentSearchesNotifier(const []),
+          ),
+          profileProvider.overrideWith(() => _FakeProfileNotifier()),
+          channelsProvider.overrideWith(() => _FakeChannelsNotifier()),
+        ],
+        child: const SearchPage(),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final channel = find.byKey(const ValueKey('search-channel-row-design'));
+    final person = find.byKey(const ValueKey('search-person-row-maya'));
+    expect(channel, findsOneWidget);
+    expect(person, findsOneWidget);
+    expect(
+      tester.widget<IosGlassNavigationButton>(_nativeFilter('All')).isSelected,
+      isTrue,
+    );
+    expect(
+      tester
+          .widget<IosGlassNavigationButton>(_nativeFilter('Channels'))
+          .isSelected,
+      isFalse,
+    );
+
+    await _pressNativeFilter(tester, 'Channels');
+    await tester.pumpAndSettle();
+
+    expect(
+      tester
+          .widget<IosGlassNavigationButton>(_nativeFilter('Channels'))
+          .isSelected,
+      isTrue,
+    );
+    expect(
+      tester.widget<IosGlassNavigationButton>(_nativeFilter('All')).isSelected,
+      isFalse,
+    );
+    expect(channel, findsOneWidget);
+    expect(person, findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
 
   testWidgets('X dismisses search while the keyboard is focused', (
     tester,
@@ -781,6 +845,27 @@ void main() {
     expect(find.text('Open'), findsOneWidget);
     expect(find.text('0 members'), findsNothing);
   });
+}
+
+Finder _nativeFilter(String label) => find.byWidgetPredicate(
+  (widget) => widget is IosGlassNavigationButton && widget.label == label,
+);
+
+Future<void> _pressNativeFilter(WidgetTester tester, String label) async {
+  final view = tester.widget<UiKitView>(
+    find.descendant(of: _nativeFilter(label), matching: find.byType(UiKitView)),
+  );
+  // Simulate the engine creating this view, then deliver the native tap through
+  // the same per-view channel used by the production UIKit control.
+  const viewId = 42;
+  view.onPlatformViewCreated!(viewId);
+  await tester.pump();
+  const channel = MethodChannel('buzz/navigation_glass/$viewId');
+  await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+    channel.name,
+    channel.codec.encodeMethodCall(const MethodCall('pressed')),
+    (_) {},
+  );
 }
 
 class _FakeSearchNotifier extends SearchNotifier {
