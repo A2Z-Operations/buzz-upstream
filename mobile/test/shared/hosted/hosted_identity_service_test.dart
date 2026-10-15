@@ -186,7 +186,7 @@ void main() {
       final first = await service.resolve();
       expect(first.state, HostedIdentityState.needsBinding);
       expect((await service.resolve()).pubkey, first.pubkey);
-      expect(calls.where((p) => p.endsWith('/status')).length, 1);
+      expect(calls.where((p) => p.endsWith('/status')).length, 2);
       expect(calls.any((p) => p.endsWith('/recovery')), isFalse);
     },
   );

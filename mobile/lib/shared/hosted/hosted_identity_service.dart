@@ -4,9 +4,11 @@ import 'package:nostr/nostr.dart' as nostr;
 
 import 'account_identity_store.dart';
 import 'builderlab_account.dart';
+import 'device_identity_source.dart';
 
 enum HostedIdentityState {
   ready,
+  needsSelection,
   needsBinding,
   needsBackup,
   mismatch,
@@ -15,9 +17,14 @@ enum HostedIdentityState {
 }
 
 class HostedIdentityResult {
-  const HostedIdentityResult(this.state, {this.pubkey});
+  const HostedIdentityResult(
+    this.state, {
+    this.pubkey,
+    this.choices = const [],
+  });
   final HostedIdentityState state;
   final String? pubkey;
+  final List<DeviceIdentityChoice> choices;
 }
 
 /// Resolves identity safely. Generation requires a separately verified
@@ -28,22 +35,30 @@ class HostedIdentityService {
     required this.account,
     required this.store,
     this.canGenerateAfterLegacyReconciliation,
+    this.deviceIdentities,
   });
 
   /// Return true only when legacy community identities have been reconciled.
   /// Must not call AccountIdentityStore: invoked under its writer lock.
   final Future<bool> Function()? canGenerateAfterLegacyReconciliation;
+  final DeviceIdentitySource? deviceIdentities;
   final BuilderlabAccountClient account;
   final AccountIdentityStore store;
   Future<void> _tail = Future<void>.value();
 
-  Future<HostedIdentityResult> resolve({bool Function()? isCurrent}) {
-    final result = _tail.then((_) => _resolve(isCurrent));
+  Future<HostedIdentityResult> resolve({
+    bool Function()? isCurrent,
+    String? selectedPubkey,
+  }) {
+    final result = _tail.then((_) => _resolve(isCurrent, selectedPubkey));
     _tail = result.then<void>((_) {}, onError: (_) {});
     return result;
   }
 
-  Future<HostedIdentityResult> _resolve(bool Function()? isCurrent) async {
+  Future<HostedIdentityResult> _resolve(
+    bool Function()? isCurrent,
+    String? selectedPubkey,
+  ) async {
     void checkCurrent() {
       if (isCurrent != null && !isCurrent()) throw AccountFailure.unavailable;
     }
@@ -64,7 +79,7 @@ class HostedIdentityService {
     } else {
       throw AccountFailure.invalidResponse;
     }
-    if (local != null) return _result(local, bound, subject);
+    if (local != null && bound != null) return _result(local, bound, subject);
 
     final status = await account.post('/v1/buzz/nsec-backups/status', {});
     _sameAccount(subject);
@@ -78,13 +93,50 @@ class HostedIdentityService {
         : _pubkey(status['current_nostr_pubkey']);
     final statusKeys = listed.map(_pubkey).toSet();
     if (statusBound != bound) throw AccountFailure.invalidResponse;
+    if (local != null) {
+      if (statusKeys.any((key) => key != local.pubkey)) {
+        return const HostedIdentityResult(HostedIdentityState.mismatch);
+      }
+      return _result(local, bound, subject);
+    }
+    final device =
+        await deviceIdentities?.choices() ?? const <DeviceIdentityChoice>[];
+    _sameAccount(subject);
+    checkCurrent();
+    if (statusKeys.isEmpty &&
+        (bound == null || device.any((item) => item.pubkey == bound))) {
+      final eligible = device
+          .where((item) => bound == null || item.pubkey == bound)
+          .toList();
+      if (eligible.isNotEmpty) {
+        final chosen =
+            selectedPubkey ??
+            (eligible.length == 1 ? eligible.single.pubkey : null);
+        if (!eligible.any((item) => item.pubkey == chosen)) {
+          return HostedIdentityResult(
+            HostedIdentityState.needsSelection,
+            choices: eligible,
+          );
+        }
+        final saved = await deviceIdentities!.adopt(
+          chosen!,
+          store,
+          checkCurrent: () {
+            _sameAccount(subject);
+            checkCurrent();
+          },
+        );
+        return _result(saved, bound, subject);
+      }
+    }
     if (statusBound == null && statusKeys.isEmpty) {
       final generated = await store.generateIfAbsent(
         authorize: () async {
           _sameAccount(subject);
           checkCurrent();
-          final reconciled =
-              await canGenerateAfterLegacyReconciliation?.call() ?? false;
+          final reconciled = deviceIdentities != null
+              ? (await deviceIdentities!.choices()).isEmpty
+              : await canGenerateAfterLegacyReconciliation?.call() ?? false;
           _sameAccount(subject);
           checkCurrent();
           return reconciled;
@@ -164,6 +216,19 @@ class HostedIdentityService {
     final candidate = candidates.values.single;
     if (bound != null && bound != candidate.keys.public) {
       return const HostedIdentityResult(HostedIdentityState.mismatch);
+    }
+    if (device.isNotEmpty &&
+        !device.any((item) => item.pubkey == candidate.keys.public) &&
+        selectedPubkey != candidate.keys.public) {
+      return HostedIdentityResult(
+        HostedIdentityState.needsSelection,
+        choices: [
+          DeviceIdentityChoice(
+            candidate.keys.public,
+            'Builderlab backup (keep existing community identities)',
+          ),
+        ],
+      );
     }
     _sameAccount(subject);
     checkCurrent();

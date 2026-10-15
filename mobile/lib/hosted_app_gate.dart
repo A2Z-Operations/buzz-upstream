@@ -14,6 +14,7 @@ import 'shared/hosted/builderlab_account.dart';
 import 'shared/hosted/hosted_admission.dart';
 import 'shared/hosted/hosted_flow.dart';
 import 'shared/hosted/hosted_identity_service.dart';
+import 'shared/hosted/device_identity_source.dart';
 import 'shared/hosted/hosted_environment.dart';
 
 // Set by a community-entry surface while it owns setup presentation.
@@ -37,7 +38,11 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
     account: account,
     browser: browser,
     store: store,
-    identity: HostedIdentityService(account: account, store: store),
+    identity: HostedIdentityService(
+      account: account,
+      store: store,
+      deviceIdentities: DeviceIdentitySource(),
+    ),
     enterCommunity: (link, subject, pubkey, isCurrent) async {
       final relay = switch (link) {
         InviteDeepLink(:final relayUrl) => relayUrl,
@@ -192,7 +197,8 @@ class HostedAppGate extends HookConsumerWidget {
         fit: StackFit.expand,
         children: [
           child,
-          if (visible && !inlineEntry)
+          if (visible &&
+              (!inlineEntry || flow.stage == HostedFlowStage.chooseIdentity))
             HostedConnectPage(
               flow: flow,
               onClose: () => unawaited(flow.leave()),

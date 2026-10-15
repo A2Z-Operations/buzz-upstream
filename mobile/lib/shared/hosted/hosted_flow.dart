@@ -5,6 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../deeplink/deep_link.dart';
 import 'account_identity_store.dart';
+import 'device_identity_source.dart';
 import 'browser_auth.dart';
 import 'builderlab_account.dart';
 import 'hosted_identity_service.dart';
@@ -17,6 +18,7 @@ enum HostedFlowStage {
   idle,
   working,
   signIn,
+  chooseIdentity,
   blocked,
   browserReturned,
   complete,
@@ -71,6 +73,7 @@ class HostedFlow extends ChangeNotifier {
   final Future<bool> Function(Uri) _openWeb;
   HostedFlowStage stage = HostedFlowStage.idle;
   HostedFlowProblem? problem;
+  List<DeviceIdentityChoice> identityChoices = const [];
   BuzzDeepLink? _target;
   bool accountOnly = false;
   Future<void> _tail = Future.value();
@@ -222,12 +225,26 @@ class HostedFlow extends ChangeNotifier {
     }
   }
 
-  Future<void> _continue(int generation) async {
+  /// Resume only an offered public identity; reread local and cloud facts first.
+  Future<void> chooseIdentity(String pubkey) {
+    if (stage != HostedFlowStage.chooseIdentity ||
+        !identityChoices.any((item) => item.pubkey == pubkey)) {
+      return Future.value();
+    }
+    final generation = ++_generation;
+    _set(HostedFlowStage.working);
+    return _enqueue(() => _continue(generation, selectedPubkey: pubkey));
+  }
+
+  Future<void> _continue(int generation, {String? selectedPubkey}) async {
     final target = _target;
     final session = account.account;
     if (target == null || session == null) throw AccountFailure.signedOut;
     if (!_acceptTarget(target)) return;
-    var resolved = await identity.resolve();
+    var resolved = await identity.resolve(
+      isCurrent: () => !_disposed && generation == _generation,
+      selectedPubkey: selectedPubkey,
+    );
     if (target is! NostrBindDeepLink) {
       for (var step = 0; step < 2; step++) {
         if (_disposed || generation != _generation) return;
@@ -278,10 +295,17 @@ class HostedFlow extends ChangeNotifier {
           break;
         }
         if (_disposed || generation != _generation) return;
-        resolved = await identity.resolve();
+        resolved = await identity.resolve(
+          isCurrent: () => !_disposed && generation == _generation,
+        );
       }
     }
     if (generation != _generation || _disposed) return;
+    if (resolved.state == HostedIdentityState.needsSelection) {
+      identityChoices = List.unmodifiable(resolved.choices);
+      _set(HostedFlowStage.chooseIdentity);
+      return;
+    }
     final pubkey = resolved.pubkey;
     if (target is NostrBindDeepLink &&
         pubkey != null &&
@@ -402,6 +426,7 @@ class HostedFlow extends ChangeNotifier {
 
   void _set(HostedFlowStage next, [HostedFlowProblem? failure]) {
     if (_disposed) return;
+    if (next != HostedFlowStage.chooseIdentity) identityChoices = const [];
     stage = next;
     problem = failure;
     notifyListeners();

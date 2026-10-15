@@ -204,6 +204,9 @@ class AccountIdentityStore {
     }
   }
 
+  /// Validate a candidate without exposing signing material to the UI.
+  static String publicKeyForNsec(String nsec) => _keys(nsec).public;
+
   static nostr.Keys _keys(String nsec) {
     try {
       final decoded = nostr.Nip19.decode(payload: nsec);

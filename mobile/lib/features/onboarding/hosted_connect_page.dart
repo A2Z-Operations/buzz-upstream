@@ -4,6 +4,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/hosted/hosted_flow.dart';
 import '../../shared/hosted/hosted_flow_problem_message.dart';
+import '../../shared/utils/string_utils.dart';
 import '../../shared/theme/grid.dart';
 import '../../shared/theme/theme_extensions.dart';
 
@@ -24,6 +25,8 @@ class HostedConnectPage extends HookConsumerWidget {
     final message = switch (flow.stage) {
       HostedFlowStage.idle => 'Continue connecting your account.',
       HostedFlowStage.working => 'Connecting your account…',
+      HostedFlowStage.chooseIdentity =>
+        'Choose the identity to connect to Builderlab. Existing device and cloud keys will be kept.',
       HostedFlowStage.signIn => 'Complete sign-in in your browser.',
       HostedFlowStage.browserReturned =>
         'Continue setup in your browser. Open your community in Buzz when it is ready.',
@@ -56,9 +59,26 @@ class HostedConnectPage extends HookConsumerWidget {
                   children: [
                     Text(message, style: context.textTheme.titleLarge),
                     const SizedBox(height: Grid.sm),
+                    for (final choice in flow.identityChoices)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: Grid.sm),
+                        child: OutlinedButton(
+                          onPressed: () => flow.chooseIdentity(choice.pubkey),
+                          child: Padding(
+                            padding: const EdgeInsets.all(Grid.sm),
+                            child: Column(
+                              children: [
+                                Text(choice.label),
+                                Text(fullNpub(choice.pubkey) ?? choice.pubkey),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
                     if (working)
                       const Center(child: CircularProgressIndicator()),
                     if (!working &&
+                        flow.stage != HostedFlowStage.chooseIdentity &&
                         flow.stage != HostedFlowStage.complete &&
                         flow.stage != HostedFlowStage.browserReturned &&
                         flow.canRetry)

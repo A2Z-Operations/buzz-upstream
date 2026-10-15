@@ -187,6 +187,11 @@ void main() {
             data = {
               'identity': bound ? {'pubkey_hex': keys.public} : null,
             };
+          } else if (path.endsWith('/status')) {
+            data = {
+              'current_nostr_pubkey': bound ? keys.public : null,
+              'backup_nostr_pubkeys': <String>[],
+            };
           } else if (path.endsWith('/challenge')) {
             effects.add('challenge');
             data = {
