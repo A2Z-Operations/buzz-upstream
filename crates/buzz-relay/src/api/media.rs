@@ -348,7 +348,9 @@ pub(crate) async fn upload_blob(
             .map_err(|e| e.into_response())?;
         let pubkey = auth_event.pubkey;
         Ok(Nip98Proof::new(pubkey, auth_event))
-    }) {
+    })
+    .await
+    {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -822,7 +824,9 @@ pub(crate) async fn get_blob(
     let admission = match admit_nip_fi_http_on_state(&state, &req_headers, move || {
         extract_blossom_read_proof(&headers_clone, &sha256, &tenant_host, strictness)
             .map_err(|e| e.into_response())
-    }) {
+    })
+    .await
+    {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
@@ -1116,7 +1120,9 @@ pub(crate) async fn head_blob(
     let admission = match admit_nip_fi_http_on_state(&state, &headers, move || {
         extract_blossom_read_proof(&headers_clone, &sha256, &tenant_host, strictness)
             .map_err(|e| e.into_response())
-    }) {
+    })
+    .await
+    {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };

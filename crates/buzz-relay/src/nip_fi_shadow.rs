@@ -24,7 +24,7 @@
 use axum::http::HeaderMap;
 use buzz_auth::DenialClass;
 
-use crate::nip_fi_config::NipFiCommunities;
+use crate::nip_fi_core::Communities;
 
 /// Which enforce step would have denied, and with which class.
 pub(crate) type WouldDeny = (Stage, DenialClass);
@@ -56,10 +56,10 @@ impl Stage {
 }
 
 /// Record one would-be enforce verdict for a request at `route`.
-pub(crate) fn record(
+pub(crate) fn record<'a>(
     route: &'static str,
     headers: &HeaderMap,
-    communities: &NipFiCommunities,
+    communities: impl Into<Communities<'a>>,
     verdict: Result<(), WouldDeny>,
 ) {
     record_for(route, community_label(headers, communities), verdict);
@@ -75,10 +75,14 @@ pub(crate) fn record_for(route: &'static str, community: String, verdict: Result
 }
 
 /// The bounded community label for `headers`: its configured URI or `unmapped`.
-pub(crate) fn community_label(headers: &HeaderMap, communities: &NipFiCommunities) -> String {
-    crate::nip_fi_core::resolve_community(headers, communities)
-        .map_or("unmapped", |binding| binding.expected_aud())
-        .to_owned()
+pub(crate) fn community_label<'a>(
+    headers: &HeaderMap,
+    communities: impl Into<Communities<'a>>,
+) -> String {
+    communities.into().resolve_from_memory(headers).map_or_else(
+        |_| "unmapped".to_owned(),
+        |binding| binding.expected_aud().to_owned(),
+    )
 }
 
 tokio::task_local! {
@@ -97,7 +101,7 @@ pub(crate) async fn observe_guard<F: std::future::Future>(
 ) -> F::Output {
     let denied = verdict.is_err();
     if denied {
-        record("http", headers, &state.config.nip_fi.communities, verdict);
+        record("http", headers, state.nip_fi_communities(), verdict);
     }
     GUARD_DENIED.scope(denied, run).await
 }
@@ -149,7 +153,7 @@ pub(crate) fn observe_strict_proof<E>(
             "buzz_nip_fi_shadow_strict_proof_total",
             "route" => route,
             "outcome" => outcome,
-            "community" => community_label(headers, &nip_fi.communities)
+            "community" => community_label(headers, state.nip_fi_communities())
         )
         .increment(1);
     }
@@ -182,12 +186,13 @@ pub(crate) async fn bind_tenant(
 fn observe_unbound(state: &crate::state::AppState, headers: &HeaderMap) {
     let nip_fi = &state.config.nip_fi;
     if nip_fi.mode.observes_only() {
-        let verdict = match crate::nip_fi_core::resolve_community(headers, &nip_fi.communities) {
+        let communities = state.nip_fi_communities();
+        let verdict = match communities.resolve_from_memory(headers) {
             Err(class) => Err((Stage::Community, class)),
             Ok(_) if guard_denied() == Some(false) => Ok(()),
             Ok(_) => return,
         };
-        record("http", headers, &nip_fi.communities, verdict);
+        record("http", headers, communities, verdict);
     }
 }
 

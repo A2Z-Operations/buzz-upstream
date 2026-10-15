@@ -195,7 +195,8 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
                     (event, signed_auth_created_at),
                 ))
             },
-        )?;
+        )
+        .await?;
 
         let pubkey = *admission.proven_pubkey();
         let (event, signed_auth_created_at) = admission.into_extra();

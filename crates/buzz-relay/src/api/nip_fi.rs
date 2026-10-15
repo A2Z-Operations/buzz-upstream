@@ -1930,6 +1930,7 @@ mod route_integration_tests {
             },
         )];
         config.nip_fi = NipFiRelayConfig {
+            source: Default::default(),
             mode: NipFiMode::Enforce,
             registry: registry.clone(),
             jwks_configs: jwks_configs.clone(),
@@ -2511,7 +2512,7 @@ mod route_integration_tests {
     /// for `key`.  `Ok(())` = admitted; `Err` = the denial response.
     // Response<Body> is intentionally large (axum's design); see admit_nip_fi_http.
     #[allow(clippy::result_large_err)]
-    fn http_admit(
+    async fn http_admit(
         state: &crate::state::AppState,
         iss: &str,
         key: &nostr::PublicKey,
@@ -2526,6 +2527,7 @@ mod route_integration_tests {
         crate::nip_fi_http::admit_nip_fi_http_on_state(state, &headers, || {
             Ok(crate::nip_fi_http::Nip98Proof::new(*key, ()))
         })
+        .await
         .map(|_| ())
     }
 
@@ -2551,7 +2553,7 @@ mod route_integration_tests {
         let key = nostr::Keys::generate().public_key();
         let mut state = (*http_enforce_state().await).clone();
         assert!(
-            http_admit(&state, TEST_ISS, &key).is_ok(),
+            http_admit(&state, TEST_ISS, &key).await.is_ok(),
             "control: the assertion is admitted on its own community"
         );
         Arc::make_mut(&mut state.config).nip_fi.communities =
@@ -2559,7 +2561,9 @@ mod route_integration_tests {
                 "https://relay.example",
                 &[TEST_ISS, OTHER_ISS],
             );
-        let resp = http_admit(&state, TEST_ISS, &key).expect_err("A's aud on B's Host");
+        let resp = http_admit(&state, TEST_ISS, &key)
+            .await
+            .expect_err("A's aud on B's Host");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2572,13 +2576,14 @@ mod route_integration_tests {
         let state = http_enforce_state().await;
         let key = nostr::Keys::generate().public_key();
         assert!(
-            http_admit(&state, TEST_ISS, &key).is_ok(),
+            http_admit(&state, TEST_ISS, &key).await.is_ok(),
             "control: (iss-A, k) is admitted before any deny"
         );
 
         deny_via_route(&state, &key, 300).await;
 
         let resp = http_admit(&state, TEST_ISS, &key)
+            .await
             .expect_err("(iss-A, k) must be denied at HTTP ingress after the route denies it");
         assert_fixed_authorization_denied(resp, "(iss-A, k) HTTP denial").await;
     }
@@ -2590,11 +2595,11 @@ mod route_integration_tests {
         deny_via_route(&state, &key, 300).await;
 
         assert!(
-            http_admit(&state, TEST_ISS, &key).is_err(),
+            http_admit(&state, TEST_ISS, &key).await.is_err(),
             "control: (iss-A, k) is denied"
         );
         assert!(
-            http_admit(&state, OTHER_ISS, &key).is_ok(),
+            http_admit(&state, OTHER_ISS, &key).await.is_ok(),
             "a deny for (iss-A, k) must not block (iss-B, k)"
         );
     }
@@ -2624,8 +2629,9 @@ mod route_integration_tests {
             .expect("router response");
         assert_fixed_authorization_denied(ws_resp, "WS admission sees the route's deny").await;
 
-        let http_resp =
-            http_admit(&state, TEST_ISS, &key).expect_err("HTTP admission sees the same deny");
+        let http_resp = http_admit(&state, TEST_ISS, &key)
+            .await
+            .expect_err("HTTP admission sees the same deny");
         assert_fixed_authorization_denied(http_resp, "HTTP admission sees the route's deny").await;
     }
 
@@ -2656,6 +2662,7 @@ mod route_integration_tests {
             crate::nip_fi_http::admit_nip_fi_http_on_state(&state, &HeaderMap::new(), || {
                 Ok(crate::nip_fi_http::Nip98Proof::new(key, 7u8))
             })
+            .await
             .expect("Off mode admits on NIP-98 success regardless of deny entries");
         assert_eq!(admitted.proven_pubkey(), &key);
         assert!(admitted.assertion().is_none());
@@ -2673,6 +2680,7 @@ mod route_integration_tests {
             &HeaderMap::new(),
             || Err(legacy()),
         )
+        .await
         .expect_err("Off mode propagates the NIP-98 failure");
         let expected = legacy();
         assert_eq!(resp.status(), expected.status());
@@ -3548,6 +3556,7 @@ mod route_integration_tests {
                 },
             )];
             config.nip_fi = NipFiRelayConfig {
+                source: Default::default(),
                 mode: NipFiMode::Shadow,
                 registry: registry.clone(),
                 jwks_configs: vec![test_jwks_config()],

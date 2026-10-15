@@ -201,6 +201,175 @@ impl Db {
     }
 }
 
+/// A Postgres transaction snapshot (`pg_current_snapshot()`), recorded so the
+/// relay can decide in process whether a committed transaction's effects are
+/// included in a read taken under it (`pg_visible_in_snapshot` semantics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgSnapshot {
+    xmin: u64,
+    xmax: u64,
+    in_progress: Vec<u64>,
+}
+
+impl PgSnapshot {
+    /// Parse the `xmin:xmax:xip,...` text form of `pg_snapshot`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(3, ':');
+        let xmin = parts.next()?.parse().ok()?;
+        let xmax = parts.next()?.parse().ok()?;
+        let in_progress = match parts.next()? {
+            "" => Vec::new(),
+            list => list
+                .split(',')
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()
+                .ok()?,
+        };
+        Some(Self {
+            xmin,
+            xmax,
+            in_progress,
+        })
+    }
+
+    /// Whether committed transaction `xid` is visible to a read under this
+    /// snapshot: below `xmin`, or below `xmax` and not in progress.
+    pub fn is_visible(&self, xid: u64) -> bool {
+        xid < self.xmin || (xid < self.xmax && !self.in_progress.contains(&xid))
+    }
+}
+
+/// One consistent read of every active registry-filtered binding.
+#[derive(Debug)]
+pub struct NipFiSnapshotLoad {
+    /// The snapshot the scan ran under.
+    pub snapshot: PgSnapshot,
+    /// `(host, issuer)` rows, one per community-issuer pair.
+    pub rows: Vec<(String, String)>,
+}
+
+/// A streamed read produced more rows than its cap allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("row cap of {0} exceeded")]
+pub struct RowCapExceeded(pub usize);
+
+/// Collect at most `cap` rows from `rows`, pulling at most `cap + 1`: the
+/// `cap + 1`st row fails the whole read. Shared by the snapshot load and the
+/// admission miss lookup so both stop streaming at the same bound.
+pub async fn collect_capped<T, E, S>(
+    rows: S,
+    cap: usize,
+) -> std::result::Result<std::result::Result<Vec<T>, RowCapExceeded>, E>
+where
+    S: futures_util::Stream<Item = std::result::Result<T, E>>,
+{
+    use futures_util::StreamExt;
+    let mut rows = std::pin::pin!(rows);
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await {
+        if out.len() == cap {
+            return Ok(Err(RowCapExceeded(cap)));
+        }
+        out.push(row?);
+    }
+    Ok(Ok(out))
+}
+
+impl Db {
+    /// Read every binding of an active community to an issuer in `registry`,
+    /// on the primary, inside one `REPEATABLE READ` transaction whose first
+    /// statement records its snapshot. `after_snapshot` runs between that
+    /// statement and the scan. A read over `max_rows` rows stops at the
+    /// `max_rows + 1`st and fails.
+    #[datastore_span(name = "load_nip_fi_binding_snapshot", system = "postgresql")]
+    pub async fn load_nip_fi_binding_snapshot(
+        &self,
+        registry: &[String],
+        max_rows: usize,
+        after_snapshot: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<std::result::Result<NipFiSnapshotLoad, RowCapExceeded>> {
+        let connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Authorization,
+        )
+        .await?;
+        let mut tx = Transaction::begin(connection, None).await?;
+        // Sets the level only; the snapshot is taken by the next statement.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let snapshot: String = sqlx::query_scalar("SELECT pg_current_snapshot()::text")
+            .fetch_one(&mut *tx)
+            .await?;
+        let snapshot = PgSnapshot::parse(&snapshot)
+            .ok_or_else(|| crate::DbError::InvalidData("unparseable pg_snapshot".into()))?;
+        after_snapshot.await;
+        let rows = {
+            let stream = sqlx::query_as::<_, (String, String)>(
+                r#"
+                SELECT c.host, b.issuer
+                FROM community_nip_fi_issuers b
+                JOIN communities c ON c.id = b.community_id
+                WHERE b.issuer = ANY($1)
+                  AND c.archived_at IS NULL
+                  AND c.deletion_state = 'active'
+                  AND c.deleted_at IS NULL
+                "#,
+            )
+            .bind(registry)
+            .fetch(&mut *tx);
+            collect_capped(stream, max_rows).await?
+        };
+        tx.commit().await?;
+        Ok(rows.map(|rows| NipFiSnapshotLoad { snapshot, rows }))
+    }
+
+    /// The registry-filtered issuers bound to the active community at
+    /// `normalized_host`, on the primary. Streams at most `registry.len() + 1`
+    /// rows; more than `registry.len()` fails the lookup. Empty when the host
+    /// is unknown, inactive, or bound only to unregistered issuers.
+    #[datastore_span(name = "lookup_nip_fi_admission_binding", system = "postgresql")]
+    pub async fn lookup_nip_fi_admission_binding(
+        &self,
+        normalized_host: &str,
+        registry: &[String],
+    ) -> Result<std::result::Result<Vec<String>, RowCapExceeded>> {
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Authorization,
+        )
+        .await?;
+        let cap = registry.len();
+        let stream = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT b.issuer
+            FROM community_nip_fi_issuers b
+            JOIN communities c ON c.id = b.community_id
+            WHERE lower(c.host) = lower($1)
+              AND b.issuer = ANY($2)
+              AND c.archived_at IS NULL
+              AND c.deletion_state = 'active'
+              AND c.deleted_at IS NULL
+            LIMIT $3
+            "#,
+        )
+        .bind(normalized_host)
+        .bind(registry)
+        .bind(i64::try_from(cap + 1).unwrap_or(i64::MAX))
+        .fetch(&mut *connection);
+        Ok(collect_capped(stream, cap).await?)
+    }
+}
+
+/// The creating transaction's ID (`pg_current_xact_id()`), read inside it.
+pub(crate) async fn current_xact_id(tx: &mut Transaction<'_, Postgres>) -> Result<u64> {
+    let xid: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    xid.parse()
+        .map_err(|_| crate::DbError::InvalidData("unparseable xid8".into()))
+}
+
 #[cfg(test)]
 mod postgres_tests {
     use super::*;

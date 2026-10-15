@@ -26,6 +26,9 @@ pub struct EnsuredCommunityRecord {
     pub host: String,
     /// True only when this call inserted the `communities` row.
     pub created: bool,
+    /// The creating transaction's ID when this call also inserted an issuer
+    /// binding; lets the relay fence its creation overlay by snapshot.
+    pub nip_fi_binding_xid: Option<u64>,
 }
 
 /// Community row returned by an atomic create-with-owner operation.
@@ -35,6 +38,9 @@ pub struct CreatedCommunityRecord {
     pub id: CommunityId,
     /// Normalized host stored for the community.
     pub host: String,
+    /// The creating transaction's ID when this call inserted an issuer
+    /// binding. `None` for an identical retry or an unbound community.
+    pub nip_fi_binding_xid: Option<u64>,
 }
 
 /// Result of atomically creating a community with its initial owner.
@@ -523,13 +529,24 @@ impl Db {
         let id = CommunityId::from_uuid(row.try_get("id")?);
         let host: String = row.try_get("host")?;
         let created: bool = row.try_get("created")?;
-        if created {
-            self.insert_nip_fi_issuers_in_transaction(&mut connection, id, nip_fi_issuers)
-                .await?;
+        let mut nip_fi_binding_xid = None;
+        if created
+            && self
+                .insert_nip_fi_issuers_in_transaction(&mut connection, id, nip_fi_issuers)
+                .await?
+                > 0
+        {
+            nip_fi_binding_xid =
+                Some(super::nip_fi_binding::current_xact_id(&mut connection).await?);
         }
         connection.commit().await?;
 
-        Ok(EnsuredCommunityRecord { id, host, created })
+        Ok(EnsuredCommunityRecord {
+            id,
+            host,
+            created,
+            nip_fi_binding_xid,
+        })
     }
 
     /// Atomically creates a community and its initial owner.
@@ -586,7 +603,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (id, host) = if let Some(row) = row {
+        let (id, host, nip_fi_binding_xid) = if let Some(row) = row {
             let id: Uuid = row.try_get("id")?;
             let host: String = row.try_get("host")?;
 
@@ -612,13 +629,19 @@ impl Db {
             .bind(&owner_pubkey)
             .execute(&mut *tx)
             .await?;
-            self.insert_nip_fi_issuers_in_transaction(
-                &mut tx,
-                CommunityId::from_uuid(id),
-                nip_fi_issuers,
-            )
-            .await?;
-            (id, host)
+            let bound = self
+                .insert_nip_fi_issuers_in_transaction(
+                    &mut tx,
+                    CommunityId::from_uuid(id),
+                    nip_fi_issuers,
+                )
+                .await?;
+            let xid = if bound > 0 {
+                Some(super::nip_fi_binding::current_xact_id(&mut tx).await?)
+            } else {
+                None
+            };
+            (id, host, xid)
         } else {
             let existing = sqlx::query(
                 r#"
@@ -641,7 +664,7 @@ impl Db {
                 tx.rollback().await?;
                 return Ok(CreateCommunityWithOwnerResult::HostExists);
             };
-            (existing.try_get("id")?, existing.try_get("host")?)
+            (existing.try_get("id")?, existing.try_get("host")?, None)
         };
 
         tx.commit().await?;
@@ -649,6 +672,7 @@ impl Db {
             CreatedCommunityRecord {
                 id: CommunityId::from_uuid(id),
                 host,
+                nip_fi_binding_xid,
             },
         ))
     }

@@ -101,7 +101,7 @@ impl ShadowSession {
         let session = Arc::new(Self {
             id: sessions.next_id.fetch_add(1, Ordering::Relaxed),
             route,
-            community: crate::nip_fi_shadow::community_label(headers, &nip_fi.communities),
+            community: crate::nip_fi_shadow::community_label(headers, state.nip_fi_communities()),
             assertion,
             phase: Mutex::new(Phase::Pending { revoked: false }),
             cancel: OnceLock::new(),
@@ -269,7 +269,7 @@ pub(crate) fn upgrade_denied(
     let denied = deny_listed(state, assertion);
     if denied {
         let verdict = Err((Stage::DenySet, DenialClass::AuthorizationDenied));
-        crate::nip_fi_shadow::record("ws", headers, &state.config.nip_fi.communities, verdict);
+        crate::nip_fi_shadow::record("ws", headers, state.nip_fi_communities(), verdict);
     }
     denied
 }

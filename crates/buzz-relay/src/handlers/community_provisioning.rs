@@ -229,6 +229,19 @@ async fn publish_membership_snapshot_if_required(
     }
 }
 
+/// After a committed creation that inserted a binding, make it admissible on
+/// this pod before the next snapshot refresh (plan §7 creation overlay).
+async fn record_binding_creation(
+    state: &AppState,
+    host: &str,
+    issuers: &[String],
+    xid: Option<u64>,
+) {
+    if let (Some(resolver), Some(xid)) = (&state.nip_fi_resolver, xid) {
+        resolver.record_creation(host, issuers, xid).await;
+    }
+}
+
 /// Validate and execute a relay-operator community provisioning request.
 ///
 /// The caller is an HTTP operator endpoint, not the Nostr event ingest path.
@@ -308,6 +321,13 @@ pub async fn provision_community(
             owner = %owner_hex,
             "community created via operator endpoint"
         );
+        record_binding_creation(
+            state,
+            &record.host,
+            nip_fi_issuers,
+            record.nip_fi_binding_xid,
+        )
+        .await;
         publish_membership_snapshot_if_required(state, record.id, &record.host).await;
         return Ok(ProvisionCommunityResponse {
             community_id: record.id.to_string(),
@@ -325,6 +345,13 @@ pub async fn provision_community(
         .ensure_configured_community_with_nip_fi_issuers(&request.host, nip_fi_issuers)
         .await
         .map_err(|e| format!("failed to create community: {e}"))?;
+    record_binding_creation(
+        state,
+        &record.host,
+        nip_fi_issuers,
+        record.nip_fi_binding_xid,
+    )
+    .await;
 
     if let Some(owner_hex) = &initial_owner {
         match state

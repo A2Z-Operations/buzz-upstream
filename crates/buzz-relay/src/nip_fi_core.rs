@@ -47,8 +47,14 @@ impl AssertionRejection {
     }
 }
 
-/// Resolve the community served at the request `Host` — enforce-mode
-/// admission step 1, before any evidence is examined (NIP-FI.md:266-268).
+/// The request `Host`, if present and readable.
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Resolve the community served at the request `Host` from a static map.
 ///
 /// An absent, unreadable, or unmapped Host is `authorization_unavailable`.
 /// This makes mapped and unmapped Hosts distinguishable (401/403 vs 503) in
@@ -58,11 +64,59 @@ pub(crate) fn resolve_community<'a>(
     headers: &HeaderMap,
     communities: &'a NipFiCommunities,
 ) -> Result<&'a CommunityBinding, DenialClass> {
-    headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
+    request_host(headers)
         .and_then(|host| communities.resolve(host))
         .ok_or(DenialClass::AuthorizationUnavailable)
+}
+
+/// The relay's community source (`BUZZ_NIP_FI_COMMUNITY_SOURCE`): the
+/// static `env` map, or the database resolver.
+#[derive(Clone, Copy)]
+pub(crate) enum Communities<'a> {
+    Env(&'a NipFiCommunities),
+    Database(&'a std::sync::Arc<crate::nip_fi_resolver::DatabaseResolver>),
+}
+
+impl Communities<'_> {
+    /// Resolve the community at the request `Host` — enforce-mode admission
+    /// step 1, before any evidence is examined (NIP-FI.md:266-268). Called
+    /// once per admission; the returned binding is what verification uses.
+    pub(crate) async fn resolve(
+        self,
+        headers: &HeaderMap,
+    ) -> Result<std::sync::Arc<CommunityBinding>, DenialClass> {
+        match self {
+            Self::Env(map) => {
+                resolve_community(headers, map).map(|b| std::sync::Arc::new(b.clone()))
+            }
+            Self::Database(resolver) => match request_host(headers) {
+                Some(host) => resolver.resolve(host).await,
+                None => Err(DenialClass::AuthorizationUnavailable),
+            },
+        }
+    }
+
+    /// The community at the request `Host` from memory only, for shadow
+    /// verdicts and labels. Never touches the database.
+    pub(crate) fn resolve_from_memory(
+        self,
+        headers: &HeaderMap,
+    ) -> Result<std::sync::Arc<CommunityBinding>, DenialClass> {
+        match self {
+            Self::Env(map) => {
+                resolve_community(headers, map).map(|b| std::sync::Arc::new(b.clone()))
+            }
+            Self::Database(resolver) => request_host(headers)
+                .and_then(|host| resolver.resolve_from_memory(host))
+                .ok_or(DenialClass::AuthorizationUnavailable),
+        }
+    }
+}
+
+impl<'a> From<&'a NipFiCommunities> for Communities<'a> {
+    fn from(map: &'a NipFiCommunities) -> Self {
+        Self::Env(map)
+    }
 }
 
 /// Extract and verify the attached assertion for `community`.

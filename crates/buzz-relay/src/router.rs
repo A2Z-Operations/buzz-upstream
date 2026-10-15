@@ -189,7 +189,15 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
-    let verdict = nip_fi_guard_steps(&state, request.headers());
+    // Shadow resolves from memory only; enforce resolves once and hands the
+    // binding to the handler's admission, so a request costs one resolution.
+    let communities = state.nip_fi_communities();
+    let community = if mode.observes_only() {
+        communities.resolve_from_memory(request.headers())
+    } else {
+        communities.resolve(request.headers()).await
+    };
+    let verdict = nip_fi_guard_steps(&state, request.headers(), community.as_deref());
     // Shadow: transparent, but the guard's verdict is recorded in enforce's
     // order, ahead of any handler step.
     if mode.observes_only() {
@@ -197,9 +205,11 @@ async fn nip_fi_assertion_guard(
         return crate::nip_fi_shadow::observe_guard(&state, &headers, verdict, next.run(request))
             .await;
     }
-    match verdict {
-        Ok(()) => next.run(request).await,
-        Err((_, class)) => http_denial(class),
+    match (verdict, community) {
+        (Ok(()), Ok(community)) => {
+            crate::nip_fi_http::with_resolved_community(community, next.run(request)).await
+        }
+        (Err((_, class)), _) | (Ok(()), Err(class)) => http_denial(class),
     }
 }
 
@@ -213,10 +223,9 @@ async fn nip_fi_assertion_guard(
 fn nip_fi_guard_steps(
     state: &AppState,
     headers: &axum::http::HeaderMap,
+    community: Result<&buzz_auth::CommunityBinding, &buzz_auth::DenialClass>,
 ) -> Result<(), crate::nip_fi_shadow::WouldDeny> {
-    let community =
-        crate::nip_fi_core::resolve_community(headers, &state.config.nip_fi.communities)
-            .map_err(|class| (crate::nip_fi_shadow::Stage::Community, class))?;
+    let community = community.map_err(|class| (crate::nip_fi_shadow::Stage::Community, *class))?;
     crate::nip_fi_core::evaluate_attached_assertion(
         headers,
         community,
@@ -664,8 +673,9 @@ async fn nip11_or_ws_handler(
             use crate::nip_fi_upgrade::check_nip_fi_at_upgrade;
             let mode = state.config.nip_fi.mode;
             let verifier = state.nip_fi_verifier.as_deref();
-            let communities = &state.config.nip_fi.communities;
+            let communities = state.nip_fi_communities();
             match check_nip_fi_at_upgrade(Root, &headers, communities, verifier, mode)
+                .await
                 .into_assertions()
             {
                 Ok((assertion, shadow)) => (true, assertion, shadow),
@@ -752,8 +762,9 @@ async fn nip11_or_ws_handler(
                 use crate::nip_fi_upgrade::check_nip_fi_at_upgrade;
                 let mode = state.config.nip_fi.mode;
                 let verifier = state.nip_fi_verifier.as_deref();
-                let communities = &state.config.nip_fi.communities;
+                let communities = state.nip_fi_communities();
                 match check_nip_fi_at_upgrade(Root, &headers, communities, verifier, mode)
+                    .await
                     .into_assertions()
                 {
                     Ok(assertions) => assertions,
@@ -2142,6 +2153,7 @@ mod tests {
         // Enforce that is the startup-race condition that must return 503 for
         // a token-carrying request.
         config.nip_fi = NipFiRelayConfig {
+            source: Default::default(),
             mode,
             registry: IssuerRegistry::new(),
             jwks_configs: vec![],
@@ -3915,6 +3927,7 @@ mod tests {
         };
 
         config.nip_fi = NipFiRelayConfig {
+            source: Default::default(),
             mode: NipFiMode::Enforce,
             registry: {
                 let mut r = IssuerRegistry::new();

@@ -948,7 +948,8 @@ pub async fn submit_event(
         )
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })?;
+    })
+    .await?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -1300,7 +1301,8 @@ pub async fn query_events(
         )
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })?;
+    })
+    .await?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -1981,7 +1983,8 @@ pub async fn count_events(
         )
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })?;
+    })
+    .await?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -2820,7 +2823,8 @@ async fn authorize_moderation_read(
         )
         .map(|auth| auth.proof(auth.event_id_bytes))
         .map_err(|e| e.into_response())
-    })?;
+    })
+    .await?;
     let pubkey = *admission.proven_pubkey();
     let event_id_bytes = admission.into_extra();
 

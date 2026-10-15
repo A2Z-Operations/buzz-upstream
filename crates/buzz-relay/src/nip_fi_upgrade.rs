@@ -15,9 +15,8 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Response};
 use buzz_auth::{DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion};
 
-use crate::nip_fi_config::NipFiCommunities;
 use crate::nip_fi_core::{
-    evaluate_attached_assertion, http_denial, resolve_community, AssertionRejection,
+    evaluate_attached_assertion, http_denial, AssertionRejection, Communities,
 };
 
 /// Outcome of NIP-FI assertion validation at upgrade time.
@@ -61,26 +60,30 @@ impl NipFiUpgradeOutcome {
 /// be valid but authorization is temporarily unavailable — so "authorization
 /// denied" would be false. "authorization unavailable, retry after repair" is
 /// the accurate and correct signal. [FI-TRACE-DENIAL-ORACLE]
-pub(crate) fn check_nip_fi_at_upgrade(
+pub(crate) async fn check_nip_fi_at_upgrade<'a>(
     route: crate::nip_fi_session::NipFiWsRoute,
     headers: &HeaderMap,
-    communities: &NipFiCommunities,
+    communities: impl Into<Communities<'a>>,
     verifier: Option<&dyn VerifyAssertion>,
     mode: NipFiMode,
 ) -> NipFiUpgradeOutcome {
+    let communities = communities.into();
     if !mode.restricts() {
         // Shadow records an upgrade would-deny; a passing assertion is
         // observed until AUTH, where its admission verdict is recorded.
         if mode.observes_only() {
-            let verdict = resolve_community(headers, communities)
+            let verdict = communities
+                .resolve_from_memory(headers)
                 .map_err(|class| (crate::nip_fi_shadow::Stage::Community, class))
                 .and_then(|community| {
-                    evaluate_attached_assertion(headers, community, verifier).map_err(|rejection| {
-                        (
-                            crate::nip_fi_shadow::Stage::Assertion,
-                            rejection.denial_class(),
-                        )
-                    })
+                    evaluate_attached_assertion(headers, &community, verifier).map_err(
+                        |rejection| {
+                            (
+                                crate::nip_fi_shadow::Stage::Assertion,
+                                rejection.denial_class(),
+                            )
+                        },
+                    )
                 });
             match verdict {
                 Ok(assertion) => return NipFiUpgradeOutcome::Observed(assertion),
@@ -98,11 +101,11 @@ pub(crate) fn check_nip_fi_at_upgrade(
     }
 
     // Enforce mode: resolve the Host's community, then validate the assertion.
-    let community = match resolve_community(headers, communities) {
+    let community = match communities.resolve(headers).await {
         Ok(community) => community,
         Err(class) => return NipFiUpgradeOutcome::Denied(http_denial(class)),
     };
-    match evaluate_attached_assertion(headers, community, verifier) {
+    match evaluate_attached_assertion(headers, &community, verifier) {
         Ok(assertion) => NipFiUpgradeOutcome::Admitted(assertion),
         Err(rejection) => {
             if let AssertionRejection::Verifier(err) = rejection {
@@ -116,6 +119,7 @@ pub(crate) fn check_nip_fi_at_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt as _;
 
     const ROOT: crate::nip_fi_session::NipFiWsRoute = crate::nip_fi_session::NipFiWsRoute::Root;
     use crate::nip_fi_core::extract_bearer_token;
@@ -393,7 +397,9 @@ mod tests {
             &communities(),
             None,
             buzz_auth::NipFiMode::Enforce,
-        );
+        )
+        .now_or_never()
+        .expect("env resolution never waits");
         match outcome {
             NipFiUpgradeOutcome::Denied(resp) => {
                 assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
@@ -413,7 +419,9 @@ mod tests {
             &communities(),
             None,
             buzz_auth::NipFiMode::Enforce,
-        );
+        )
+        .now_or_never()
+        .expect("env resolution never waits");
         // Missing header → MissingEvidence; but None verifier fires first.
         // Correct behavior: extract_bearer_token is called before verifier check,
         // so missing header → 401 (MissingEvidence) before reaching the None verifier path.
@@ -443,7 +451,9 @@ mod tests {
             &communities(),
             None,
             buzz_auth::NipFiMode::Off,
-        );
+        )
+        .now_or_never()
+        .expect("env resolution never waits");
         assert!(
             matches!(outcome, NipFiUpgradeOutcome::NotRequired),
             "Off mode must not require assertion — OSS default must not regress"
@@ -471,7 +481,9 @@ mod tests {
             &communities(),
             None,
             buzz_auth::NipFiMode::DenyProtected,
-        );
+        )
+        .now_or_never()
+        .expect("env resolution never waits");
         match outcome {
             NipFiUpgradeOutcome::Denied(resp) => {
                 assert_eq!(
@@ -519,13 +531,17 @@ mod tests {
         ];
         for (err, status, body) in rows {
             let verifier = ScriptedVerifier::new(Err(err));
-            let (got_status, got_body) = denied_parts(check_nip_fi_at_upgrade(
-                ROOT,
-                &headers_with("Bearer a.b.c"),
-                &communities(),
-                Some(&verifier),
-                NipFiMode::Enforce,
-            ));
+            let (got_status, got_body) = denied_parts(
+                check_nip_fi_at_upgrade(
+                    ROOT,
+                    &headers_with("Bearer a.b.c"),
+                    &communities(),
+                    Some(&verifier),
+                    NipFiMode::Enforce,
+                )
+                .now_or_never()
+                .expect("env resolution never waits"),
+            );
             assert_eq!(got_status, status, "{err:?}");
             assert_eq!(got_body, body, "{err:?}");
         }
@@ -535,13 +551,17 @@ mod tests {
     // Mutation: checking the verifier first turns this 403 into 503.
     #[test]
     fn characterize_upgrade_transport_precedes_verifier_presence() {
-        let (status, body) = denied_parts(check_nip_fi_at_upgrade(
-            ROOT,
-            &headers_with("junk"),
-            &communities(),
-            None,
-            NipFiMode::Enforce,
-        ));
+        let (status, body) = denied_parts(
+            check_nip_fi_at_upgrade(
+                ROOT,
+                &headers_with("junk"),
+                &communities(),
+                None,
+                NipFiMode::Enforce,
+            )
+            .now_or_never()
+            .expect("env resolution never waits"),
+        );
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, b"evidence rejected\n");
     }
@@ -558,7 +578,10 @@ mod tests {
             &communities(),
             Some(&verifier),
             NipFiMode::Enforce,
-        ) {
+        )
+        .now_or_never()
+        .expect("env resolution never waits")
+        {
             NipFiUpgradeOutcome::Admitted(assertion) => {
                 assert_eq!(assertion.asserted_key(), None);
             }
@@ -581,16 +604,22 @@ mod tests {
                 &communities(),
                 Some(&verifier),
                 NipFiMode::Off
-            ),
+            )
+            .now_or_never()
+            .expect("env resolution never waits"),
             NipFiUpgradeOutcome::NotRequired
         ));
-        let (status, _) = denied_parts(check_nip_fi_at_upgrade(
-            ROOT,
-            &headers,
-            &communities(),
-            Some(&verifier),
-            NipFiMode::DenyProtected,
-        ));
+        let (status, _) = denied_parts(
+            check_nip_fi_at_upgrade(
+                ROOT,
+                &headers,
+                &communities(),
+                Some(&verifier),
+                NipFiMode::DenyProtected,
+            )
+            .now_or_never()
+            .expect("env resolution never waits"),
+        );
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(verifier.calls(), 0);
     }
@@ -611,6 +640,8 @@ mod tests {
                 Some(&verifier),
                 NipFiMode::Shadow,
             )
+            .now_or_never()
+            .expect("env resolution never waits")
         };
         let Ok((None, Some(_))) = check().into_assertions() else {
             panic!("a passing shadow assertion is observed, never enforced");
@@ -623,6 +654,8 @@ mod tests {
             Some(&verifier),
             NipFiMode::Shadow,
         )
+        .now_or_never()
+        .expect("env resolution never waits")
         .into_assertions() else {
             panic!("a missing shadow assertion admits as Off");
         };
@@ -647,7 +680,9 @@ mod tests {
                         &communities(),
                         verifier,
                         NipFiMode::Shadow,
-                    );
+                    )
+                    .now_or_never()
+                    .expect("env resolution never waits");
                     assert!(matches!(outcome, NipFiUpgradeOutcome::NotRequired));
                 }
             }
