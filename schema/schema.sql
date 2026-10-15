@@ -64,7 +64,6 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- functions
 \i functions/channels_community_id_immutable.sql
-\i functions/enqueue_push_match_job.sql
 \i functions/refresh_channel_ttl_after_event_insert.sql
 \i functions/guard_channel_roster_snapshot.sql
 \i functions/events_created_at_floor_guard.sql
@@ -78,6 +77,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i functions/enforce_community_write_fence.sql
 \i functions/enforce_community_tombstone.sql
 \i functions/attach_community_write_fence.sql
+\i functions/profile_name_fields.sql
 
 -- tables
 \i tables/public/communities.sql

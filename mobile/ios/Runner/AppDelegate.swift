@@ -59,6 +59,10 @@ import os.log
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BuzzIosMediaCarousel") {
+      registrar.register(IosMediaCarouselFactory(messenger: registrar.messenger()), withId: "buzz/ios_media_carousel")
+    }
+
     let messenger = engineBridge.applicationRegistrar.messenger()
     huddleMediaPlugin = HuddleMediaPlugin(messenger: messenger)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BuzzIosNavigationBar") {
@@ -1073,7 +1077,7 @@ import os.log
 }
 
 extension BuzzPushNavigationTarget {
-  fileprivate var flutterArguments: [String: String] {
+  var flutterArguments: [String: String] {
     var arguments = [
       "eventId": eventID,
       "communityId": communityID,

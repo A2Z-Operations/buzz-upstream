@@ -24,12 +24,16 @@ plain NIP-29, a client cannot:
 A client also cannot mark its own channels so that it can find them again.
 Channel labels (below) do this.
 
+Also, every channel that a person belongs to shows in their client as a chat.
+So a group that exists only to control who can read some data appears in
+sidebars, search results and unread counts. System channels (below) fix this.
+
 ## Channel identity tags
 
 On every channel-state event that the relay signs, the relay MUST put these
 tags in this order, before any other `t` or `P` tag:
 
-1. `["t", <channel type>]`, for example `stream`, `forum`, `dm`, `workflow`.
+1. `["t", <channel type>]`, for example `stream`, `forum`, `dm`, `workflow`, `system`.
 2. `["t", <label>]` for each channel label, in stored order (see
    [Channel labels](#channel-labels)).
 3. `["P", <creator public key, hex>]`.
@@ -123,6 +127,103 @@ supported this NIP.
 Values in one tag filter combine with OR, as in NIP-01. So
 `"#t": ["workspace", "notes"]` finds channels with either label. To require a
 label and a creator, use `#t` and `#P` together.
+
+The relay MUST match `#t` and `#P` before it applies `limit`, as NIP-01
+requires. A relay that reads the newest channel events first and matches tags
+after can return a short or empty page while matching channels exist.
+
+## Choosing one channel
+
+The relay does not make labels unique. Many channels can share a label, and
+any owner or admin can set any label. So two creates for the same label can
+both succeed, for example when two processes of one agent start at the same
+time.
+
+A client that needs one channel per creator and label:
+
+1. queries `{"kinds": [39000], "#P": ["<creator>"], "#t": ["<label>"]}`;
+2. creates the channel only if the query returns nothing; and
+3. when the query returns more than one channel, uses the oldest one.
+
+The oldest channel has the lowest `created_at` tag value, compared as an
+integer. If two channels have the same value, the lowest channel ID (`d` tag,
+compared as a string) wins. A channel without a `created_at` tag ranks after
+every channel that has one, and two channels without one compare by channel
+ID.
+Every reader that follows this rule picks the same channel, even after either
+channel is edited.
+
+## System channels
+
+A system channel exists only to control who can read some data, for example
+config that only an agent and its owner can read. It has the channel type
+`system`. In every other way it is an ordinary channel: it has members, roles,
+messages and labels.
+
+**Create.** A kind:9007 with `["channel_type", "system"]` creates a system
+channel. It is private unless the kind:9007 also has `["visibility", "open"]`.
+
+**Hidden.** While a system channel is private, its kind:39000 carries the
+NIP-29 `hidden` tag.
+
+### Reads that leave system channels out
+
+The relay leaves system channels out of every read that does not name them.
+Clients that do not know about system channels then stay correct with no
+change. This applies to:
+
+- a filter without `#h`, for example the channels or messages a reader can see;
+- kind:39002 `#p:["<reader>"]`, the channels a reader belongs to;
+- COUNT and NIP-50 search; and
+- any relay-specific query API that does the same reads.
+
+A filter **names** a system channel when it has the channel ID in `#h`, or in
+`#d` on a filter whose kinds are all 39000–39003. Then the ordinary read rules
+apply: the reader can read the channel if they are a member or if it is open.
+A client that has the ID, for example from a link, can open the channel. Thus
+a system channel stays an ordinary NIP-29 group.
+
+The relay decides this for each filter. A filter that names a system channel
+does not add it to another filter in the same request.
+
+The relay MUST NOT send push notifications or kind:44100/44101 membership
+notifications for system channels. A client that received one would show the
+channel.
+
+### Asking for system channels
+
+A filter whose kinds are all 39000–39003 also returns the system channels that
+the reader can read when it has:
+
+- `"#t"` with the value `system`; or
+- any `"#P"`. A query for the channels of named creators returns a small
+  result, so it does not fill generic channel lists.
+
+The filter then matches as usual. A label alone does not ask for system
+channels.
+
+| To find | Filter |
+| --- | --- |
+| My system channels | `{"kinds": [39002], "#p": ["<me>"], "#t": ["system"]}`, then their kind:39000 by `#d` |
+| Open system channels | `{"kinds": [39000], "#t": ["system"]}` |
+| One creator's channel with a label, system or not | `{"kinds": [39000], "#P": ["<creator>"], "#t": ["<label>"]}` |
+
+`"#t": ["system", "<label>"]` means `system` **or** the label. It does not
+mean "a system channel with this label". Use `#P` and the label instead.
+
+Private system channels stay hidden from non-members, as for every private
+channel.
+
+## Advertising support
+
+Until this draft has an upstream integer NIP number, relays MUST NOT advertise
+it in NIP-11 `supported_nips`. A relay that supports this NIP adds `"nip-cl"`
+to its NIP-11 `supported_extensions` string array.
+
+A relay without this NIP drops label tags on create and refuses
+`channel_type=system`. So a client SHOULD NOT create a channel with labels or
+a system channel on a relay whose NIP-11 document does not contain `"nip-cl"`.
+Lookups by label on such a relay find nothing, which is safe.
 
 ## Trust
 

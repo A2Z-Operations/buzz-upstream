@@ -3,6 +3,7 @@ part of '../channel_detail_page.dart';
 class _MessageList extends HookConsumerWidget {
   final ValueNotifier<StickyDateHeaderState> stickyDateHeaderState;
   final List<MainTimelineEntry> entries;
+  final List<TypingEntry> inlineTyping;
   final List<TimelineMessage> allMessages;
   final String? initialMessageId;
   final String? initialThreadRootId;
@@ -12,6 +13,8 @@ class _MessageList extends HookConsumerWidget {
   final Set<String> initialForcedUnreadMessageIds;
   final bool hasInitialUnread;
   final String channelId;
+  final ChannelMessagesNotifier notifier;
+  final bool isDm;
   final String? currentPubkey;
   final bool isMember;
   final bool isArchived;
@@ -22,6 +25,7 @@ class _MessageList extends HookConsumerWidget {
 
   const _MessageList({
     required this.entries,
+    this.inlineTyping = const [],
     required this.stickyDateHeaderState,
     required this.allMessages,
     required this.initialMessageId,
@@ -32,6 +36,8 @@ class _MessageList extends HookConsumerWidget {
     required this.initialForcedUnreadMessageIds,
     required this.hasInitialUnread,
     required this.channelId,
+    required this.notifier,
+    required this.isDm,
     required this.currentPubkey,
     required this.isMember,
     required this.isArchived,
@@ -43,6 +49,8 @@ class _MessageList extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final handoff = useAgentReplyHandoffs(channelId, inlineTyping, allMessages);
+    final displayedTyping = handoff.typing;
     final appView = View.of(context);
     final localSendAnimations = ref.watch(
       localMessageSendAnimationProvider(channelId),
@@ -85,7 +93,6 @@ class _MessageList extends HookConsumerWidget {
     final unreadBoundaryFetchCount = useRef(0);
     final hasUnreadDeepLink =
         initialMessageId != null || initialThreadRootId != null;
-    final notifier = ref.read(channelMessagesProvider(channelId).notifier);
     final dayTimestampByReversedIndex = <int, int>{};
     final dayStartByReversedIndex = <int, int>{};
     final dayHeaderTimestampByReversedIndex = <int, int>{};
@@ -522,9 +529,6 @@ class _MessageList extends HookConsumerWidget {
               olderFetchPaused.value) {
             return;
           }
-          final notifier = ref.read(
-            channelMessagesProvider(channelId).notifier,
-          );
           if (notifier.reachedOldest) return;
           isLoadingOlder.value = true;
           notifier
@@ -558,6 +562,83 @@ class _MessageList extends HookConsumerWidget {
         showUnreadNavigation,
         stickyDateHeaderState,
       ],
+    );
+
+    void readVisibleRows() {
+      final readState = ref.read(readStateProvider);
+      final viewportHeight = timelineViewportHeight.value;
+      if (!context.mounted ||
+          !readState.isReady ||
+          isAutoScrolling.value ||
+          viewportHeight <= 0 ||
+          entries.isEmpty) {
+        return;
+      }
+      // Rows hidden under the app bar, the composer or the keyboard are not
+      // read. The keyboard covers rows even when the list does not follow
+      // the latest message, so this uses the whole covered height, not the
+      // list's own bottom inset.
+      final bottomEdge =
+          (navigationBottomInset / viewportHeight).clamp(0.0, 1.0) - 0.01;
+      final topEdge =
+          1 -
+          frostedAppBarHeight(
+                context,
+                titleContentHeight: appBarTitleContentHeight,
+              ) /
+              viewportHeight +
+          0.01;
+      final visible = <TimelineMessage>[];
+      for (final position in itemPositionsListener.itemPositions.value) {
+        if (position.index >= displayEntries.length ||
+            position.itemLeadingEdge < bottomEdge ||
+            position.itemTrailingEdge > topEdge) {
+          continue;
+        }
+        final group =
+            displayEntries[displayEntries.length - 1 - position.index];
+        visible.addAll(group.map((entry) => entry.message));
+      }
+      final latest = entries.last.message;
+      final atBottom =
+          latestIsAtBoundary() &&
+          itemPositionsListener.itemPositions.value.any(
+            (position) =>
+                position.index == 0 && position.itemLeadingEdge >= bottomEdge,
+          );
+      final marks = readingMarks(
+        readState: readState,
+        channelId: channelId,
+        isDm: isDm,
+        currentPubkey: currentPubkey,
+        loaded: allMessages,
+        visible: visible,
+        bottom: atBottom ? latest : null,
+      );
+      final notifier = ref.read(readStateProvider.notifier);
+      // Reading to the bottom ends a manual "mark unread" on the channel.
+      if (atBottom && readState.isForcedUnread(channelId)) {
+        notifier.clearForcedUnread(channelId);
+      }
+      for (final mark in marks.entries) {
+        notifier.markContextRead(mark.key, mark.value);
+      }
+    }
+
+    // Reading starts once the timeline holds still for the dwell while this
+    // page is in front and the app is in use.
+    final appInUse = isAppInUse(useAppLifecycleState());
+    final readStateReady = ref.watch(
+      readStateProvider.select((state) => state.isReady),
+    );
+    useReadingDwell(
+      positions: itemPositionsListener.itemPositions,
+      active:
+          readStateReady &&
+          appInUse &&
+          (ModalRoute.of(context)?.isCurrent ?? true),
+      onDwell: readVisibleRows,
+      keys: [channelId, readingContentKey(allMessages), navigationBottomInset],
     );
 
     useEffect(() {
@@ -710,34 +791,24 @@ class _MessageList extends HookConsumerWidget {
       },
     );
 
-    if (entries.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              BuzzIcons.messageSquare,
-              size: Grid.xl,
-              color: context.colors.onSurfaceVariant,
-            ),
-            const SizedBox(height: Grid.xxs),
-            Text(
-              'No messages yet',
-              style: context.textTheme.bodyLarge?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: Grid.half),
-            Text(
-              'Be the first to say something!',
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
-          ],
+    if (entries.isEmpty && displayedTyping.isNotEmpty) {
+      return Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            Grid.gutter,
+            0,
+            Grid.gutter,
+            composerBottomInset,
+          ),
+          child: InlineAgentTyping(
+            channelId: channelId,
+            entries: displayedTyping,
+          ),
         ),
       );
     }
+    if (entries.isEmpty) return const _EmptyMessages();
 
     // Build channel names map once for all message bubbles.
     final channelsAsync = ref.watch(channelsProvider);
@@ -906,7 +977,16 @@ class _MessageList extends HookConsumerWidget {
                         else ...[
                           _MessageBubble(
                             message: message,
-                            showAuthor: showAuthor,
+                            showAuthor:
+                                showAuthor ||
+                                isRecentAgentReplyHandoff(
+                                  handoff.messageIds,
+                                  message.id,
+                                ),
+                            typingHandoff: isRecentAgentReplyHandoff(
+                              handoff.messageIds,
+                              message.id,
+                            ),
                             showAvatar: showAvatar,
                             hasReplies: entry.summary != null,
                             replyFooter: entry.summary == null
@@ -930,6 +1010,11 @@ class _MessageList extends HookConsumerWidget {
                             restoreComposerFocus: restoreComposerFocus,
                           ),
                         ],
+                        if (index == 0 && displayedTyping.isNotEmpty)
+                          InlineAgentTyping(
+                            channelId: channelId,
+                            entries: displayedTyping,
+                          ),
                       ],
                     ),
                   ),

@@ -3,6 +3,7 @@ import 'package:buzz/shared/widgets/app_route_observer.dart';
 import 'package:buzz/features/pairing/pairing_provider.dart';
 import 'package:buzz/shared/community/paired_community_landing.dart';
 import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../profile/presence_snapshot_test.dart'
     show PresenceTestRelay, presenceEvent;
@@ -50,6 +51,8 @@ import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/shared/widgets/ios_navigation_bar.dart';
 import 'package:buzz/shared/widgets/masked_avatar_badge.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
+
+import '../../helpers/thread_ids.dart';
 
 part 'channels_page_test/presence_tests.dart';
 part 'channels_page_test/unread_readiness_tests.dart';
@@ -345,23 +348,13 @@ void main() {
       expect(text.style?.height, contentListTitleTextStyle.height);
       expect(
         text.style?.color,
-        Theme.of(
-          tester.element(find.text(label)),
-        ).colorScheme.onSurface.withValues(alpha: 0.8),
+        Theme.of(tester.element(find.text(label))).colorScheme.onSurface,
       );
     }
-    final channelIcon = tester.widget<Icon>(
-      find.byKey(const ValueKey('channel-icon-1')),
-    );
-    expect(
-      channelIcon.color,
-      Theme.of(
-        tester.element(find.byKey(const ValueKey('channel-icon-1'))),
-      ).colorScheme.onSurface.withValues(alpha: 0.8),
-    );
+    expect(find.byKey(const ValueKey('channel-icon-1')), findsNothing);
     final sectionTitle = tester.widget<Text>(find.text('Channels'));
     expect(sectionTitle.style?.fontSize, contentListTitleTextStyle.fontSize);
-    expect(sectionTitle.style?.fontWeight, FontWeight.w600);
+    expect(sectionTitle.style?.fontWeight, FontWeight.w400);
   });
 
   testWidgets('keys DM tile fallback avatars to the non-self counterpart', (
@@ -675,6 +668,56 @@ void main() {
     expect(appBar.frostedBlurSigma, 23.12);
   });
 
+  testWidgets('Home keeps header blur after returning from search', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    tester.view.physicalSize = const Size(320, 320);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      buildTestable(
+        realHome: true,
+        topSectionGradient: const LinearGradient(
+          colors: [Colors.yellow, Colors.blue],
+        ),
+        overrides: [
+          savedPrefsProvider.overrideWithValue(prefs),
+          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    final position = tester
+        .state<ScrollableState>(
+          find
+              .descendant(
+                of: find.byType(CustomScrollView),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        )
+        .position;
+    position.jumpTo(position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    final header = find.byType(FrostedAppBar).first;
+    expect(
+      find.descendant(of: header, matching: find.byType(BackdropFilter)),
+      findsOneWidget,
+    );
+    final offset = position.pixels;
+    await tester.tap(find.byTooltip('Search'));
+    await tester.pumpAndSettle();
+    tester.state<NavigatorState>(find.byType(Navigator).first).pop();
+    await tester.pumpAndSettle();
+    expect(position.pixels, offset);
+    expect(
+      find.descendant(of: header, matching: find.byType(BackdropFilter)),
+      findsOneWidget,
+    );
+  });
+
   for (final customRoute in [false, true]) {
     testWidgets(
       'Home replays native scroll state on return: custom=$customRoute',
@@ -901,7 +944,12 @@ void main() {
             () => _FakeChannelSectionsNotifier(
               const ChannelSectionStore(
                 sections: [
-                  ChannelSection(id: 'section-1', name: 'Design', order: 0),
+                  ChannelSection(
+                    id: 'section-1',
+                    name: 'Design',
+                    icon: '🎨',
+                    order: 0,
+                  ),
                 ],
               ),
             ),
@@ -911,6 +959,25 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    expect(find.text('🎨'), findsNothing);
+    final sectionRow = find
+        .ancestor(of: find.text('Design'), matching: find.byType(Row))
+        .first;
+    final chevron = find.descendant(
+      of: sectionRow,
+      matching: find.byIcon(BuzzIcons.chevronDown),
+    );
+    expect(
+      tester.getTopLeft(chevron).dx -
+          tester.getTopRight(find.text('Design')).dx,
+      closeTo(Grid.quarter, 0.01),
+    );
+    for (final divider in tester.widgetList<Divider>(find.byType(Divider))) {
+      expect(
+        divider.color,
+        AppTheme.light().colorScheme.onSurface.withValues(alpha: 0.07),
+      );
+    }
     await tester.tap(find.byKey(const Key('section-menu-section-1')));
     await tester.pumpAndSettle();
 
@@ -3600,13 +3667,13 @@ void main() {
                   _observed(
                     id: 'reply-1',
                     createdAt: 20,
-                    rootId: 'root',
+                    rootId: threadIdRoot,
                     isThreadedReply: true,
                   ),
                   _observed(
                     id: 'reply-2',
                     createdAt: 30,
-                    rootId: 'root',
+                    rootId: threadIdRoot,
                     isThreadedReply: true,
                   ),
                 ],
@@ -3633,7 +3700,7 @@ void main() {
         _observed(
           id: 'reply-1',
           createdAt: 30,
-          rootId: 'root',
+          rootId: threadIdRoot,
           isThreadedReply: true,
         ),
       ],
@@ -3667,7 +3734,11 @@ void main() {
         const ReadStateState(
           isReady: true,
           pubkey: 'pk',
-          contexts: {'1': 10, 'activity:1': 25, 'thread-activity:root': 30},
+          contexts: {
+            '1': 10,
+            'activity:1': 25,
+            'thread-activity:$threadIdRoot': 30,
+          },
           version: 0,
         ),
       );

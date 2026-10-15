@@ -126,6 +126,25 @@ pub async fn handle_req(
     if let Some(allowed) = token_channel_ids.as_deref() {
         accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
+    // System channels are outside `accessible_channels`. A filter that names
+    // one adds it to its own scope only (see `system_channels`).
+    let mut readable_system = match super::system_channels::readable_system_channels_for_filters(
+        &state,
+        conn.tenant.community(),
+        &pubkey_bytes,
+        &filters,
+        &accessible_channels,
+        token_channel_ids.as_deref(),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(conn_id = %conn_id, "Failed to get readable system channels: {e}");
+            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            return;
+        }
+    };
 
     // Build the conformance `AbstractState` once at request entry. The
     // `Option` only goes `None` on malformed pubkey bytes (already a
@@ -146,11 +165,17 @@ pub async fn handle_req(
     // is what fixes the search false-miss: a `#h=<just-added>` search would
     // otherwise be scoped against the stale vector and return empty.
     if let Some(requested) = requested_channel_ids.as_ref() {
+        let repaired_from = accessible_channels.len();
         for &ch_id in requested {
             let token_allows = token_channel_ids
                 .as_deref()
                 .is_none_or(|allowed| allowed.contains(&ch_id));
-            let db_is_member = if !token_allows || accessible_channels.contains(&ch_id) {
+            // A readable system channel is authorized for the filters that
+            // name it; it must not enter the request-wide vector.
+            let db_is_member = if !token_allows
+                || accessible_channels.contains(&ch_id)
+                || readable_system.contains(&ch_id)
+            {
                 None
             } else {
                 match state
@@ -185,13 +210,28 @@ pub async fn handle_req(
                 db_is_member,
             );
         }
+        if let Err(e) = super::system_channels::keep_repaired_system_channels_named(
+            &state,
+            conn.tenant.community(),
+            &mut accessible_channels,
+            repaired_from,
+            &mut readable_system,
+        )
+        .await
+        {
+            warn!(conn_id = %conn_id, "Failed to classify repaired channels: {e}");
+            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            return;
+        }
     }
 
     let authorized_requested_channels = requested_channel_ids.as_ref().map(|requested| {
         requested
             .iter()
             .copied()
-            .filter(|channel_id| accessible_channels.contains(channel_id))
+            .filter(|channel_id| {
+                accessible_channels.contains(channel_id) || readable_system.contains(channel_id)
+            })
             .collect::<Vec<_>>()
     });
     // Partial authorization preserves NIP-01 OR semantics by omitting only
@@ -318,6 +358,7 @@ pub async fn handle_req(
                 owner,
                 &filters,
                 &accessible_channels,
+                &readable_system,
                 token_channel_ids.is_none(),
                 &conn.tenant,
                 &pubkey_bytes,
@@ -416,7 +457,11 @@ pub async fn handle_req(
                     &mut params,
                     filter,
                     per_filter_channel,
-                    &accessible_channels,
+                    &super::system_channels::filter_channel_scope(
+                        filter,
+                        &accessible_channels,
+                        &readable_system,
+                    ),
                 );
                 // Shared-gated visibility pushdown: set reader bytes so query_events
                 // appends the SQL visibility clause before ORDER/LIMIT, preventing
@@ -448,6 +493,11 @@ pub async fn handle_req(
         // Phase 3 — post-processing, strictly in filter order.
         while let Some((idx, per_filter_channel, filter_events)) = results.next().await {
             let filter = &filters[idx];
+            let filter_scope = super::system_channels::filter_channel_scope(
+                filter,
+                &accessible_channels,
+                &readable_system,
+            );
             let events = match filter_events {
                 Ok(evs) => evs,
                 Err(e) => {
@@ -510,7 +560,7 @@ pub async fn handle_req(
                 }
 
                 if let Some(ch_id) = stored.channel_id {
-                    if !accessible_channels.contains(&ch_id) {
+                    if !filter_scope.contains(&ch_id) {
                         continue;
                     }
                 }
@@ -684,7 +734,8 @@ async fn handle_search_req(
     sub_id: &str,
     owner: u64,
     filters: &[Filter],
-    accessible_channels: &[uuid::Uuid],
+    implicit_channels: &[uuid::Uuid],
+    readable_system: &[uuid::Uuid],
     include_global: bool,
     tenant: &TenantContext,
     reader_pubkey_bytes: &[u8],
@@ -692,17 +743,15 @@ async fn handle_search_req(
     state: &AppState,
     trace_state: Option<&crate::conformance::AbstractState>,
 ) {
-    // The community-wide channel scope (no #h tag on the filter). `None` means
-    // "no accessible channels and no global access" → EOSE, exactly as the
-    // legacy string-filter helper short-circuited.
-    let all_channels_scope =
-        match build_search_channel_scope_filter(accessible_channels, include_global) {
-            Some(scope) => scope,
-            None => {
-                conn.send(RelayMessage::eose(sub_id));
-                return;
-            }
-        };
+    // `None` means "no accessible channels and no global access" → EOSE,
+    // exactly as the legacy string-filter helper short-circuited. A filter
+    // that names a readable system channel can still match it.
+    if build_search_channel_scope_filter(implicit_channels, include_global).is_none()
+        && readable_system.is_empty()
+    {
+        conn.send(RelayMessage::eose(sub_id));
+        return;
+    }
 
     let mut seen_ids: HashSet<nostr::EventId> = HashSet::new();
 
@@ -711,6 +760,13 @@ async fn handle_search_req(
             Some(s) if !s.is_empty() => s.clone(),
             _ => continue,
         };
+        // Implicit channels plus the readable system channels this filter
+        // names; never another filter's.
+        let accessible_channels = &*super::system_channels::filter_channel_scope(
+            filter,
+            implicit_channels,
+            readable_system,
+        );
 
         let limit = filter
             .limit
@@ -742,7 +798,11 @@ async fn handle_search_req(
                 }
                 buzz_search::ChannelScope::Channels(valid)
             } else {
-                all_channels_scope.clone()
+                // The community-wide scope (no #h tag on the filter).
+                match build_search_channel_scope_filter(accessible_channels, include_global) {
+                    Some(scope) => scope,
+                    None => continue,
+                }
             };
 
         let kinds = filter.kinds.as_ref().and_then(|ks| {
@@ -784,6 +844,7 @@ async fn handle_search_req(
                 page,
                 per_page: SEARCH_PAGE_SIZE,
                 mode: buzz_search::SearchMode::FullText,
+                sort: buzz_search::SearchSort::Relevance,
             };
 
             let search_result = match state.search.search(&search_query).await {
@@ -988,7 +1049,10 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
                 // #e is fully pushed (any count) via JSONB containment.
             }
             _ => {
-                // Any other generic tag (#t, #a, etc.) is not pushed.
+                // Any other generic tag (#t, #a, etc.) is not pushed exactly.
+                // #t/#P on group-state kinds are matched in SQL
+                // (`group_state_tag_values`), but this fast path does not
+                // model them, so COUNT still post-filters them.
                 if !tag_values.is_empty() {
                     return false;
                 }
@@ -1094,7 +1158,7 @@ fn filter_to_query_params(
         }
     });
 
-    // Push #e tag filter into SQL via JSONB containment.
+    // Push #e tag filter into SQL as an exact positional tag match.
     let e_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::E);
     let e_tags = filter.generic_tags.get(&e_tag_key).and_then(|values| {
         if values.is_empty() {
@@ -1161,6 +1225,8 @@ fn filter_to_query_params(
         .filter(|values| !values.is_empty())
         .map(|values| values.iter().map(|v| v.to_string()).collect());
 
+    let tag_values = group_state_tag_values(filter);
+
     EventQuery {
         channel_id,
         kinds,
@@ -1175,8 +1241,40 @@ fn filter_to_query_params(
         ids,
         e_tags,
         d_tag_values,
+        tag_values,
         ..EventQuery::for_community(community)
     }
+}
+
+/// `#t` (channel type and labels) and `#P` (creator) values to match in SQL
+/// before `LIMIT`, when every filter kind is a relay-signed group-state kind
+/// (39000–39003). Without this, a page of the newest group-state events is
+/// read first and the tag match runs after it, so a selective
+/// `{kinds:[39000], #t:[<label>], limit:n}` can return fewer than `n`
+/// matches, or none, while older matches exist.
+///
+/// The SQL match is exact NIP-01 tag matching (see
+/// [`EventQuery::tag_values`]), so no false candidate can take a place in
+/// the page. The caller's NIP-01 post-filter still runs on each event.
+fn group_state_tag_values(filter: &Filter) -> Vec<(String, Vec<String>)> {
+    if !super::system_channels::filter_is_group_state_only(filter) {
+        return Vec::new();
+    }
+    [
+        nostr::SingleLetterTag::lowercase(nostr::Alphabet::T),
+        nostr::SingleLetterTag::uppercase(nostr::Alphabet::P),
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let values = filter.generic_tags.get(&key)?;
+        (!values.is_empty()).then(|| {
+            (
+                key.to_string(),
+                values.iter().map(|value| value.to_string()).collect(),
+            )
+        })
+    })
+    .collect()
 }
 
 /// Push channel constraints into SQL before `LIMIT`.
@@ -2566,6 +2664,48 @@ mod tests {
         assert!(!filters_are_nip43_membership_only(&[
             Filter::new().kinds([nostr::Kind::Custom(13_534), nostr::Kind::TextNote]),
         ]));
+    }
+
+    #[test]
+    fn group_state_t_and_creator_tags_reach_sql_only_for_group_state_kinds() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let creator = "ab".repeat(32);
+        let filter = |kinds: serde_json::Value| -> Filter {
+            serde_json::from_value(serde_json::json!({
+                "kinds": kinds,
+                "#t": ["workspace", "team:core"],
+                "#P": [creator],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            filter_to_query_params(&filter(serde_json::json!([39000, 39002])), None, community)
+                .tag_values,
+            vec![
+                (
+                    "t".to_string(),
+                    // Filter tag values are a set, so they arrive sorted.
+                    vec!["team:core".to_string(), "workspace".to_string()]
+                ),
+                ("P".to_string(), vec![creator.clone()]),
+            ]
+        );
+        for kinds in [serde_json::json!([39000, 1]), serde_json::json!([30023])] {
+            assert!(
+                filter_to_query_params(&filter(kinds.clone()), None, community)
+                    .tag_values
+                    .is_empty(),
+                "kinds {kinds} must keep #t/#P as a post-filter"
+            );
+        }
+        let kindless: Filter = serde_json::from_value(serde_json::json!({"#t": ["x"]})).unwrap();
+        assert!(filter_to_query_params(&kindless, None, community)
+            .tag_values
+            .is_empty());
+        assert!(
+            !filter_fully_pushable(&filter(serde_json::json!([39000]))),
+            "containment can over-match, so COUNT must still post-filter"
+        );
     }
 
     #[test]
