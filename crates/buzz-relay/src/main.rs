@@ -626,7 +626,14 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
             );
             None
         } else {
-            match db.ensure_configured_community_for_bootstrap(&host).await {
+            let nip_fi_issuers = config
+                .nip_fi_provision_binding
+                .as_ref()
+                .map_or(&[][..], |policy| policy.issuers_for_new_host(&host));
+            match db
+                .ensure_configured_community_for_bootstrap(&host, nip_fi_issuers)
+                .await
+            {
                 Ok(record) => {
                     info!(host = %record.host, community = %record.id, "Deployment community ensured");
                     Some(record.id)
@@ -645,6 +652,12 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
             }
         }
     };
+
+    if let Some(policy) = &config.nip_fi_provision_binding {
+        buzz_relay::handlers::community_provisioning::verify_reserved_hosts_unbound(&db, policy)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
 
     // NIP-43: migrate any existing pubkey_allowlist entries to relay_members.
     // Idempotent — safe to run every startup. Must run before bootstrap_owner

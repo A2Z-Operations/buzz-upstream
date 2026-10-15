@@ -216,6 +216,36 @@ impl NipFiCommunities {
             .map(|c| c.expected_aud().to_owned())
             .collect()
     }
+
+    /// The configured community hosts.
+    pub fn hosts(&self) -> impl Iterator<Item = &str> {
+        self.by_host.keys().map(String::as_str)
+    }
+}
+
+/// Parse `BUZZ_NIP_FI_PROVISION_BINDING`, independent of `BUZZ_NIP_FI_MODE`.
+///
+/// Rejects a suffix that covers any `BUZZ_NIP_FI_COMMUNITIES` host, so the
+/// static enterprise map and database-bound communities never overlap.
+pub fn parse_provision_binding(
+    communities: &NipFiCommunities,
+) -> Result<Option<buzz_auth::ProvisionBindingPolicy>, ConfigError> {
+    let Some(policy) = buzz_auth::ProvisionBindingPolicy::from_env()
+        .map_err(|e| ConfigError::InvalidValue(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let suffix = policy.host_suffix();
+    if communities
+        .hosts()
+        .any(|host| host == suffix || host.ends_with(&format!(".{suffix}")))
+    {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_NIP_FI_PROVISION_BINDING: host_suffix covers a BUZZ_NIP_FI_COMMUNITIES host"
+                .to_string(),
+        ));
+    }
+    Ok(Some(policy))
 }
 
 /// The authority of a canonical community URI, or `None` unless the URI is

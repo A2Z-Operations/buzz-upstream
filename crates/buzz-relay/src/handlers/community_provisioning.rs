@@ -261,6 +261,12 @@ pub async fn provision_community(
     }
 
     validate_host(&request.host)?;
+    let nip_fi_policy = state.config.nip_fi_provision_binding.as_ref();
+    if nip_fi_policy.is_some_and(|policy| policy.is_reserved(&request.host)) {
+        return Err("host is reserved: it is a NIP-FI command audience".to_string());
+    }
+    let nip_fi_issuers =
+        nip_fi_policy.map_or(&[][..], |policy| policy.issuers_for_new_host(&request.host));
 
     let initial_owner = request
         .initial_owner_pubkey
@@ -278,7 +284,11 @@ pub async fn provision_community(
         })?;
         let record = match state
             .db
-            .create_community_with_owner(&request.host, owner_hex)
+            .create_community_with_owner_and_nip_fi_issuers(
+                &request.host,
+                owner_hex,
+                nip_fi_issuers,
+            )
             .await
             .map_err(|e| format!("failed to create community: {e}"))?
         {
@@ -312,7 +322,7 @@ pub async fn provision_community(
     // create_only so an existing owner can never be rotated by a create race.
     let record = state
         .db
-        .ensure_configured_community(&request.host)
+        .ensure_configured_community_with_nip_fi_issuers(&request.host, nip_fi_issuers)
         .await
         .map_err(|e| format!("failed to create community: {e}"))?;
 
@@ -351,6 +361,26 @@ pub async fn provision_community(
         status: if record.created { "created" } else { "existed" },
         owner_pubkey: initial_owner,
     })
+}
+
+/// Refuse startup when a reserved host (a NIP-FI command audience) holds an
+/// issuer binding. An unbound reserved community row is valid.
+pub async fn verify_reserved_hosts_unbound(
+    db: &buzz_db::Db,
+    policy: &buzz_auth::ProvisionBindingPolicy,
+) -> Result<(), String> {
+    let bound = db
+        .nip_fi_bound_hosts(&policy.reserved_hosts())
+        .await
+        .map_err(|e| format!("failed to check reserved NIP-FI hosts: {e}"))?;
+    if bound.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "reserved hosts hold NIP-FI issuer bindings (a command audience must never be a \
+             community audience): {bound:?}"
+        ))
+    }
 }
 
 #[cfg(test)]

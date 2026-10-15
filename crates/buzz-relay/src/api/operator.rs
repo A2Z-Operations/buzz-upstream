@@ -901,6 +901,46 @@ pub async fn community_availability(
     })))
 }
 
+/// Read a community's NIP-FI issuer binding from the database. Reserved hosts
+/// (NIP-FI command audiences) always report no issuers.
+pub async fn community_nip_fi_binding(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<CommunityAvailabilityQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    authorize_operator_request(
+        &state,
+        &headers,
+        "GET",
+        "/operator/communities/nip-fi-binding",
+        raw_query.as_deref(),
+        None,
+    )
+    .await?;
+
+    let normalized_host = normalize_candidate_host(&query.host)
+        .map_err(|msg| api_error(StatusCode::BAD_REQUEST, &msg))?;
+    let record = state
+        .db
+        .lookup_nip_fi_binding_by_host(&normalized_host)
+        .await
+        .map_err(|e| internal_error(&format!("look up NIP-FI binding: {e}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "community not found"))?;
+    let reserved = state
+        .config
+        .nip_fi_provision_binding
+        .as_ref()
+        .is_some_and(|policy| policy.is_reserved(&normalized_host));
+    let issuers = if reserved { Vec::new() } else { record.issuers };
+
+    Ok(Json(serde_json::json!({
+        "host": record.host,
+        "active": record.active,
+        "issuers": issuers,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
@@ -2570,6 +2610,51 @@ mod postgres_tests {
             .execute(&pool)
             .await
             .expect("clean up listener registrations");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_binding_route_reads_bound_issuers_and_404s_unknown_hosts() {
+        let operator = Keys::generate();
+        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+            return;
+        };
+        let host = format!("community-{}.example", Uuid::new_v4().simple());
+        let issuer = "https://issuer.example/api/goose".to_string();
+        state
+            .db
+            .ensure_configured_community_with_nip_fi_issuers(&host, std::slice::from_ref(&issuer))
+            .await
+            .expect("seed bound community");
+        let router = build_router(state);
+
+        for (query_host, expected) in [
+            (host.to_uppercase(), StatusCode::OK),
+            (format!("missing-{host}"), StatusCode::NOT_FOUND),
+        ] {
+            let query = format!("host={query_host}");
+            let url = format!("http://{INGRESS_HOST}/operator/communities/nip-fi-binding?{query}");
+            let auth = nip98_auth_header(&operator, &url, "GET", None);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/operator/communities/nip-fi-binding?{query}"))
+                        .header(header::HOST, INGRESS_HOST)
+                        .header(header::AUTHORIZATION, auth)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected, "{query_host}");
+            if expected == StatusCode::OK {
+                let json = read_json(response).await;
+                assert_eq!(json["host"], host);
+                assert_eq!(json["active"], true);
+                assert_eq!(json["issuers"], serde_json::json!([issuer]));
+            }
+        }
     }
 
     #[tokio::test]
