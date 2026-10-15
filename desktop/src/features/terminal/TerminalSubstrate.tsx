@@ -609,6 +609,12 @@ export function TerminalSubstrate({
                 session.active && "buzz-terminal-tab-active",
               )}
               key={session.id}
+              onAuxClick={(event) => {
+                if (event.button !== 1) return;
+                event.preventDefault();
+                if (session.closing) return;
+                runTabAction(() => onCloseSession(session.id));
+              }}
               role="presentation"
             >
               <button

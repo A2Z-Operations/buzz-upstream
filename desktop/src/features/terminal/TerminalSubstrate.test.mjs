@@ -233,6 +233,40 @@ test("tab actions restore terminal input focus", async () => {
   }
 });
 
+test("middle-click closes an open terminal tab only", async () => {
+  const closed = [];
+  const { view } = fixture({
+    onCloseSession(id) {
+      closed.push(id);
+    },
+    sessions: [
+      { active: true, closing: false, id: "one", title: "SHELL" },
+      { active: false, closing: true, id: "two", title: "LOG" },
+    ],
+  });
+  await ready(view);
+
+  const openTab = view.getByRole("tab", { name: "Terminal 1" }).parentElement;
+  const closingTab = view.getByRole("tab", {
+    name: "Terminal 2, closing",
+  }).parentElement;
+  const auxClick = (target, button) => {
+    const event = new dom.window.MouseEvent("auxclick", {
+      bubbles: true,
+      button,
+      cancelable: true,
+    });
+    fireEvent(target, event);
+    return event;
+  };
+  const middleClick = auxClick(openTab, 1);
+  auxClick(openTab, 2);
+  auxClick(closingTab, 1);
+
+  assert.deepEqual(closed, ["one"]);
+  assert.equal(middleClick.defaultPrevented, true);
+});
+
 test("drag resize batches visual updates and commits state only on release", async () => {
   const { view } = fixture({ mode: "docked" });
   await ready(view);
