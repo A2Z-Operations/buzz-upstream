@@ -319,26 +319,17 @@ fn authority_contains_userinfo(uri: &str) -> bool {
     authority.is_empty() || authority.contains('@')
 }
 
-/// Resolve `host:port` and enforce the public HTTPS address policy.
+/// Resolve `host:port` and enforce the selected transport's address policy.
 ///
 /// Returns the first permitted address for DNS pinning. Blocks on the OS
 /// resolver via `spawn_blocking` to avoid blocking the async runtime.
 ///
 /// Uses the `(host, port)` tuple form of `ToSocketAddrs` — not
-/// `format!("{host}:{port}")` — so IPv6 literal hosts (returned without
-/// brackets by `Url::host_str()`) are handled correctly without socket-address
-/// ambiguity.
+/// `format!("{host}:{port}")` — so bare IPv6 literal hosts are handled
+/// correctly without socket-address ambiguity.
 ///
-/// Rejecting *any* resolved address (not just the first) closes split-horizon
-/// DNS attacks: if an attacker can cause one DNS record to resolve to a private
-/// address, the entire request is blocked even when other records are public.
-pub(crate) async fn resolve_and_check_ssrf(
-    host: &str,
-    port: u16,
-) -> Result<std::net::IpAddr, JwksFetchError> {
-    resolve_for_transport(host, port, JwksTransport::PublicHttps).await
-}
-
+/// Every resolved address must satisfy the selected transport's policy; one
+/// disallowed answer blocks the entire request, even when other answers pass.
 async fn resolve_for_transport(
     host: &str,
     port: u16,
