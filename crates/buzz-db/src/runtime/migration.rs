@@ -709,7 +709,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 64);
+        assert_eq!(migrations.len(), 65);
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
@@ -726,6 +726,11 @@ mod postgres_tests {
             .contains("ALTER TYPE channel_type ADD VALUE IF NOT EXISTS 'system'"));
         assert_eq!(migrations[63].version, 64);
         assert!(migrations[63]
+            .sql
+            .as_str()
+            .contains("CREATE FUNCTION profile_name_fields"));
+        assert_eq!(migrations[64].version, 65);
+        assert!(migrations[64]
             .sql
             .as_str()
             .contains("CREATE TABLE community_nip_fi_issuers"));
@@ -2291,10 +2296,10 @@ mod postgres_tests {
         }
         expected_fences.extend(personal.fence_attachments);
         expected_fences.extend(["artifact_heads", "artifact_revisions"].map(str::to_owned));
-        // 0064 fences the NIP-FI issuer bindings table.
+        // 0065 fences the NIP-FI issuer bindings table.
         assert!(MIGRATOR
             .iter()
-            .find(|m| m.version == 64)
+            .find(|m| m.version == 65)
             .expect("NIP-FI binding migration")
             .sql
             .as_str()
