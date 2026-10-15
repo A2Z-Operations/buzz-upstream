@@ -19,8 +19,9 @@ const IDLE_POLL_CEILING: Duration = Duration::from_secs(2);
 const OUTBOX_REAP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const REGISTRATION_REAP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Largest channel `about` a notification carries. A larger one omits the
-/// whole `channel` object, so the listener reads the channel itself and the
-/// body stays within the listener's size cap.
+/// whole `channel` object and the listener reads the channel itself. Even
+/// escaped, this keeps a body with a frame-sized event well under kgoose's
+/// 1 MiB cap.
 const MAX_NOTIFICATION_ABOUT_BYTES: usize = 16 * 1024;
 
 /// Notification sent to the configured operator-listener endpoint.
@@ -456,7 +457,7 @@ mod tests {
 
     impl Default for MockStore {
         fn default() -> Self {
-            Self::loading(Ok(Some(stored_event(Kind::Custom(9)))))
+            Self::loading(Ok(Some(deliverable_event(Kind::Custom(9)))))
         }
     }
 
@@ -475,7 +476,7 @@ mod tests {
         }
     }
 
-    fn stored_event(kind: Kind) -> buzz_db::operator_listener::DeliverableEvent {
+    fn deliverable_event(kind: Kind) -> buzz_db::operator_listener::DeliverableEvent {
         let event = EventBuilder::new(kind, "hello agent")
             .sign_with_keys(&Keys::generate())
             .expect("sign test event");
@@ -658,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn successful_delivery_posts_payload_and_completes_claim() {
         let (routes, relay_keypair, delivery) = delivery_fixture(1);
-        let mut loaded = stored_event(Kind::Custom(9));
+        let mut loaded = deliverable_event(Kind::Custom(9));
         let channel = buzz_db::operator_listener::DeliveryChannel {
             id: Uuid::new_v4(),
             name: "general".to_owned(),
@@ -717,9 +718,9 @@ mod tests {
 
     async fn delivered_channel(
         channel: Option<buzz_db::operator_listener::DeliveryChannel>,
-    ) -> serde_json::Value {
+    ) -> Option<serde_json::Value> {
         let (routes, relay_keypair, delivery) = delivery_fixture(1);
-        let mut loaded = stored_event(Kind::Custom(9));
+        let mut loaded = deliverable_event(Kind::Custom(9));
         loaded.channel = channel;
         let store = MockStore::loading(Ok(Some(loaded)));
         let transport = MockTransport::new(Ok(StatusCode::NO_CONTENT));
@@ -729,9 +730,7 @@ mod tests {
         let request = transport.take_request().expect("delivery request");
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
         assert!(body.get("event").is_some());
-        body.get("channel")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null)
+        body.get("channel").cloned()
     }
 
     #[tokio::test]
@@ -743,27 +742,31 @@ mod tests {
             visibility: "private".to_owned(),
             about,
         };
-        assert_eq!(delivered_channel(None).await, serde_json::Value::Null);
+        assert_eq!(delivered_channel(None).await, None);
         for about in [None, Some(String::new())] {
-            let delivered = delivered_channel(Some(channel(about))).await;
+            let delivered = delivered_channel(Some(channel(about)))
+                .await
+                .expect("channel");
             assert_eq!(delivered["channel_type"], "dm");
             assert!(delivered.get("about").is_none(), "{delivered}");
         }
         let largest = "a".repeat(MAX_NOTIFICATION_ABOUT_BYTES);
         assert_eq!(
-            delivered_channel(Some(channel(Some(largest.clone())))).await["about"],
+            delivered_channel(Some(channel(Some(largest.clone()))))
+                .await
+                .expect("channel")["about"],
             largest
         );
         assert_eq!(
             delivered_channel(Some(channel(Some(format!("{largest}a"))))).await,
-            serde_json::Value::Null
+            None
         );
     }
 
     #[tokio::test]
     async fn unreadable_event_retries_then_fails_without_http_request() {
         // Author-only kinds pass the database check but not the reader check.
-        for loaded in [None, Some(stored_event(Kind::Custom(30300)))] {
+        for loaded in [None, Some(deliverable_event(Kind::Custom(30300)))] {
             for (attempt, expect_retry) in [
                 (1, true),
                 (buzz_db::operator_listener::MAX_DELIVERY_ATTEMPTS, false),

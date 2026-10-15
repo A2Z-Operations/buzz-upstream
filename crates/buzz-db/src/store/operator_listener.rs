@@ -356,20 +356,16 @@ pub async fn load_deliverable_event(
     let Some(row) = row else {
         return Ok(None);
     };
-    let channel = match (
-        row.try_get::<Option<Uuid>, _>("channel_id")?,
-        row.try_get::<Option<String>, _>("channel_name")?,
-        row.try_get::<Option<String>, _>("channel_type")?,
-        row.try_get::<Option<String>, _>("channel_visibility")?,
-    ) {
-        (Some(id), Some(name), Some(channel_type), Some(visibility)) => Some(DeliveryChannel {
-            id,
+    // The channel columns are NOT NULL, so a name means the join matched.
+    let channel = match row.try_get::<Option<String>, _>("channel_name")? {
+        Some(name) => Some(DeliveryChannel {
+            id: row.try_get("channel_id")?,
             name,
-            channel_type,
-            visibility,
+            channel_type: row.try_get("channel_type")?,
+            visibility: row.try_get("channel_visibility")?,
             about: row.try_get("channel_about")?,
         }),
-        _ => None,
+        None => None,
     };
     Ok(crate::event::row_to_stored_event(row)?.map(|stored| DeliverableEvent { stored, channel }))
 }
@@ -1229,11 +1225,13 @@ mod postgres_tests {
         .await
         .expect("register target");
 
+        let dangling_channel = Uuid::new_v4();
         let mut deliveries = HashMap::new();
         for channel in [
             Some(open_channel),
             Some(member_channel),
             Some(other_channel),
+            Some(dangling_channel),
             None,
         ] {
             let event = EventBuilder::new(Kind::Custom(9), format!("hello {channel:?}"))
@@ -1305,6 +1303,10 @@ mod postgres_tests {
             Some((member_channel, "private".to_owned()))
         );
         assert!(load(other_channel).await.is_none(), "non-member may not");
+        assert!(
+            load(dangling_channel).await.is_none(),
+            "missing channel row"
+        );
         let channel_less = load_with(deliveries[&None].clone(), OPEN_RELAY)
             .await
             .expect("channel-less event");
