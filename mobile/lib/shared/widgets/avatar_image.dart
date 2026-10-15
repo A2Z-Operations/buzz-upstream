@@ -57,7 +57,15 @@ class AvatarImage extends StatelessWidget {
     final borderRadius = BorderRadius.circular(radius * 0.6);
     return DecoratedBox(
       decoration: BoxDecoration(color: color, borderRadius: borderRadius),
-      child: ClipRRect(borderRadius: borderRadius, child: content),
+      child: ClipRRect(
+        borderRadius: borderRadius,
+        child: !usesInsetAgentArtwork(imageUrl)
+            ? content
+            : Transform.scale(
+                scale: animatedAvatarArtworkScale,
+                child: content,
+              ),
+      ),
     );
   }
 }
