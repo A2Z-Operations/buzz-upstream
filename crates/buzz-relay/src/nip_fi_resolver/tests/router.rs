@@ -284,7 +284,10 @@ async fn each_admission_resolves_its_host_exactly_once() {
     let token = mint(ISS, &host("fresh"));
     for (n, path) in sites().iter().enumerate() {
         let outcome = p.send(path, &host("fresh"), Some(&token)).await;
-        assert!(cleared_nip_fi(&[outcome.clone()]), "{path}: {outcome:?}");
+        assert!(
+            cleared_nip_fi(std::slice::from_ref(&outcome)),
+            "{path}: {outcome:?}"
+        );
         assert_eq!(store.lookups_for(&host("fresh")), n + 1, "{path}");
     }
 }
@@ -418,7 +421,10 @@ async fn off_mode_with_database_source_neither_gates_nor_resolves() {
     let p = pod(&store, &clock, NipFiMode::Off).await;
     for path in sites() {
         let outcome = p.send(&path, &host("quiet"), None).await;
-        assert!(cleared_nip_fi(&[outcome.clone()]), "{path}: {outcome:?}");
+        assert!(
+            cleared_nip_fi(std::slice::from_ref(&outcome)),
+            "{path}: {outcome:?}"
+        );
     }
     assert!(store.lookups.lock().unwrap().is_empty());
 }
@@ -426,6 +432,7 @@ async fn off_mode_with_database_source_neither_gates_nor_resolves() {
 // ── Criterion 5: a disconnect covers communities created after it ──────────
 
 #[tokio::test]
+#[allow(clippy::result_large_err)] // the NIP-98 closure returns the production `Response` error type
 async fn key_disconnected_before_its_community_exists_is_denied_there() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();

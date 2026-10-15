@@ -304,7 +304,7 @@ impl DatabaseResolver {
             return Err(UNAVAILABLE);
         }
         self.ensure_fresh()?;
-        if let Some(binding) = self.from_memory(&host) {
+        if let Some(binding) = self.lookup_in_memory(&host) {
             return Ok(binding);
         }
         if self.negatively_cached(&host) {
@@ -323,7 +323,7 @@ impl DatabaseResolver {
     pub fn resolve_from_memory(&self, raw_host: &str) -> Option<Arc<CommunityBinding>> {
         let host = normalize_host(raw_host);
         self.passes_prefilter(&host)
-            .then(|| self.from_memory(&host))
+            .then(|| self.lookup_in_memory(&host))
             .flatten()
     }
 
@@ -471,7 +471,7 @@ impl DatabaseResolver {
 
     /// Snapshot, then overlay. Clones only the selected binding; each guard
     /// is dropped before returning.
-    fn from_memory(&self, host: &str) -> Option<Arc<CommunityBinding>> {
+    fn lookup_in_memory(&self, host: &str) -> Option<Arc<CommunityBinding>> {
         if let Some(binding) = self
             .published
             .load()
