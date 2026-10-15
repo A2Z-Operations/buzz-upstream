@@ -104,6 +104,9 @@ class HomePage extends HookConsumerWidget {
         settingsPageBuilder: settingsPageBuilder,
         onSearch: () => Navigator.of(context).push(
           PageRouteBuilder<void>(
+            // Keep Android backdrop filters composited while search is open.
+            // UIKit controls must instead be hidden beneath the iOS route.
+            opaque: defaultTargetPlatform == TargetPlatform.iOS,
             allowSnapshotting: false,
             transitionDuration: reducedMotion
                 ? Duration.zero
