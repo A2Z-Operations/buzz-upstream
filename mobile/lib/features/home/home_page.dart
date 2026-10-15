@@ -105,8 +105,24 @@ class HomePage extends HookConsumerWidget {
         onSearch: () => Navigator.of(context).push(
           PageRouteBuilder<void>(
             allowSnapshotting: false,
-            transitionDuration: Duration.zero,
-            reverseTransitionDuration: Duration.zero,
+            transitionDuration: reducedMotion
+                ? Duration.zero
+                : const Duration(milliseconds: 260),
+            reverseTransitionDuration: reducedMotion
+                ? Duration.zero
+                : const Duration(milliseconds: 220),
+            transitionsBuilder: (_, animation, secondaryAnimation, child) =>
+                reducedMotion
+                ? child
+                : SlideTransition(
+                    position: animation.drive(
+                      Tween(
+                        begin: const Offset(0, 1),
+                        end: Offset.zero,
+                      ).chain(CurveTween(curve: Curves.easeOutCubic)),
+                    ),
+                    child: child,
+                  ),
             pageBuilder: (_, animation, secondaryAnimation) =>
                 const SearchPage(),
           ),
