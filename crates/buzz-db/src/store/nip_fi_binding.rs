@@ -555,4 +555,104 @@ mod postgres_tests {
         assert_eq!(bound(&db, &unbound).await, Some(Vec::new()));
         assert_eq!(bound(&db, &unique_host("missing")).await, None);
     }
+
+    /// Move `host`'s community out of `active` the way the deletion executor
+    /// does: the tombstone trigger admits the state change only under the
+    /// executor's community and fence-generation settings.
+    async fn start_deleting(db: &Db, host: &str) {
+        let mut tx = db.pool.begin().await.expect("begin");
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM communities WHERE host = $1")
+            .bind(host)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("community id");
+        sqlx::query("SELECT set_config('buzz.deletion_executor_community', $1, true), set_config('buzz.deletion_fence_generation', '1', true)")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("executor settings");
+        sqlx::query("UPDATE communities SET deletion_state = 'quiescing', deletion_fence_generation = 1 WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect("start deletion");
+        tx.commit().await.expect("commit");
+    }
+
+    async fn snapshot_hosts(db: &Db, registry: &[String]) -> Vec<String> {
+        db.load_nip_fi_binding_snapshot(registry, 100_000, async {})
+            .await
+            .expect("snapshot")
+            .expect("under cap")
+            .rows
+            .into_iter()
+            .map(|(host, _)| host)
+            .collect()
+    }
+
+    async fn admission(db: &Db, host: &str, registry: &[String]) -> Vec<String> {
+        db.lookup_nip_fi_admission_binding(host, registry)
+            .await
+            .expect("admission lookup")
+            .expect("under cap")
+    }
+
+    // Criterion 14(a): archived and deleting communities drop out of both the
+    // snapshot load and the admission miss lookup; an active control stays.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn snapshot_and_admission_lookup_skip_archived_and_deleting_communities() {
+        let db = setup_db().await;
+        let registry = issuers();
+        let [archived, deleting, control] = ["archived", "deleting", "control"].map(unique_host);
+        for host in [&archived, &deleting, &control] {
+            db.ensure_configured_community_with_nip_fi_issuers(host, &registry)
+                .await
+                .expect("seed");
+            assert!(snapshot_hosts(&db, &registry).await.contains(host));
+            assert_eq!(admission(&db, host, &registry).await, registry);
+        }
+
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE host = $1")
+            .bind(&archived)
+            .execute(&db.pool)
+            .await
+            .expect("archive");
+        start_deleting(&db, &deleting).await;
+
+        let hosts = snapshot_hosts(&db, &registry).await;
+        for gone in [&archived, &deleting] {
+            assert!(!hosts.contains(gone), "{gone} must leave the snapshot");
+            assert!(admission(&db, gone, &registry).await.is_empty(), "{gone}");
+        }
+        assert!(hosts.contains(&control));
+        assert_eq!(admission(&db, &control, &registry).await, registry);
+    }
+
+    // Criterion 17(a)(1): only registered issuers come back, and a host bound
+    // only to unregistered issuers yields zero rows from the real SQL.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn admission_lookup_returns_only_registered_issuers() {
+        let db = setup_db().await;
+        let other = "https://unregistered.example".to_string();
+        let mixed = unique_host("mixed");
+        let foreign = unique_host("foreign");
+        db.ensure_configured_community_with_nip_fi_issuers(
+            &mixed,
+            &[ISS.to_string(), other.clone()],
+        )
+        .await
+        .expect("seed mixed");
+        db.ensure_configured_community_with_nip_fi_issuers(&foreign, std::slice::from_ref(&other))
+            .await
+            .expect("seed foreign");
+
+        assert_eq!(
+            admission(&db, &mixed.to_uppercase(), &issuers()).await,
+            issuers()
+        );
+        assert!(admission(&db, &foreign, &issuers()).await.is_empty());
+        assert!(!snapshot_hosts(&db, &issuers()).await.contains(&foreign));
+    }
 }
