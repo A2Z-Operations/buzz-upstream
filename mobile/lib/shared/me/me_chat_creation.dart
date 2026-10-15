@@ -56,6 +56,19 @@ class MeChatCreation {
     sync.check();
   }
 
+  /// Abandon only this reviewed intent, preserving any relay channel/messages.
+  /// Partial channels remain accessible from Home (or Solo if already placed).
+  Future<void> discard(MeSync sync) async {
+    if (sync.disposed) throw StateError('Your community changed. Try again.');
+    final current = pending(sync);
+    if (current?.id != id || current?.name != name || current?.agent != agent) {
+      throw StateError('The unfinished chat changed. Review it again.');
+    }
+    if (!await sync.prefs!.remove(storageKey(sync))) {
+      throw StateError('Couldn’t discard this setup. Try again.');
+    }
+  }
+
   /// Keep the journal through every relay step, including Me placement.
   Future<T> complete<T>(
     MeSync sync, {

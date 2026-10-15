@@ -1,3 +1,4 @@
+import 'package:buzz/features/channels/compose_bar.dart';
 import 'package:buzz/features/channels/agent_reply_handoff.dart';
 import 'package:buzz/features/channels/me/me_messages_provider.dart';
 import 'package:buzz/shared/me/me_assistants.dart';
@@ -281,6 +282,7 @@ Widget _buildTestable({
   http.Client? mediaClient,
   VideoPreviewFrameLoader? videoPreviewLoader,
   Widget? home,
+  Stream<MeGroups>? organization,
 }) {
   final resolvedChannel = channel ?? _testChannel;
   final navigatorKey = GlobalKey<NavigatorState>();
@@ -291,6 +293,13 @@ Widget _buildTestable({
   return ProviderScope(
     retry: providerRetry ?? (disableRetries ? (_, _) => null : null),
     overrides: [
+      meGroupsProvider.overrideWith(
+        (ref) =>
+            organization ??
+            Stream.value(
+              MeGroups(channels: personalChat ? [resolvedChannel.id] : []),
+            ),
+      ),
       if (personalChat) ...[
         meSyncProvider.overrideWithValue(
           MeSync(
@@ -307,7 +316,6 @@ Widget _buildTestable({
         ),
         meMessagesProvider(_channelId).overrideWith(() => fakeMessagesNotifier),
         meAssistantsProvider.overrideWith((ref) async => []),
-        meGroupsProvider.overrideWith((ref) => Stream.value(const MeGroups())),
       ],
       if (videoPreviewLoader != null)
         videoPreviewFrameLoaderProvider.overrideWithValue(videoPreviewLoader),
@@ -10233,6 +10241,65 @@ void main() {
     });
   });
 
+  testWidgets('unknown Solo placement remains readable but cannot send', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _buildTestable(
+        disableRetries: true,
+        organization: Stream.error(StateError('offline')),
+        messages: [
+          _textMsg(id: 'visible', pubkey: 'alice', content: 'Cached message'),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(findRichText('Cached message'), findsOneWidget);
+    final compose = tester.widget<ComposeBar>(find.byType(ComposeBar));
+    await expectLater(
+      compose.onSend('Do not route without placement', []),
+      throwsStateError,
+    );
+  });
+
+  testWidgets(
+    'default Activity/deep-link entry resolves Solo and keeps replies inline',
+    (tester) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          personalChat: true,
+          messages: [
+            _textMsg(id: threadIdRoot, pubkey: 'self', content: 'Question'),
+            _textMsg(
+              id: threadIdReplyZero,
+              pubkey: 'alice',
+              content: 'Agent answer',
+              extraTags: [
+                ['e', threadIdRoot, '', 'reply'],
+              ],
+            ),
+          ],
+          home: ChannelDetailPage(
+            channel: _testChannel,
+            initialMessageId: threadIdReplyZero,
+            initialThreadRootId: threadIdRoot,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('me-assistant-button')), findsOneWidget);
+      expect(findRichText('Agent answer'), findsOneWidget);
+      expect(find.byType(ThreadDetailPage), findsNothing);
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(ChannelDetailPage)),
+      );
+      final notifier =
+          container.read(meMessagesProvider(_channelId).notifier)
+              as _FakeMessagesNotifier;
+      expect(notifier.loadedEventIds, contains(threadIdReplyZero));
+    },
+  );
+
   group('Typing indicator', () {
     testWidgets('Me reply consumes typing and grows its pending bubble', (
       tester,
@@ -16257,6 +16324,13 @@ class _FakeMessagesNotifier extends ChannelMessagesNotifier {
   final List<List<NostrEvent>> _olderPages;
   final bool failOlderFetch;
   final Map<String, ChannelWindowThreadSummary> summaries;
+  final loadedEventIds = <String>{};
+  @override
+  Future<void> loadEventsById(Iterable<String> eventIds) async {
+    loadedEventIds.addAll(eventIds);
+    await super.loadEventsById(eventIds);
+  }
+
   int fetchOlderCalls = 0;
 
   _FakeMessagesNotifier(

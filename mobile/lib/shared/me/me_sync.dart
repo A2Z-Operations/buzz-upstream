@@ -12,13 +12,14 @@ import '../relay/relay.dart';
 import 'me_groups.dart';
 import 'me_recovery.dart';
 
-/// A live, account/community-scoped reader for desktop's encrypted Me record.
+/// A live, account/community-scoped reader for desktop's encrypted Solo record.
 final meGroupsProvider = StreamProvider<MeGroups>((ref) {
   final service = ref.watch(meSyncProvider);
   final controller = StreamController<MeGroups>();
   var disposed = false;
   void Function()? unsubscribe;
   NostrEvent? latest;
+  var hasSnapshot = false;
   void accept(NostrEvent event) {
     if (disposed ||
         (latest != null &&
@@ -29,9 +30,11 @@ final meGroupsProvider = StreamProvider<MeGroups>((ref) {
     try {
       final value = service.decode(event);
       latest = event;
+      hasSnapshot = true;
       controller.add(value);
+      unawaited(service.cache(event).catchError((Object _) {}));
     } catch (error, stack) {
-      controller.addError(error, stack);
+      if (!hasSnapshot) controller.addError(error, stack);
     }
   }
 
@@ -42,23 +45,35 @@ final meGroupsProvider = StreamProvider<MeGroups>((ref) {
       if (event != null) {
         accept(event);
       } else if (latest == null) {
+        hasSnapshot = true;
         controller.add(const MeGroups());
+        await service.cache(null);
       }
     } catch (error, stack) {
-      if (!disposed) controller.addError(error, stack);
+      if (!disposed && !hasSnapshot) controller.addError(error, stack);
     }
   }
 
   Future<void> start() async {
+    try {
+      final cached = service.cachedSnapshot();
+      if (cached != null) {
+        latest = cached.event;
+        hasSnapshot = true;
+        controller.add(cached.groups);
+      }
+    } catch (_) {
+      // A corrupt cache must not prevent a fresh relay read.
+    }
     try {
       service.check();
       unsubscribe = await service.session.subscribe(
         service.filter,
         accept,
         onClosed: (_) {
-          if (!disposed) {
+          if (!disposed && !hasSnapshot) {
             controller.addError(
-              StateError('Couldn’t sync Me. Reconnect and try again.'),
+              StateError('Couldn’t sync Solo. Reconnect and try again.'),
             );
           }
         },
@@ -69,7 +84,7 @@ final meGroupsProvider = StreamProvider<MeGroups>((ref) {
       }
       await refresh();
     } catch (error, stack) {
-      if (!disposed) controller.addError(error, stack);
+      if (!disposed && !hasSnapshot) controller.addError(error, stack);
     }
   }
 
@@ -119,6 +134,48 @@ class MeSync {
 
   MeSync(this.session, this.config, {this.connected = true, this.prefs});
 
+  /// Encrypted last verified organization, isolated by account and community.
+  String get cacheKey => 'me-cache:$community:$pubkey';
+
+  /// Read while offline. A signed event preserves replacement ordering.
+  ({NostrEvent? event, MeGroups groups})? cachedSnapshot() {
+    if (disposed || config.nsec == null) return null;
+    final saved = prefs?.getString(cacheKey);
+    if (saved == null) return null;
+    final value = jsonDecode(nip44Decrypt(key, saved)) as Map<String, dynamic>;
+    if (value['community'] != community) {
+      throw const FormatException('Invalid cached organization');
+    }
+    final json = value['event'] as Map<String, dynamic>?;
+    final event = json == null ? null : NostrEvent.fromJson(json);
+    return (
+      event: event,
+      groups: event == null ? const MeGroups() : decode(event),
+    );
+  }
+
+  /// Store only verified data; never overwrite a newer persisted head.
+  Future<void> cache(NostrEvent? event) async {
+    if (disposed || config.nsec == null || prefs == null) return;
+    if (event != null) decode(event);
+    try {
+      final previous = cachedSnapshot()?.event;
+      if (previous != null &&
+          (event == null || !meEventIsNewer(event, previous))) {
+        return;
+      }
+    } catch (_) {
+      // Replace corrupt local storage with verified relay data.
+    }
+    await prefs!.setString(
+      cacheKey,
+      nip44Encrypt(
+        key,
+        jsonEncode({'community': community, 'event': event?.toJson()}),
+      ),
+    );
+  }
+
   NostrFilter get filter => NostrFilter(
     kinds: const [30078],
     authors: [pubkey],
@@ -130,9 +187,9 @@ class MeSync {
 
   void check() {
     if (!connected || config.nsec == null) {
-      throw StateError('Connect to your community to load Me.');
+      throw StateError('Connect to your community to load Solo.');
     }
-    if (disposed) throw StateError('Your community changed. Open Me again.');
+    if (disposed) throw StateError('Your community changed. Open Solo again.');
   }
 
   MeGroups decode(NostrEvent event) {
@@ -148,7 +205,7 @@ class MeSync {
         !event.tags.any(
           (t) => t.length == 2 && t[0] == 't' && t[1] == MeGroups.tag,
         )) {
-      throw const FormatException('Invalid Me record');
+      throw const FormatException('Invalid Solo record');
     }
     nostr.Event.fromJson(jsonEncode(event.toJson()));
     return MeGroups.decode(nip44Decrypt(key, event.content), community);
@@ -178,7 +235,7 @@ class MeSync {
   /// Refresh before applying an intent, then confirm the selected signed event.
   Future<void> update(MeGroups Function(MeGroups) change) async {
     check();
-    if (_saving) throw StateError('A Me change is still being saved.');
+    if (_saving) throw StateError('A Solo change is still being saved.');
     _saving = true;
     try {
       MeGroups? recovered;
@@ -213,20 +270,20 @@ class MeSync {
             await session.publish(event);
             if ((await head())?.id != event.id) {
               throw StateError(
-                'A previous Me save is still unconfirmed. Try again.',
+                'A previous Solo save is still unconfirmed. Try again.',
               );
             }
           }
           await prefs?.remove(pendingKey);
           throw StateError(
-            'Your previous Me save is confirmed. Review your projects before making another change.',
+            'Your previous Solo save is confirmed. Review your projects before making another change.',
           );
         }
       }
       final before = await head();
       if (recovered != null && before?.id != recoveredHead) {
         throw StateError(
-          'Me changed again. Your pending change is saved; try again.',
+          'Solo changed again. Your pending change is saved; try again.',
         );
       }
       final value =
@@ -243,7 +300,7 @@ class MeSync {
       final current = await head();
       if (before?.id != current?.id) {
         throw StateError(
-          'Me changed on another device. Refresh and try again.',
+          'Solo changed on another device. Refresh and try again.',
         );
       }
       if (current != null &&
@@ -275,13 +332,13 @@ class MeSync {
       check();
       if ((await head())?.id != signed.id) {
         throw StateError(
-          'Another Me change is selected. Refresh to see the latest projects.',
+          'Another Solo change is selected. Refresh to see the latest projects.',
         );
       }
       await prefs?.remove(pendingKey);
       if (recovered != null) {
         throw StateError(
-          'Your previous Me save was recovered alongside the desktop changes. Review your projects before making another change.',
+          'Your previous Solo save was recovered alongside the desktop changes. Review your projects before making another change.',
         );
       }
     } finally {

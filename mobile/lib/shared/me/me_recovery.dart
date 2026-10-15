@@ -5,7 +5,7 @@ import 'me_groups.dart';
 class MeRecoveryConflict implements Exception {
   @override
   String toString() =>
-      'Me has conflicting edits on another device. Your pending change is still saved on this phone.';
+      'Solo has conflicting edits on another device. Your pending change is still saved on this phone.';
 }
 
 /// Reapply only local edits to a newer desktop record. Concurrent edits to the

@@ -18,7 +18,7 @@ class MeGroups {
 
   factory MeGroups.decode(String plaintext, String community) {
     if (utf8.encode(plaintext).length > 16384) {
-      throw const FormatException('Me storage is full');
+      throw const FormatException('Solo storage is full');
     }
     final raw = jsonDecode(plaintext) as Map<String, dynamic>;
     final value = raw['value'] as Map<String, dynamic>;
@@ -27,7 +27,7 @@ class MeGroups {
         raw['deleted'] is! bool ||
         value['type'] != 'groups' ||
         value['id'] != 'me') {
-      throw const FormatException('Unsupported Me record');
+      throw const FormatException('Unsupported Solo record');
     }
     final groups = (value['groups'] as List)
         .map((g) => Map<String, dynamic>.from(g as Map))
@@ -59,7 +59,7 @@ class MeGroups {
         channels.length > 1000 ||
         channels.toSet().length != channels.length ||
         channels.any((id) => !channelId.hasMatch(id))) {
-      throw const FormatException('Invalid Me projects');
+      throw const FormatException('Invalid Solo projects');
     }
     if (raw['deleted'] == true) return const MeGroups();
     return MeGroups(

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nostr/nostr.dart' as nostr;
@@ -11,6 +12,18 @@ import 'package:buzz/shared/relay/relay.dart';
 
 class FakeRelay extends RelaySessionNotifier {
   List<NostrEvent> events = [];
+  Future<List<NostrEvent>>? pendingRead;
+  void Function(String)? closeSubscription;
+  @override
+  Future<void Function()> subscribe(
+    NostrFilter filter,
+    void Function(NostrEvent) onEvent, {
+    void Function(String message)? onClosed,
+  }) async {
+    closeSubscription = onClosed;
+    return () {};
+  }
+
   int writes = 0;
   bool loseAcknowledgment = false;
   void Function()? beforeRead;
@@ -20,7 +33,7 @@ class FakeRelay extends RelaySessionNotifier {
     Duration timeout = const Duration(seconds: 8),
   }) async {
     beforeRead?.call();
-    return events;
+    return pendingRead ?? events;
   }
 
   @override
@@ -61,6 +74,149 @@ void main() {
       ],
       verify: false,
     ).toMap(),
+  );
+  test(
+    'offline relaunch emits encrypted cached organization and isolates accounts',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final config = RelayConfig(baseUrl: origin, nsec: nsec);
+      final online = MeSync(FakeRelay(), config, prefs: prefs);
+      const groups = MeGroups(
+        groups: [
+          {'id': 'project', 'name': 'Private project', 'defaultTemplateId': ''},
+        ],
+      );
+      await online.cache(signed(groups: groups, timestamp: 3));
+      await online.cache(signed(timestamp: 2));
+      await online.cache(null);
+      expect(
+        prefs.getString(online.cacheKey),
+        isNot(contains('Private project')),
+      );
+      final offline = MeSync(
+        FakeRelay(),
+        config,
+        prefs: prefs,
+        connected: false,
+      );
+      final container = ProviderContainer(
+        overrides: [meSyncProvider.overrideWithValue(offline)],
+        retry: (_, _) => null,
+      );
+      addTearDown(container.dispose);
+      container.listen(meGroupsProvider, (_, _) {});
+      expect(
+        (await container.read(meGroupsProvider.future)).groups.single['name'],
+        'Private project',
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(container.read(meGroupsProvider).hasError, isFalse);
+      for (final other in [
+        RelayConfig(baseUrl: 'https://other.test', nsec: nsec),
+        RelayConfig(
+          baseUrl: origin,
+          nsec: nostr.Nip19.encode(
+            prefix: nostr.Nip19Prefix.nsec,
+            data: '0' * 63 + '2',
+          ),
+        ),
+      ]) {
+        expect(
+          MeSync(
+            FakeRelay(),
+            other,
+            prefs: prefs,
+            connected: false,
+          ).cachedSnapshot(),
+          isNull,
+        );
+      }
+    },
+  );
+  test(
+    'corrupt cache refreshes online and persists the verified replacement',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final relay = FakeRelay()..events = [signed(timestamp: 5)];
+      final service = MeSync(
+        relay,
+        RelayConfig(baseUrl: origin, nsec: nsec),
+        prefs: prefs,
+      );
+      await prefs.setString(service.cacheKey, 'corrupt');
+      final container = ProviderContainer(
+        overrides: [meSyncProvider.overrideWithValue(service)],
+        retry: (_, _) => null,
+      );
+      addTearDown(container.dispose);
+      container.listen(meGroupsProvider, (_, _) {});
+      expect((await container.read(meGroupsProvider.future)).channels, isEmpty);
+      await Future<void>.delayed(Duration.zero);
+      expect(service.cachedSnapshot()?.event?.id, relay.events.single.id);
+    },
+  );
+  test(
+    'empty organization survives relaunch without relay connectivity',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final config = RelayConfig(baseUrl: origin, nsec: nsec);
+      await MeSync(FakeRelay(), config, prefs: prefs).cache(null);
+      final offline = MeSync(
+        FakeRelay(),
+        config,
+        prefs: prefs,
+        connected: false,
+      );
+      expect(offline.cachedSnapshot()?.groups.channels, isEmpty);
+    },
+  );
+  test(
+    'cached organization emits before refresh and survives a closed subscription',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final response = Completer<List<NostrEvent>>();
+      final relay = FakeRelay()..pendingRead = response.future;
+      final service = MeSync(
+        relay,
+        RelayConfig(baseUrl: origin, nsec: nsec),
+        prefs: prefs,
+      );
+      final old = signed(timestamp: 1);
+      await service.cache(old);
+      final container = ProviderContainer(
+        overrides: [meSyncProvider.overrideWithValue(service)],
+        retry: (_, _) => null,
+      );
+      addTearDown(container.dispose);
+      container.listen(meGroupsProvider, (_, _) {});
+      expect((await container.read(meGroupsProvider.future)).groups, isEmpty);
+      final fresh = signed(
+        timestamp: 2,
+        groups: const MeGroups(
+          groups: [
+            {'id': 'new', 'name': 'From desktop', 'defaultTemplateId': ''},
+          ],
+        ),
+      );
+      response.complete([fresh]);
+      await Future<void>.delayed(Duration.zero);
+      expect(
+        container.read(meGroupsProvider).value?.groups.single['name'],
+        'From desktop',
+      );
+      expect(service.cachedSnapshot()?.event?.id, fresh.id);
+      relay.closeSubscription!('offline');
+      await Future<void>.delayed(Duration.zero);
+      expect(container.read(meGroupsProvider).hasError, isFalse);
+      expect(
+        container.read(meGroupsProvider).value?.groups.single['name'],
+        'From desktop',
+      );
+    },
   );
   test('verifies signature, account and encrypted community envelope', () {
     final sync = MeSync(FakeRelay(), RelayConfig(baseUrl: origin, nsec: nsec));
