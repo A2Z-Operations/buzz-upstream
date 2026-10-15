@@ -1,11 +1,10 @@
 //! Application-owned revocation, under the admission lock and in the writer's commit.
 use crate::{error::Result, CommunityId};
-use sqlx::{Postgres, Transaction};
 
 /// Durably revoke an active banned principal's invites and its verified agents' invites.
 /// The caller holds the admission lock before writing restriction or invite rows.
 pub(crate) async fn revoke_banned_issuer_invites(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut sqlx::PgConnection,
     community: CommunityId,
     pubkey: &[u8],
 ) -> Result<()> {
@@ -22,7 +21,7 @@ pub(crate) async fn revoke_banned_issuer_invites(
     )
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
@@ -30,7 +29,7 @@ pub(crate) async fn revoke_banned_issuer_invites(
 /// Durably revoke an agent's invites when its newly verified owner is actively banned.
 /// Timeouts block admission temporarily but never durably revoke invites.
 pub(crate) async fn revoke_restricted_agent_invites(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut sqlx::PgConnection,
     community: CommunityId,
     agent_pubkey: &[u8],
     owner_pubkey: &[u8],
@@ -46,7 +45,7 @@ pub(crate) async fn revoke_restricted_agent_invites(
     .bind(community.as_uuid())
     .bind(agent_pubkey)
     .bind(owner_pubkey)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }

@@ -5,7 +5,7 @@ async fn legacy_fixture() -> (PgPool, Vec<Uuid>) {
     let pool = PgPool::connect(&crate::test_support::database_url())
         .await
         .unwrap();
-    crate::migration::run_migrations_through(&pool, 60)
+    crate::migration::run_migrations_through(&pool, 64)
         .await
         .unwrap();
     let mut communities = Vec::new();

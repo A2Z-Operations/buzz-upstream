@@ -328,8 +328,10 @@ pub async fn claim_relay_invite_with_owner(
     )
     .await?;
 
-    lock_admission(&mut tx, community).await?;
-    if claim_owner::claimant_restricted(&mut tx, community, claimer_pubkey, verified_owner).await? {
+    lock_admission(tx.conn(), community).await?;
+    if claim_owner::claimant_restricted(tx.conn(), community, claimer_pubkey, verified_owner)
+        .await?
+    {
         tx.rollback().await?;
         log_claim_outcome(community, None, "restricted", None, None);
         return Ok(ClaimOutcome::Restricted.into());
@@ -378,7 +380,7 @@ pub async fn claim_relay_invite_with_owner(
     let issuer: String = invite.try_get("created_by")?;
     let denial = if revoked_at.is_some() {
         Some((ClaimOutcome::Revoked, "revoked"))
-    } else if principal_restricted(&mut tx, community, &issuer).await? {
+    } else if principal_restricted(tx.conn(), community, &issuer).await? {
         Some((ClaimOutcome::IssuerRestricted, "issuer_restricted"))
     } else {
         None
@@ -413,7 +415,7 @@ pub async fn claim_relay_invite_with_owner(
             .await?;
         }
         let owner =
-            claim_owner::persist_claim_owner(&mut tx, community, claimer_pubkey, verified_owner)
+            claim_owner::persist_claim_owner(tx.conn(), community, claimer_pubkey, verified_owner)
                 .await?;
         tx.commit().await?;
         log_claim_outcome(
@@ -479,7 +481,7 @@ pub async fn claim_relay_invite_with_owner(
 
     if !inserted {
         let owner =
-            claim_owner::persist_claim_owner(&mut tx, community, claimer_pubkey, verified_owner)
+            claim_owner::persist_claim_owner(tx.conn(), community, claimer_pubkey, verified_owner)
                 .await?;
         tx.commit().await?;
         log_claim_outcome(
@@ -510,7 +512,7 @@ pub async fn claim_relay_invite_with_owner(
 
     // 11. Commit membership, evidence, consumption, and verified ownership together.
     let owner =
-        claim_owner::persist_claim_owner(&mut tx, community, claimer_pubkey, verified_owner)
+        claim_owner::persist_claim_owner(tx.conn(), community, claimer_pubkey, verified_owner)
             .await?;
     tx.commit().await?;
 

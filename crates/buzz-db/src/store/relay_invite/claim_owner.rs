@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::{CommunityId, DbError};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 
 /// Result of a committed legacy invitation claim.
 pub struct MembershipClaimResult {
@@ -14,7 +14,7 @@ pub struct MembershipClaimResult {
 
 /// Check existing and presented owner identities without creating a user row.
 pub(super) async fn claimant_restricted(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut sqlx::PgConnection,
     community: CommunityId,
     claimant: &str,
     verified_owner: Option<&str>,
@@ -36,7 +36,7 @@ pub(super) async fn claimant_restricted(
         hex::decode(claimant)
             .map_err(|_| DbError::InvalidData("invalid invitation principal".into()))?,
     )
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     let owner_bytes =
         hex::decode(owner).map_err(|_| DbError::InvalidData("invalid invitation owner".into()))?;
@@ -57,7 +57,7 @@ pub(super) struct OwnerPersistence {
 
 /// Called only on an admitted claim, while the admission lock is still held.
 pub(super) async fn persist_claim_owner(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut sqlx::PgConnection,
     community: CommunityId,
     claimant: &str,
     verified_owner: Option<&str>,
@@ -76,12 +76,12 @@ pub(super) async fn persist_claim_owner(
         )
         .bind(community.as_uuid())
         .bind(key)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     }
     let link_created = sqlx::query("UPDATE users SET agent_owner_pubkey=$3 WHERE community_id=$1 AND pubkey=$2 AND agent_owner_pubkey IS NULL")
-        .bind(community.as_uuid()).bind(&claimant_bytes).bind(&owner_bytes).execute(&mut **tx).await?.rows_affected() > 0;
+        .bind(community.as_uuid()).bind(&claimant_bytes).bind(&owner_bytes).execute(&mut *tx).await?.rows_affected() > 0;
     // Defensive parity with other owner writers; admission already rejects banned owners.
     if link_created {
         super::revoke_restricted_agent_invites(tx, community, &claimant_bytes, &owner_bytes)
@@ -102,17 +102,14 @@ pub async fn claim_relay_membership_with_owner(
     policy_version: Option<&str>,
     verified_owner: Option<&str>,
 ) -> Result<MembershipClaimResult> {
-    let connection = crate::observability::acquire_writer(
+    let mut tx = crate::begin_community_write_transaction(
         pool,
+        community,
         crate::observability::WriterOperation::Authorization,
     )
     .await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
-    crate::deletion::DeletionStore::new(pool.clone())
-        .guard_transaction(&mut tx, community)
-        .await?;
-    super::lock_admission(&mut tx, community).await?;
-    if claimant_restricted(&mut tx, community, pubkey, verified_owner).await? {
+    super::lock_admission(tx.conn(), community).await?;
+    if claimant_restricted(tx.conn(), community, pubkey, verified_owner).await? {
         return Err(DbError::InviteRestricted);
     }
     let inserted = sqlx::query(
@@ -123,7 +120,7 @@ pub async fn claim_relay_membership_with_owner(
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(role)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?
     .rows_affected()
         > 0;
@@ -136,11 +133,11 @@ pub async fn claim_relay_membership_with_owner(
         .bind(community.as_uuid())
         .bind(pubkey)
         .bind(version)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
     }
 
-    let owner = persist_claim_owner(&mut tx, community, pubkey, verified_owner).await?;
+    let owner = persist_claim_owner(tx.conn(), community, pubkey, verified_owner).await?;
     tx.commit().await?;
     Ok(MembershipClaimResult {
         inserted,

@@ -524,7 +524,8 @@ pub async fn execute_ban_with_marker(
     .execute(tx.conn())
     .await?;
 
-    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey).await?;
+    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey)
+        .await?;
 
     let marker = sqlx::query(
         r#"
@@ -620,7 +621,8 @@ pub async fn execute_timeout_with_marker(
     .execute(tx.conn())
     .await?;
 
-    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey).await?;
+    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey)
+        .await?;
 
     let marker = sqlx::query(
         r#"
