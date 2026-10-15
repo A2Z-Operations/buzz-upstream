@@ -132,7 +132,7 @@ Future<void> _offerMeRecovery(BuildContext context, MeSync sync) async {
   final discard = await showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
-      title: const Text('Conflicting Me changes'),
+      title: const Text('Conflicting Solo changes'),
       content: const Text(
         'Desktop and this phone changed the same project or chat. Keep the pending phone change to retry later, or discard it and use the current desktop organization. Your chat messages will be kept.',
       ),

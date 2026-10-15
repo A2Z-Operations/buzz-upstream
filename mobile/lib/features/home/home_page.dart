@@ -71,7 +71,7 @@ class HomePage extends HookConsumerWidget {
     _HomeDestination(
       icon: Icons.chat_bubble_outline,
       selectedIcon: Icons.chat_bubble,
-      label: 'Me',
+      label: 'Solo',
     ),
   ];
 

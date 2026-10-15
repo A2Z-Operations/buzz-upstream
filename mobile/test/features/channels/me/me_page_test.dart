@@ -227,85 +227,97 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('iOS new chat restores a durable creation after restart', (
-    tester,
-  ) async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-    addTearDown(() => debugDefaultTargetPlatformOverride = null);
-    const channel = MethodChannel('buzz/profile_text_editor');
-    final calls = <MethodCall>[];
-    var directoryLoads = 0;
-    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
-      call,
+  for (final resume in [true, false]) {
+    testWidgets('iOS new chat recovers a durable creation: resume=$resume', (
+      tester,
     ) async {
-      calls.add(call);
-      return null;
-    });
-    addTearDown(
-      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-        channel,
-        null,
-      ),
-    );
-    SharedPreferences.setMockInitialValues({});
-    final prefs = await SharedPreferences.getInstance();
-    final sync = MeSync(
-      RelaySessionNotifier(),
-      RelayConfig(
-        baseUrl: 'https://relay.test',
-        nsec: nostr.Nip19.encode(
-          prefix: nostr.Nip19Prefix.nsec,
-          data:
-              '0000000000000000000000000000000000000000000000000000000000000001',
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      const channel = MethodChannel('buzz/profile_text_editor');
+      final calls = <MethodCall>[];
+      var directoryLoads = 0;
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+        call,
+      ) async {
+        calls.add(call);
+        return null;
+      });
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          channel,
+          null,
         ),
-      ),
-      prefs: prefs,
-    );
-    await const MeChatCreation(
-      'same-id',
-      'Unfinished chat',
-      'agent',
-    ).save(sync);
-    final restarted = MeSync(RelaySessionNotifier(), sync.config, prefs: prefs);
-    await tester.pumpWidget(
-      ProviderScope(
-        overrides: [
-          meGroupsProvider.overrideWith(
-            (ref) => Stream.value(const MeGroups()),
+      );
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final sync = MeSync(
+        RelaySessionNotifier(),
+        RelayConfig(
+          baseUrl: 'https://relay.test',
+          nsec: nostr.Nip19.encode(
+            prefix: nostr.Nip19Prefix.nsec,
+            data:
+                '0000000000000000000000000000000000000000000000000000000000000001',
           ),
-          meSyncProvider.overrideWithValue(restarted),
-          channelsProvider.overrideWith(FakeChannels.new),
-          meAssistantsProvider.overrideWith((ref) async {
-            directoryLoads++;
-            return [];
-          }),
-        ],
-        child: MaterialApp(theme: AppTheme.light(), home: const MePage()),
-      ),
-    );
-    await tester.pumpAndSettle();
+        ),
+        prefs: prefs,
+      );
+      await const MeChatCreation(
+        'same-id',
+        'Unfinished chat',
+        'agent',
+      ).save(sync);
+      final restarted = MeSync(
+        RelaySessionNotifier(),
+        sync.config,
+        prefs: prefs,
+      );
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            meGroupsProvider.overrideWith(
+              (ref) => Stream.value(const MeGroups()),
+            ),
+            meSyncProvider.overrideWithValue(restarted),
+            channelsProvider.overrideWith(FakeChannels.new),
+            meAssistantsProvider.overrideWith((ref) async {
+              directoryLoads++;
+              return [];
+            }),
+          ],
+          child: MaterialApp(theme: AppTheme.light(), home: const MePage()),
+        ),
+      );
+      await tester.pumpAndSettle();
 
-    final bar = tester.widget<FrostedAppBar>(find.byType(FrostedAppBar));
-    bar.nativeActions!
-        .firstWhere((action) => action.label == 'New chat')
-        .onPressed!();
-    await tester.pumpAndSettle();
-    expect(directoryLoads, 1);
-    expect(calls, hasLength(1));
-    expect(calls.single.method, 'presentChat');
-    final args = calls.single.arguments as Map;
-    expect(args['title'], 'New chat');
-    expect(args['initialValue'], 'Unfinished chat');
-    expect(args['selectedAssistant'], 'agent');
-    expect(args['fieldsLocked'], isTrue);
-    expect(args['error'], contains('Resume'));
-    expect(args['placeholder'], 'Chat name');
-    expect(args['assistants'], isEmpty);
-    expect(args['containerCornerRadius'], Radii.container);
-    expect(find.byType(BottomSheet), findsNothing);
-    await tester.pumpWidget(const SizedBox.shrink());
-    debugDefaultTargetPlatformOverride = null;
-  });
+      final bar = tester.widget<FrostedAppBar>(find.byType(FrostedAppBar));
+      bar.nativeActions!
+          .firstWhere((action) => action.label == 'New chat')
+          .onPressed!();
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(resume ? 'Resume' : 'Discard setup'));
+      await tester.pumpAndSettle();
+      expect(directoryLoads, 1);
+      expect(calls, hasLength(1));
+      expect(calls.single.method, 'presentChat');
+      final args = calls.single.arguments as Map;
+      expect(args['title'], 'New chat');
+      expect(args['initialValue'], resume ? 'Unfinished chat' : '');
+      expect(args['selectedAssistant'], resume ? 'agent' : isNull);
+      expect(args['fieldsLocked'], resume);
+      expect(args['error'], resume ? contains('Resume') : isNull);
+      expect(
+        MeChatCreation.pending(restarted)?.id,
+        resume ? 'same-id' : isNull,
+      );
+      expect(args['placeholder'], 'Chat name');
+      expect(args['assistants'], isEmpty);
+      expect(args['containerCornerRadius'], Radii.container);
+      expect(find.byType(BottomSheet), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+      debugDefaultTargetPlatformOverride = null;
+    });
+  }
 
   testWidgets('unavailable preferences show retry instead of empty state', (
     tester,

@@ -17,6 +17,7 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../shared/emoji/emoji_burst.dart';
 import '../../shared/me/me_sync.dart';
+import '../../shared/me/me_search_placement.dart';
 import 'me/me_assistant_picker.dart';
 import 'me/me_chat_assistant.dart';
 import 'me/me_messages_provider.dart';
@@ -89,6 +90,7 @@ import 'reading_marks.dart';
 import 'timeline_message.dart';
 
 part 'channel_detail_page/message_list.dart';
+part 'channel_detail_page/placement_route.dart';
 part 'channel_detail_page/empty_messages.dart';
 part 'channel_detail_page/oldest_navigation.dart';
 part 'channel_detail_page/system_rows.dart';
@@ -107,14 +109,11 @@ part 'channel_detail_page/app_bar.dart';
 
 /// Fetch deep-link targets that may be outside the loaded channel window.
 Future<void> _loadDeepLinkEvents(
-  WidgetRef ref,
-  String channelId,
+  ChannelMessagesNotifier notifier,
   Set<String> eventIds,
 ) async {
   try {
-    await ref
-        .read(channelMessagesProvider(channelId).notifier)
-        .loadEventsById(eventIds);
+    await notifier.loadEventsById(eventIds);
   } catch (error) {
     debugPrint('deep-link: failed to load target messages: $error');
   }
@@ -253,11 +252,12 @@ enum InitialThreadRouteBehavior {
   replaceCurrentRoute,
 }
 
-class ChannelDetailPage extends HookConsumerWidget {
+class _ResolvedChannelDetailPage extends HookConsumerWidget {
   final Channel channel;
 
   /// Uses personal assistant routing for a chat placed in Me.
   final bool personalChat;
+  final bool placementKnown;
   final String? initialAssistant;
   final String? initialMessageId;
   final String? initialThreadRootId;
@@ -265,10 +265,11 @@ class ChannelDetailPage extends HookConsumerWidget {
   /// How the automatically opened initial thread affects the route stack.
   final InitialThreadRouteBehavior initialThreadRouteBehavior;
 
-  const ChannelDetailPage({
+  const _ResolvedChannelDetailPage({
     super.key,
     required this.channel,
-    this.personalChat = false,
+    required this.personalChat,
+    required this.placementKnown,
     this.initialAssistant,
     this.initialMessageId,
     this.initialThreadRootId,
@@ -561,7 +562,7 @@ class ChannelDetailPage extends HookConsumerWidget {
         };
         if (eventIds.isEmpty) return null;
         final notifier = ref.read(messagesProvider.notifier);
-        unawaited(_loadDeepLinkEvents(ref, channel.id, eventIds));
+        unawaited(_loadDeepLinkEvents(notifier, eventIds));
         return () => notifier.releaseDeepLinkEvents(eventIds);
       },
       [
@@ -813,8 +814,13 @@ class ChannelDetailPage extends HookConsumerWidget {
                               stickyDateHeaderState: stickyDateHeaderState,
                               entries: timelineEntries,
                               allMessages: timelineMessages,
-                              initialMessageId: initialMessageId,
-                              initialThreadRootId: initialThreadRootId,
+                              initialMessageId: personalChat
+                                  ? initialMessageId ?? initialThreadRootId
+                                  : initialMessageId,
+                              initialThreadRootId:
+                                  personalChat || !placementKnown
+                                  ? null
+                                  : initialThreadRootId,
                               initialThreadRouteBehavior:
                                   initialThreadRouteBehavior,
                               initialOrdinaryUnreadMessageIds:
@@ -912,13 +918,19 @@ class ChannelDetailPage extends HookConsumerWidget {
                               mentionPubkeys, {
                               mediaTags = const <List<String>>[],
                             }) async {
+                              if (!placementKnown) {
+                                ref.invalidate(meGroupsProvider);
+                                throw StateError(
+                                  'Reconnect to verify this chat before sending.',
+                                );
+                              }
                               var recipients = mentionPubkeys;
                               if (personalChat) {
                                 if (mePlacement?.asData?.value.channels
                                         .contains(channel.id) !=
                                     true) {
                                   throw StateError(
-                                    'Refresh Me before sending to this chat.',
+                                    'Refresh Solo before sending to this chat.',
                                   );
                                 }
                                 recipients = await meRecipients(

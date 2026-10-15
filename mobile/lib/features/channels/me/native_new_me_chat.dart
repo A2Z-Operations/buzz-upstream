@@ -4,6 +4,39 @@ Future<(Channel, String)?> _showNewMeChat(
   BuildContext context,
   WidgetRef ref,
 ) async {
+  final initialSync = ref.read(meSyncProvider);
+  final unfinished = MeChatCreation.pending(initialSync);
+  if (unfinished != null) {
+    final resume = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Unfinished chat'),
+        content: Text(
+          'Resume “${unfinished.name}”, or discard its setup to start another chat. Any channel and messages already created are kept in Home or Solo.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Later'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Discard setup'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Resume'),
+          ),
+        ],
+      ),
+    );
+    if (resume == null || !context.mounted) return null;
+    if (!resume) {
+      await unfinished.discard(initialSync);
+      ref.invalidate(channelsProvider);
+    }
+  }
+  if (!context.mounted) return null;
   if (defaultTargetPlatform == TargetPlatform.iOS) {
     final sync = ref.read(meSyncProvider);
     final pending = MeChatCreation.pending(sync);

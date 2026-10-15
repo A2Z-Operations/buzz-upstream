@@ -120,7 +120,7 @@ class MePage extends HookConsumerWidget {
     return FrostedScaffold(
       backgroundColor: context.colors.surface,
       appBar: FrostedAppBar(
-        nativeTitle: 'Me',
+        nativeTitle: 'Solo',
         nativeLargeTitle: true,
         automaticallyImplyLeading: false,
         nativeActions: [
@@ -140,7 +140,7 @@ class MePage extends HookConsumerWidget {
         horizontalInset: Grid.gutter,
         showBottomDivider: true,
         bottomDividerOpacity: 0.07,
-        title: Text('Me', style: headerTitleStyle),
+        title: Text('Solo', style: headerTitleStyle),
         titleStyle: headerTitleStyle,
         actions: [
           ClipRRect(

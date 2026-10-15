@@ -132,7 +132,7 @@ void main() {
       findsOneWidget,
     );
     expect(find.bySemanticsLabel('Activity, unread'), findsNothing);
-    await tester.tap(find.byTooltip('Me'));
+    await tester.tap(find.byTooltip('Solo'));
     await tester.pumpAndSettle();
     expect(find.text('Personal workspace'), findsOneWidget);
     expect(find.byType(SearchPage), findsNothing);
@@ -336,7 +336,7 @@ void main() {
     await tester.pump();
     expect(hapticCalls, hasLength(1));
 
-    await tester.tap(find.byTooltip('Me'));
+    await tester.tap(find.byTooltip('Solo'));
     await tester.pump();
     expect(hapticCalls, hasLength(2));
   });

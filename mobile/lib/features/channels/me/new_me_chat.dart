@@ -21,7 +21,7 @@ class _NewMeChat extends HookConsumerWidget {
       return const Padding(
         padding: EdgeInsets.all(Grid.gutter),
         child: Text(
-          'Your account or community changed. Return to Me to start a chat.',
+          'Your account or community changed. Return to Solo to start a chat.',
         ),
       );
     }

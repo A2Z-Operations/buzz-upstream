@@ -35,6 +35,38 @@ void main() {
     );
     expect(touchedRelay, isFalse);
   });
+  test(
+    'discard preserves partial relay state and permits a different intent offline',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final config = RelayConfig(
+        baseUrl: 'https://relay.test',
+        nsec: nostr.Nip19.encode(
+          prefix: nostr.Nip19Prefix.nsec,
+          data: '0' * 63 + '1',
+        ),
+      );
+      final online = MeSync(RelaySessionNotifier(), config, prefs: prefs);
+      const intent = MeChatCreation('old', 'Old', 'revoked-agent');
+      await intent.save(online);
+      final offline = MeSync(
+        RelaySessionNotifier(),
+        config,
+        prefs: prefs,
+        connected: false,
+      );
+      await expectLater(
+        const MeChatCreation('wrong', 'Old', 'revoked-agent').discard(offline),
+        throwsStateError,
+      );
+      expect(MeChatCreation.pending(offline)?.id, 'old');
+      await intent.discard(offline);
+      expect(MeChatCreation.pending(offline), isNull);
+      await const MeChatCreation('new', 'New', 'other-agent').save(online);
+      expect(MeChatCreation.pending(online)?.id, 'new');
+    },
+  );
   for (final crashAfter in [0, 1, 2, 3]) {
     test('restart resumes the same chat after boundary $crashAfter', () async {
       SharedPreferences.setMockInitialValues({});
