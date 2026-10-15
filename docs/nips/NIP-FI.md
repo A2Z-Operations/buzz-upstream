@@ -146,6 +146,9 @@ TransportContractId = H(canonical transport contract)
 association, audience, token class, allowed algorithms, key-source contract,
 identity/key/claim mapping, time and size rules, and compiled verifier
 behavior.  JWKS key rotation changes the snapshot, not the policy ID.
+The key-source contract includes the JWKS transport. A mesh transport tag is
+included only when that mode is explicitly selected, so existing public HTTPS
+policy IDs keep their encoding.
 `TransportContractId` covers the client-attached field, parsing, attachment,
 and no-fallback semantics.
 
@@ -204,9 +207,18 @@ regardless of issuer policy.
 
 Each issuer policy configures:
 
-- `jwks_uri`: HTTPS URI selecting the authenticated key source.  SSRF-protected
-  at both URI validation and DNS-resolution time; no credentials, fragments,
-  or private-IP endpoints accepted.
+- `jwks_uri`: the URI selecting the authenticated key source. By default it is
+  HTTPS and SSRF-protected at URI validation and DNS-resolution time; no
+  credentials, fragments, or private-IP endpoints are accepted.
+- `jwks_transport`: optional per-issuer transport, defaulting to
+  `public_https`. The explicit value `mesh` permits an HTTP URI only when it
+  uses a DNS hostname and has no userinfo, query, or fragment. Every resolved
+  address must be classified as non-global; global or mixed answers are
+  rejected, and the selected address is pinned for the request. This transport
+  does not provide its own authentication: operators MUST enforce mutual TLS
+  peer authentication and integrity protection, endpoint authorization, and
+  egress restrictions. Unauthenticated HTTP permits JWKS key substitution and
+  issuer impersonation. There is no public-network fallback.
 - `refresh_interval_seconds`: positive, ≤ 1 year, strictly less than
   `key_snapshot_hard_deadline_seconds`.
 - `key_snapshot_hard_deadline_seconds`: the outer time bound after which no
@@ -927,10 +939,18 @@ gap by requiring assertion verification on every protected HTTP request.
 The per-request re-verification model means there is no cached admission
 window; a deny-set entry takes effect on the very next request.
 
-**SSRF.** The JWKS fetcher MUST enforce SSRF protection: HTTPS-only URI
-validation, DNS resolution with IP deny-list enforcement, address pinning to
-prevent DNS rebinding TOCTOU, and redirect denial.  The IP deny-list covers
-the complete IANA Special-Purpose address registry.
+**SSRF and JWKS transport.** The default `public_https` transport MUST use
+HTTPS, reject non-public resolved addresses, pin the selected DNS result, and
+deny redirects. The explicit per-issuer `mesh` transport permits HTTP only for
+a DNS hostname and MUST reject any DNS answer containing a global or
+unclassified address before pinning one non-global result. Both modes use a
+bounded fetch, reject non-success status codes, and never follow redirects or
+fall back to another network path. The mesh mode is safe only when the
+deployment enforces mutual TLS peer authentication and integrity protection,
+endpoint authorization, and egress restrictions. The relay cannot verify those
+mesh properties; unauthenticated HTTP permits key substitution and issuer
+impersonation. The existing address predicate and public HTTPS rules remain
+unchanged.
 
 **Issuer compromise.** A compromised assertion issuer can impersonate any
 identity but cannot prove possession of the assertion-named Nostr key.  The NIP-42

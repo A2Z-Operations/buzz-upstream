@@ -99,7 +99,12 @@ Auth is simple — authenticated or not. Channel membership gates content visibi
 
 ## Encryption
 
-One model. TLS in transit. At-rest encryption delegated to the storage layer (e.g., Postgres TDE, volume encryption). Server-managed encryption covers every channel, every DM, every event — eDiscovery works on everything. End-to-end encryption (NIP-44) is a future consideration for DMs.
+One model. TLS in transit. At-rest encryption delegated to the storage layer
+(e.g., Postgres TDE, volume encryption). An explicitly configured mesh JWKS
+HTTP hop preserves transport protection only when the deployment enforces
+mutual TLS peer authentication and integrity protection. Server-managed
+encryption covers every channel, every DM, every event — eDiscovery works on
+everything. End-to-end encryption (NIP-44) is a future consideration for DMs.
 
 ---
 

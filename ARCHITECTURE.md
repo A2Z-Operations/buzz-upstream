@@ -873,6 +873,14 @@ Every security-sensitive operation uses an explicit, verified pattern. No implic
 Applied in: `buzz-auth` (JWKS boundary), `buzz-workflow` (CallWebhook action),
 desktop `link_preview` (SSRF check).
 
+JWKS uses public HTTPS by default and retains this public-address check. An
+issuer may explicitly delegate HTTP transport authentication to an operator-
+secured service mesh; that mode rejects global, unclassified, or mixed DNS
+answers and pins a non-global result. The relay cannot prove mesh mutual TLS
+peer authentication or integrity protection, so operators must enforce both,
+authorize the endpoint, and restrict egress. Unauthenticated HTTP permits key
+substitution and issuer impersonation.
+
 ### Audit Integrity
 
 - Hash chain: each entry's SHA-256 covers all fields including `prev_hash` — tampering any entry breaks all subsequent hashes

@@ -146,6 +146,35 @@ fn enforce_jwks_contract_mismatch_rejects() {
     );
 }
 
+#[test]
+fn enforce_mesh_policy_and_public_jwks_config_mismatch_rejects() {
+    let issuer = "https://id.example";
+    let mesh_contract = JwksSourceContract::new_deployment_authenticated(
+        "http://mesh.example.test/.well-known/jwks.json".to_owned(),
+        300,
+        3600,
+    )
+    .expect("valid mesh contract");
+    let mesh_policy = IssuerPolicy::new(
+        issuer.to_owned(),
+        vec!["https://relay.example/api".to_owned()],
+        TokenClass::DedicatedNipFi,
+        FreshnessClass::OfflineJwt,
+        vec![JwtAlgorithm::ES256],
+        0,
+        3600,
+        None,
+        mesh_contract,
+    )
+    .expect("valid mesh policy");
+    let mut registry = IssuerRegistry::new();
+    registry.insert(mesh_policy);
+
+    let error = validate_nip_fi_config(NipFiMode::Enforce, &registry, &[make_jwks_config(issuer)])
+        .expect_err("policy and source transport contracts must match");
+    assert_eq!(error, NipFiStartupError::JwksContractMismatch);
+}
+
 /// Rejected regardless of whether a JWKS config is present — the verifier
 /// has no status witness to satisfy the freshness guarantee.
 #[test]
