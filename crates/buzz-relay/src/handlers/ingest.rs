@@ -7351,22 +7351,14 @@ mod postgres_tests {
         let pool = sqlx::PgPool::connect_with(options)
             .await
             .expect("schema pool");
-        for sql in [
-            include_str!("../../../../schema/functions/community_deletion_lock_key.sql"),
-            include_str!("../../../../schema/functions/invite_admission_lock.sql"),
-        ] {
-            sqlx::raw_sql(sql)
-                .execute(&pool)
-                .await
-                .expect("writer lock functions");
-        }
+        sqlx::raw_sql(include_str!(
+            "../../../../schema/functions/invite_admission_lock.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("invite admission lock function");
         let state = build_canvas_ingest_state(&db_url, &pool).await;
         let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
-        sqlx::query("INSERT INTO communities(id, host) VALUES($1,'revoke-owner.test')")
-            .bind(community.as_uuid())
-            .execute(&pool)
-            .await
-            .expect("writer community");
         let tenant = TenantContext::resolved(community, "revoke-owner.test".to_string());
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.communities (id, host) VALUES ($1, 'revoke-owner.test')"

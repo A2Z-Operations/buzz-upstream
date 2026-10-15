@@ -8724,15 +8724,12 @@ pub(crate) mod postgres_tests {
             )
             .await
             .expect("schema pool");
-            for sql in [
-                include_str!("../../../../schema/functions/community_deletion_lock_key.sql"),
-                include_str!("../../../../schema/functions/invite_admission_lock.sql"),
-            ] {
-                sqlx::raw_sql(sql)
-                    .execute(&pool)
-                    .await
-                    .expect("writer lock functions");
-            }
+            sqlx::raw_sql(include_str!(
+                "../../../../schema/functions/invite_admission_lock.sql"
+            ))
+            .execute(&pool)
+            .await
+            .expect("invite admission lock function");
             Arc::get_mut(&mut state).expect("unique state").db = buzz_db::Db::from_pool(pool);
 
             let tenant = fresh_tenant("late-owner.test");
