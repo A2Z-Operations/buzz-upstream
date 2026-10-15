@@ -3,6 +3,8 @@ import 'hosted_flow.dart';
 String hostedFlowProblemMessage(
   HostedFlowProblem? problem,
 ) => switch (problem) {
+  HostedFlowProblem.unsupportedEnvironment =>
+    'This community needs a different or unsupported Builderlab environment. Use an app build configured for this community.',
   HostedFlowProblem.denied => 'This account does not have access.',
   HostedFlowProblem.differentAccount =>
     'Your browser signed in to a different account. Sign in to your original account on the web, then reopen setup. Your saved account and keys have been kept.',

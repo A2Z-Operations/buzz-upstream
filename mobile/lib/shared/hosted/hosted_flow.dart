@@ -34,6 +34,7 @@ enum HostedFlowProblem {
   identityUnavailable,
   backupRequired,
   bindingRequired,
+  unsupportedEnvironment,
 }
 
 /// Resolves only after relay admission is proven and local persistence completes.
@@ -195,6 +196,7 @@ class HostedFlow extends ChangeNotifier {
     _set(HostedFlowStage.working);
     return _enqueue(() async {
       if (generation != _generation) return;
+      if (!_acceptTarget(target)) return;
       final restored = await account.restore();
       if (generation != _generation) return;
       if (restored == null) {
@@ -224,6 +226,7 @@ class HostedFlow extends ChangeNotifier {
     final target = _target;
     final session = account.account;
     if (target == null || session == null) throw AccountFailure.signedOut;
+    if (!_acceptTarget(target)) return;
     var resolved = await identity.resolve();
     if (target is! NostrBindDeepLink) {
       for (var step = 0; step < 2; step++) {
@@ -319,6 +322,19 @@ class HostedFlow extends ChangeNotifier {
     if (generation != _generation || _disposed) return;
     await browser.clearIntent();
     _set(HostedFlowStage.complete);
+  }
+
+  bool _acceptTarget(BuzzDeepLink target) {
+    final relay = switch (target) {
+      InviteDeepLink(:final relayUrl) => relayUrl,
+      AddCommunityDeepLink(:final relayUrl) => relayUrl,
+      _ => null,
+    };
+    if (relay != null && !HostedEnvironment.supportsRelay(Uri.parse(relay))) {
+      _set(HostedFlowStage.blocked, HostedFlowProblem.unsupportedEnvironment);
+      return false;
+    }
+    return true;
   }
 
   Future<String> _verifyBinding({

@@ -14,6 +14,7 @@ import 'shared/hosted/builderlab_account.dart';
 import 'shared/hosted/hosted_admission.dart';
 import 'shared/hosted/hosted_flow.dart';
 import 'shared/hosted/hosted_identity_service.dart';
+import 'shared/hosted/hosted_environment.dart';
 
 // Set by a community-entry surface while it owns setup presentation.
 final hostedInlineEntryProvider = NotifierProvider<HostedInlineEntry, bool>(
@@ -134,11 +135,7 @@ class HostedAppGate extends HookConsumerWidget {
             return true;
           }
           final host = Uri.parse(relay).host.toLowerCase();
-          final reserved =
-              host == 'buzz.xyz' ||
-              host.endsWith('.buzz.xyz') ||
-              host == 'builderlab.xyz' ||
-              host.endsWith('.builderlab.xyz');
+          final reserved = HostedEnvironment.isReservedHost(host);
           if (!reserved && link is AddCommunityDeepLink) {
             if (routeContext.mounted) {
               await showDialog<void>(
@@ -161,14 +158,14 @@ class HostedAppGate extends HookConsumerWidget {
             }
             return true;
           }
-          if (reserved && !host.endsWith('.communities.buzz.xyz')) {
+          if (reserved && !HostedEnvironment.supportsRelay(Uri.parse(relay))) {
             if (routeContext.mounted) {
               await showDialog<void>(
                 context: routeContext,
                 builder: (context) => AlertDialog(
                   title: const Text('Community setup unavailable'),
                   content: const Text(
-                    'This community does not support account setup in this build yet.',
+                    'This community needs a different or unsupported Builderlab environment. Use an app build configured for this community.',
                   ),
                   actions: [
                     TextButton(
@@ -185,11 +182,7 @@ class HostedAppGate extends HookConsumerWidget {
         if (link is InviteDeepLink) {
           final host = Uri.parse(link.relayUrl).host;
           // Reserved hosted domains must never fall into legacy key generation.
-          final reserved =
-              host == 'buzz.xyz' ||
-              host.endsWith('.buzz.xyz') ||
-              host == 'builderlab.xyz' ||
-              host.endsWith('.builderlab.xyz');
+          final reserved = HostedEnvironment.isReservedHost(host);
           if (!reserved) return false;
         }
         await flow.start(link);

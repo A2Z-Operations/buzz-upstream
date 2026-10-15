@@ -8,6 +8,7 @@ import '../relay/relay_session.dart';
 import '../relay/relay_socket.dart';
 import 'account_identity_store.dart';
 import 'builderlab_account.dart';
+import 'hosted_environment.dart';
 
 /// Builds a community only after scoped backup evidence and current binding.
 /// The caller persists it through the existing community transition owner.
@@ -49,7 +50,7 @@ class HostedAdmission {
         uri.hasQuery ||
         uri.hasFragment ||
         (uri.path.isNotEmpty && uri.path != '/') ||
-        !uri.host.endsWith('.communities.buzz.xyz') ||
+        !HostedEnvironment.supportsRelay(uri) ||
         (uri.hasPort && uri.port != 443)) {
       throw AccountFailure.denied;
     }
