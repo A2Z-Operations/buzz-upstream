@@ -3739,6 +3739,63 @@ mod route_integration_tests {
             target_on_shadow.assert_open("shadow pod, enforce command");
         }
 
+        /// Two enforce pods on one Redis, each running the production
+        /// subscriber, with both subscriptions confirmed live.
+        async fn enforce_pair(
+        ) -> [(Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>); 2] {
+            let mut pods = Vec::new();
+            for _ in 0..2 {
+                let pod = pod_in(NipFiMode::Enforce).await;
+                let seen = listen(&pod);
+                pods.push((pod, seen));
+            }
+            for (pod, seen) in &mut pods {
+                await_probe(seen, pod).await;
+            }
+            pods.try_into().unwrap_or_else(|_| unreachable!())
+        }
+
+        // Plan criterion 10: restart recovery across pods. A disconnect sent
+        // to P1 is applied by P1 *and* by P2 (P1's reply alone proves only
+        // P1). Restarting both pods empties their deny maps, so K is accepted
+        // until the issuer re-sends; that gap is the exposure window. The
+        // re-send (fresh `jti`, same `until`) to one pod restores the deny on
+        // every pod. A control key is never denied. Admission paths read
+        // this deny map (see `nip_fi_resolver::tests::router`).
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn re_sent_disconnect_restores_the_deny_on_every_pod_after_restart() {
+            let key = nostr::Keys::generate().public_key();
+            let control = nostr::Keys::generate().public_key();
+            let until = chrono::Utc::now().timestamp() + 300;
+            let send = |pod: Arc<AppState>| async move {
+                let token = mint_token(&key.to_hex(), 0, serde_json::json!({ "until": until }));
+                let (status, body) = post_command(&pod, &token, &key.to_hex()).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(&body[..], br#"{"disconnected": true}"#);
+                drain_publishes(&pod).await;
+            };
+
+            let [(p1, _), (p2, mut p2_seen)] = enforce_pair().await;
+            send(Arc::clone(&p1)).await;
+            assert!(is_denied(&p1, &key), "P1 applies its own command");
+            await_target(&mut p2_seen, &key).await;
+            assert!(is_denied(&p2, &key), "P2 applies P1's command");
+            assert!(!is_denied(&p1, &control) && !is_denied(&p2, &control));
+
+            // Restart: fresh pods, empty deny maps. K is accepted again
+            // until the re-send arrives.
+            let [(p1, mut p1_seen), (p2, mut p2_seen)] = enforce_pair().await;
+            assert!(!is_denied(&p1, &key) && !is_denied(&p2, &key));
+
+            send(Arc::clone(&p2)).await;
+            await_target(&mut p1_seen, &key).await;
+            await_target(&mut p2_seen, &key).await;
+            assert!(is_denied(&p1, &key), "P1 applies the re-send");
+            assert!(is_denied(&p2, &key), "P2 applies its own re-send");
+            assert!(!is_denied(&p1, &control) && !is_denied(&p2, &control));
+        }
+
         // Pins finding 1 (replay half): shadow and enforce share one Redis
         // but claim under disjoint prefixes, so a shadow accept leaves the
         // command usable by enforce, while shadow still rejects its own
