@@ -1159,7 +1159,15 @@ mod postgres_tests {
     }
 
     async fn operator_test_state(operator_keys: &[Keys]) -> Option<Arc<AppState>> {
+        operator_test_state_with_policy(operator_keys, None).await
+    }
+
+    async fn operator_test_state_with_policy(
+        operator_keys: &[Keys],
+        nip_fi_provision_binding: Option<buzz_auth::ProvisionBindingPolicy>,
+    ) -> Option<Arc<AppState>> {
         let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
+        config.nip_fi_provision_binding = nip_fi_provision_binding;
         config.database_url = crate::test_support::database_url();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = "wss://tenant.example".to_string();
@@ -2655,6 +2663,186 @@ mod postgres_tests {
                 assert_eq!(json["issuers"], serde_json::json!([issuer]));
             }
         }
+    }
+
+    const NIP_FI_ISSUER: &str = "https://issuer.example/api/goose";
+
+    /// A provisioning policy under a fresh suffix whose `cmd.<suffix>` host is
+    /// a command audience. Returns the policy, the reserved host and a normal
+    /// one-label control host.
+    fn reserved_host_policy() -> (buzz_auth::ProvisionBindingPolicy, String, String) {
+        let suffix = format!("{}.example", Uuid::new_v4().simple());
+        let reserved = format!("cmd.{suffix}");
+        let policy = buzz_auth::ProvisionBindingPolicy::parse(
+            &serde_json::json!({"host_suffix": suffix, "authorized_issuers": [NIP_FI_ISSUER]})
+                .to_string(),
+            &serde_json::json!([{
+                "issuer": NIP_FI_ISSUER,
+                "command_audiences": [format!("https://{reserved}")],
+            }])
+            .to_string(),
+        )
+        .expect("valid policy");
+        (policy, reserved, format!("acme.{suffix}"))
+    }
+
+    async fn nip_fi_lookup(state: Arc<AppState>, operator: &Keys, host: &str) -> Value {
+        let response = signed_operator_request(
+            state,
+            operator,
+            "GET",
+            &format!("/operator/communities/nip-fi-binding?host={host}"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+        read_json(response).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_provisioning_refuses_reserved_host_on_both_branches() {
+        let operator = Keys::generate();
+        let owner = Keys::generate();
+        let (policy, reserved, control) = reserved_host_policy();
+        let Some(state) =
+            operator_test_state_with_policy(std::slice::from_ref(&operator), Some(policy)).await
+        else {
+            return;
+        };
+
+        for create_only in [true, false] {
+            let control = control.replacen("acme.", &format!("acme-{create_only}."), 1);
+            for (host, allowed) in [(reserved.as_str(), false), (control.as_str(), true)] {
+                let body = serde_json::json!({
+                    "host": host,
+                    "initial_owner_pubkey": owner.public_key().to_hex(),
+                    "create_only": create_only,
+                })
+                .to_string();
+                let response = signed_operator_request(
+                    Arc::clone(&state),
+                    &operator,
+                    "POST",
+                    "/operator/communities",
+                    Some(body),
+                )
+                .await;
+                assert_eq!(
+                    response.status().is_success(),
+                    allowed,
+                    "create_only={create_only} {host}"
+                );
+                let row = state
+                    .db
+                    .lookup_community_by_host(host)
+                    .await
+                    .expect("lookup");
+                assert_eq!(row.is_some(), allowed, "create_only={create_only} {host}");
+                let bound = state
+                    .db
+                    .nip_fi_bound_hosts(&[host.to_string()])
+                    .await
+                    .expect("bound hosts");
+                assert_eq!(
+                    !bound.is_empty(),
+                    allowed,
+                    "create_only={create_only} {host}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_bootstrap_leaves_reserved_host_unbound_across_restarts() {
+        let (policy, reserved, control) = reserved_host_policy();
+        let Ok(pool) = sqlx::PgPool::connect(&crate::test_support::database_url()).await else {
+            return;
+        };
+        let db = buzz_db::Db::from_pool(pool);
+        for start in 0..2 {
+            for (host, bound) in [(&reserved, false), (&control, true)] {
+                let record = crate::handlers::community_provisioning::ensure_deployment_community(
+                    &db,
+                    Some(&policy),
+                    host,
+                )
+                .await
+                .expect("startup")
+                .expect("community");
+                assert_eq!(&record.host, host);
+                let issuers = db
+                    .nip_fi_bound_hosts(std::slice::from_ref(host))
+                    .await
+                    .expect("bound hosts");
+                assert_eq!(!issuers.is_empty(), bound, "start {start}: {host}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_raw_reserved_binding_refuses_startup_and_reports_no_issuers() {
+        let operator = Keys::generate();
+        let (policy, reserved, control) = reserved_host_policy();
+        let Some(state) =
+            operator_test_state_with_policy(std::slice::from_ref(&operator), Some(policy.clone()))
+                .await
+        else {
+            return;
+        };
+        let startup = || {
+            crate::handlers::community_provisioning::ensure_deployment_community(
+                &state.db,
+                Some(&policy),
+                &control,
+            )
+        };
+        startup()
+            .await
+            .expect("control: startup with no reserved binding");
+
+        // Bind the reserved host with raw SQL, bypassing every policy check.
+        let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+            .await
+            .expect("connect");
+        state
+            .db
+            .ensure_configured_community_for_bootstrap(&reserved, &[])
+            .await
+            .expect("reserved community");
+        sqlx::query(
+            "INSERT INTO community_nip_fi_issuers (community_id, issuer) \
+             SELECT id, $2 FROM communities WHERE host = $1",
+        )
+        .bind(&reserved)
+        .bind(NIP_FI_ISSUER)
+        .execute(&pool)
+        .await
+        .expect("raw reserved binding");
+
+        assert!(matches!(
+            startup().await,
+            Err(
+                crate::handlers::community_provisioning::DeploymentCommunityError::ReservedBinding(
+                    _
+                )
+            )
+        ));
+        let lookup = nip_fi_lookup(Arc::clone(&state), &operator, &reserved).await;
+        assert_eq!(lookup["issuers"], serde_json::json!([]));
+        let lookup = nip_fi_lookup(Arc::clone(&state), &operator, &control).await;
+        assert_eq!(lookup["issuers"], serde_json::json!([NIP_FI_ISSUER]));
+
+        sqlx::query(
+            "DELETE FROM community_nip_fi_issuers \
+             WHERE community_id = (SELECT id FROM communities WHERE host = $1)",
+        )
+        .bind(&reserved)
+        .execute(&pool)
+        .await
+        .expect("remove raw binding so later startups in this database pass");
     }
 
     #[tokio::test]

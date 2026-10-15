@@ -216,28 +216,23 @@ impl NipFiCommunities {
             .map(|c| c.expected_aud().to_owned())
             .collect()
     }
-
-    /// The configured community hosts.
-    pub fn hosts(&self) -> impl Iterator<Item = &str> {
-        self.by_host.keys().map(String::as_str)
-    }
 }
 
 /// Parse `BUZZ_NIP_FI_PROVISION_BINDING`, independent of `BUZZ_NIP_FI_MODE`.
 ///
 /// Rejects a suffix that covers any `BUZZ_NIP_FI_COMMUNITIES` host, so the
-/// static enterprise map and database-bound communities never overlap.
-pub fn parse_provision_binding(
-    communities: &NipFiCommunities,
-) -> Result<Option<buzz_auth::ProvisionBindingPolicy>, ConfigError> {
+/// static enterprise map and database-bound communities never overlap. The
+/// hosts are read here rather than from [`NipFiRelayConfig`], whose map is
+/// empty when the mode does not evaluate.
+pub fn parse_provision_binding() -> Result<Option<buzz_auth::ProvisionBindingPolicy>, ConfigError> {
     let Some(policy) = buzz_auth::ProvisionBindingPolicy::from_env()
         .map_err(|e| ConfigError::InvalidValue(e.to_string()))?
     else {
         return Ok(None);
     };
     let suffix = policy.host_suffix();
-    if communities
-        .hosts()
+    if enterprise_community_hosts()?
+        .iter()
         .any(|host| host == suffix || host.ends_with(&format!(".{suffix}")))
     {
         return Err(ConfigError::InvalidValue(
@@ -246,6 +241,28 @@ pub fn parse_provision_binding(
         ));
     }
     Ok(Some(policy))
+}
+
+/// The hosts declared in `BUZZ_NIP_FI_COMMUNITIES`, in any mode. Only the
+/// `canonical_uri` of each entry is checked; an unreadable declaration fails
+/// closed because the overlap check could not be trusted.
+fn enterprise_community_hosts() -> Result<Vec<String>, ConfigError> {
+    let raw = std::env::var("BUZZ_NIP_FI_COMMUNITIES").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let unreadable = || {
+        ConfigError::InvalidValue(
+            "BUZZ_NIP_FI_PROVISION_BINDING: BUZZ_NIP_FI_COMMUNITIES hosts are unreadable"
+                .to_string(),
+        )
+    };
+    let entries: Vec<CommunityEnvConfig> = serde_json::from_str(&raw).map_err(|_| unreadable())?;
+    entries
+        .iter()
+        .map(|entry| canonical_authority(&entry.canonical_uri).map(str::to_owned))
+        .collect::<Option<_>>()
+        .ok_or_else(unreadable)
 }
 
 /// The authority of a canonical community URI, or `None` unless the URI is
@@ -1402,6 +1419,47 @@ mod tests {
 
     fn community_entry(uri: &str, issuers: &[&str]) -> serde_json::Value {
         serde_json::json!({ "canonical_uri": uri, "authorized_issuers": issuers })
+    }
+
+    /// Startup (`Config::from_env`) with `BUZZ_NIP_FI_COMMUNITIES` declaring
+    /// `a.relay.test` and a provisioning binding under `suffix`.
+    fn startup_with_provision_suffix(mode: &str, suffix: &str) -> Result<(), String> {
+        enforce_with_communities(serde_json::json!([community_entry(
+            "https://a.relay.test",
+            &["https://issuer.test", "https://issuer-b.test"]
+        )]))
+        .expect("valid enforce config");
+        std::env::set_var("BUZZ_NIP_FI_MODE", mode);
+        std::env::set_var(
+            buzz_auth::nip_fi::provision::PROVISION_BINDING_ENV,
+            serde_json::json!({
+                "host_suffix": suffix,
+                "authorized_issuers": ["https://issuer.test"],
+            })
+            .to_string(),
+        );
+        crate::config::Config::from_env()
+            .map(|cfg| assert!(cfg.nip_fi_provision_binding.is_some()))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn provision_binding_overlap_rejects_startup_in_every_mode() {
+        let _guard = super::NIP_FI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvGuard::new(NIP_FI_VARS);
+        let _binding = EnvGuard::new(&[buzz_auth::nip_fi::provision::PROVISION_BINDING_ENV]);
+        for mode in ["off", "enforce"] {
+            let err = startup_with_provision_suffix(mode, "relay.test")
+                .expect_err("suffix covering an enterprise host");
+            assert!(
+                err.contains("covers a BUZZ_NIP_FI_COMMUNITIES host"),
+                "{mode}: {err}"
+            );
+            startup_with_provision_suffix(mode, "communities.buzz.xyz")
+                .unwrap_or_else(|e| panic!("{mode}: disjoint suffix must start: {e}"));
+        }
     }
 
     #[test]

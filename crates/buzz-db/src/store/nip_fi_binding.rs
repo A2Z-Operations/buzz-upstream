@@ -377,7 +377,7 @@ mod postgres_tests {
             db.nip_fi_bound_hosts(&[unbound.to_uppercase(), elsewhere.clone()])
                 .await
                 .expect("bound hosts"),
-            [unbound.clone()]
+            std::slice::from_ref(&unbound)
         );
         assert!(db
             .unbind_nip_fi_issuer(found[0].id, ISS)

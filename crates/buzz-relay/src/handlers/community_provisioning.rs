@@ -363,9 +363,41 @@ pub async fn provision_community(
     })
 }
 
+/// Why startup could not settle the deployment community.
+#[derive(Debug)]
+pub enum DeploymentCommunityError {
+    /// A reserved host holds an issuer binding; startup must not continue.
+    ReservedBinding(String),
+    /// Ensuring the community failed.
+    Ensure(buzz_db::DbError),
+}
+
+/// Startup: refuse a reserved host that holds an issuer binding, then ensure
+/// the deployment community at `host`, bound only as the provisioning policy
+/// allows. `Ok(None)` when `host` is empty.
+pub async fn ensure_deployment_community(
+    db: &buzz_db::Db,
+    policy: Option<&buzz_auth::ProvisionBindingPolicy>,
+    host: &str,
+) -> Result<Option<buzz_db::EnsuredCommunityRecord>, DeploymentCommunityError> {
+    if let Some(policy) = policy {
+        verify_reserved_hosts_unbound(db, policy)
+            .await
+            .map_err(DeploymentCommunityError::ReservedBinding)?;
+    }
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let issuers = policy.map_or(&[][..], |policy| policy.issuers_for_new_host(host));
+    db.ensure_configured_community_for_bootstrap(host, issuers)
+        .await
+        .map(Some)
+        .map_err(DeploymentCommunityError::Ensure)
+}
+
 /// Refuse startup when a reserved host (a NIP-FI command audience) holds an
 /// issuer binding. An unbound reserved community row is valid.
-pub async fn verify_reserved_hosts_unbound(
+async fn verify_reserved_hosts_unbound(
     db: &buzz_db::Db,
     policy: &buzz_auth::ProvisionBindingPolicy,
 ) -> Result<(), String> {

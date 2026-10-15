@@ -1442,9 +1442,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
-            nip_fi_provision_binding: crate::nip_fi_config::parse_provision_binding(
-                &nip_fi.communities,
-            )?,
+            nip_fi_provision_binding: crate::nip_fi_config::parse_provision_binding()?,
             nip_fi,
         })
     }
