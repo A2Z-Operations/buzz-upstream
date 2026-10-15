@@ -397,7 +397,13 @@ where
     // evidence (`Authorization`, NIP-98, assertion) is examined. Explicit
     // here because some admitted routes are exempt from the router guard.
     // [NIP-FI.md:266-268]
-    let community = resolve_community(headers, communities).map_err(|c| (Stage::Community, c))?;
+    use crate::access::{AuthAttempt, AuthResult};
+    let failed = |stage, class, reason| {
+        AuthAttempt::nip_fi(None, false).log(AuthResult::Failed(reason));
+        (stage, class)
+    };
+    let community = resolve_community(headers, communities)
+        .map_err(|c| failed(Stage::Community, c, "community_unresolved"))?;
 
     // Step 2 — cardinality gate: exactly one Authorization field per
     // NIP-FI.md:695-700.
@@ -408,25 +414,33 @@ where
     // closes the attack where a relay-aware adversary slips a second credential
     // past the NIP-98 verifier.  [FI-INV-15]
     if headers.get_all("authorization").iter().count() > 1 {
-        return Err((Stage::Cardinality, DenialClass::EvidenceRejected));
+        return Err(failed(
+            Stage::Cardinality,
+            DenialClass::EvidenceRejected,
+            "duplicate_authorization",
+        ));
     }
 
     // Step 3: NIP-98.  Failure is a NIP-FI DenialClass, not a legacy error.
     // [NIP-FI.md §Admission procedure step 3; FI-TRACE-DENIAL-ORACLE]
     let proof = extract_nip98().map_err(|_legacy| {
-        let class = if headers.contains_key("authorization") {
-            DenialClass::EvidenceRejected
+        let (class, reason) = if headers.contains_key("authorization") {
+            (DenialClass::EvidenceRejected, "nip98_invalid")
         } else {
-            DenialClass::MissingEvidence
+            (DenialClass::MissingEvidence, "nip98_missing")
         };
-        (Stage::Nip98, class)
+        failed(Stage::Nip98, class, reason)
     })?;
 
     // Steps 4–5: extract and verify the assertion.
     let assertion =
         evaluate_attached_assertion(headers, community, verifier).map_err(|rejection| {
-            if let AssertionRejection::Verifier(e) = rejection {
-                tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
+            let attempt = AuthAttempt::nip_fi(Some(proof.pubkey), true);
+            match rejection {
+                AssertionRejection::VerifierUnavailable => {
+                    attempt.log(AuthResult::Denied(rejection.code()))
+                }
+                _ => attempt.log(AuthResult::Failed(rejection.code())),
             }
             (Stage::Assertion, rejection.denial_class())
         })?;
@@ -434,15 +448,18 @@ where
     // Step 6: key pairing — assertion.asserted_key MUST equal proven NIP-98 key.
     // A claimless assertion (no nostr_pubkey) is also a denial; key mismatch
     // is a private-state denial (403).  [FI-INV-05] [FI-TRACE-DENIAL-ORACLE]
+    let denied = |stage, reason| {
+        AuthAttempt::nip_fi(Some(proof.pubkey), true).log(AuthResult::Denied(reason));
+        (stage, DenialClass::AuthorizationDenied)
+    };
     if !asserted_key_matches(&assertion, proof.pubkey) {
-        tracing::debug!(proven = %proof.pubkey.to_hex(), "NIP-FI HTTP key pairing mismatch");
-        return Err((Stage::Pairing, DenialClass::AuthorizationDenied));
+        return Err(denied(Stage::Pairing, "key_mismatch"));
     }
 
     // Step 7: deny-map check — (iss, pubkey) must not be in an active deny
     // window.  Private-state denial.  [FI-INV-14] [NIP-FI.md:624-627]
     if deny_map.is_denied(assertion.identity().issuer(), &proof.pubkey, Utc::now()) {
-        return Err((Stage::DenySet, DenialClass::AuthorizationDenied));
+        return Err(denied(Stage::DenySet, "deny_set"));
     }
 
     Ok((proof, assertion))

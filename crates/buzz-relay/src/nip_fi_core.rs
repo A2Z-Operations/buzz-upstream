@@ -45,6 +45,16 @@ impl AssertionRejection {
             Self::Verifier(err) => err.denial_class(),
         }
     }
+
+    /// A fixed code for access logs; never token contents.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Transport(DenialClass::MissingEvidence) => "assertion_missing",
+            Self::Transport(_) => "assertion_malformed",
+            Self::VerifierUnavailable => "verifier_unavailable",
+            Self::Verifier(err) => err.code(),
+        }
+    }
 }
 
 /// Resolve the community served at the request `Host` — enforce-mode

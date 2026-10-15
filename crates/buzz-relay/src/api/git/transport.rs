@@ -1472,8 +1472,10 @@ async fn run_git_at(
     }
 
     if !status.success() {
+        // Hook output lands in stderr, so it stays out of WARN.
         let stderr = read_log_prefix(stderr_tmp.path(), 64 * 1024).await;
-        warn!(stderr = %stderr, service = %service, "git subprocess exited with error");
+        warn!(service = %service, ?status, "git subprocess exited with error");
+        tracing::debug!(stderr = %stderr, service = %service, "git subprocess stderr");
         // Still return output — git protocol errors are communicated in-band.
         // A non-zero exit feeds `PackOutput.ok` below, but it is NOT the signal
         // for a pre-receive hook decline: `git receive-pack --stateless-rpc`

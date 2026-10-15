@@ -98,15 +98,23 @@ pub(crate) fn check_nip_fi_at_upgrade(
     }
 
     // Enforce mode: resolve the Host's community, then validate the assertion.
+    use crate::access::{AuthAttempt, AuthResult};
     let community = match resolve_community(headers, communities) {
         Ok(community) => community,
-        Err(class) => return NipFiUpgradeOutcome::Denied(http_denial(class)),
+        Err(class) => {
+            AuthAttempt::nip_fi(None, false).log(AuthResult::Failed("community_unresolved"));
+            return NipFiUpgradeOutcome::Denied(http_denial(class));
+        }
     };
     match evaluate_attached_assertion(headers, community, verifier) {
         Ok(assertion) => NipFiUpgradeOutcome::Admitted(assertion),
         Err(rejection) => {
-            if let AssertionRejection::Verifier(err) = rejection {
-                tracing::debug!(code = err.code(), "nip-fi assertion denied at upgrade");
+            let attempt = AuthAttempt::nip_fi(None, false);
+            match rejection {
+                AssertionRejection::VerifierUnavailable => {
+                    attempt.log(AuthResult::Denied(rejection.code()))
+                }
+                _ => attempt.log(AuthResult::Failed(rejection.code())),
             }
             NipFiUpgradeOutcome::Denied(http_denial(rejection.denial_class()))
         }

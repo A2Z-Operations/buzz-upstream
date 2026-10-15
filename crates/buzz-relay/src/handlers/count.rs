@@ -21,6 +21,7 @@ pub async fn handle_count(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
+    let mut access = crate::access::ReadLog::count(&conn, &sub_id, &filters);
     // Require auth
     let (pubkey_bytes, token_channel_ids) = {
         match conn.auth_state_snapshot() {
@@ -32,6 +33,7 @@ pub async fn handle_count(
                     &sub_id,
                     "auth-required: not authenticated",
                 ));
+                access.deny("auth_required");
                 return;
             }
         }
@@ -45,6 +47,7 @@ pub async fn handle_count(
             &sub_id,
             "restricted: p-gated kinds require #p tag matching your pubkey",
         ));
+        access.deny("p_gated");
         return;
     }
     if !super::req::engram_filters_authorized(&filters, &authed_pubkey_hex) {
@@ -52,6 +55,7 @@ pub async fn handle_count(
             &sub_id,
             "restricted: agent-engram reads require authors=[self] or #p=[self]",
         ));
+        access.deny("engram_gated");
         return;
     }
     if !super::req::author_only_filters_authorized(&filters, &authed_pubkey_hex) {
@@ -59,6 +63,7 @@ pub async fn handle_count(
             &sub_id,
             "restricted: author-only kinds require authors=[self]",
         ));
+        access.deny("author_only");
         return;
     }
 
@@ -75,6 +80,7 @@ pub async fn handle_count(
                     &sub_id,
                     "restricted: too many explicit channels",
                 ));
+                access.deny("too_many_channels");
                 return;
             }
         };
@@ -86,8 +92,9 @@ pub async fn handle_count(
     {
         Ok(ids) => ids,
         Err(e) => {
-            warn!(sub_id = %sub_id, "Failed to get accessible channels: {e}");
+            warn!(sub_id = %sub_id, error_kind = %crate::access::db_error_kind(&e), "Failed to get accessible channels");
             conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            access.error("database_error");
             return;
         }
     };
@@ -113,8 +120,9 @@ pub async fn handle_count(
     {
         Ok(ids) => ids,
         Err(e) => {
-            warn!(sub_id = %sub_id, "Failed to get readable system channels: {e}");
+            warn!(sub_id = %sub_id, error_kind = %crate::access::db_error_kind(&e), "Failed to get readable system channels");
             conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            access.error("database_error");
             return;
         }
     };
@@ -137,6 +145,7 @@ pub async fn handle_count(
                 &sub_id,
                 "restricted: authorization denied",
             ));
+            access.deny("session_expired");
             return;
         }
     };
@@ -179,8 +188,9 @@ pub async fn handle_count(
                     {
                         Ok(member) => Some(member),
                         Err(e) => {
-                            warn!(sub_id = %sub_id, "Channel membership confirmation failed: {e}");
+                            warn!(sub_id = %sub_id, error_kind = %crate::access::db_error_kind(&e), "Channel membership confirmation failed");
                             conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                            access.error("database_error");
                             return;
                         }
                     }
@@ -203,8 +213,9 @@ pub async fn handle_count(
             )
             .await
             {
-                warn!(sub_id = %sub_id, "Failed to classify repaired channels: {e}");
+                warn!(sub_id = %sub_id, error_kind = %crate::access::db_error_kind(&e), "Failed to classify repaired channels");
                 conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                access.error("database_error");
                 return;
             }
             let filter_scope = super::system_channels::filter_channel_scope(
@@ -257,6 +268,11 @@ pub async fn handle_count(
                             &sub_id,
                             &super::req::db_read_closed_reason(&e),
                         ));
+                        access.error(if e.is_statement_cancelled() {
+                            "query_timed_out"
+                        } else {
+                            "database_error"
+                        });
                         return;
                     }
                 }
@@ -276,6 +292,7 @@ pub async fn handle_count(
                                 &sub_id,
                                 "restricted: count filter requires narrower constraints",
                             ));
+                            access.deny("count_too_broad");
                             return;
                         }
                         for se in stored_events {
@@ -294,6 +311,11 @@ pub async fn handle_count(
                             &sub_id,
                             &super::req::db_read_closed_reason(&e),
                         ));
+                        access.error(if e.is_statement_cancelled() {
+                            "query_timed_out"
+                        } else {
+                            "database_error"
+                        });
                         return;
                     }
                 }
@@ -344,6 +366,11 @@ pub async fn handle_count(
                             &sub_id,
                             &super::req::db_read_closed_reason(&e),
                         ));
+                        access.error(if e.is_statement_cancelled() {
+                            "query_timed_out"
+                        } else {
+                            "database_error"
+                        });
                         return;
                     }
                 }
@@ -362,6 +389,7 @@ pub async fn handle_count(
                                 &sub_id,
                                 "restricted: count filter requires narrower constraints",
                             ));
+                            access.deny("count_too_broad");
                             return;
                         }
                         for se in stored_events {
@@ -380,6 +408,11 @@ pub async fn handle_count(
                             &sub_id,
                             &super::req::db_read_closed_reason(&e),
                         ));
+                        access.error(if e.is_statement_cancelled() {
+                            "query_timed_out"
+                        } else {
+                            "database_error"
+                        });
                         return;
                     }
                 }
@@ -387,6 +420,7 @@ pub async fn handle_count(
         }
     }
     conn.send(RelayMessage::count(&sub_id, total));
+    access.served(usize::try_from(total).unwrap_or(usize::MAX));
 }
 
 #[cfg(test)]

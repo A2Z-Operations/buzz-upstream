@@ -11,7 +11,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use buzz_auth::{generate_challenge, AuthContext};
@@ -512,6 +512,7 @@ async fn handle_active_connection(
     // produced by any caller but retained for future test extensibility.
     pre_built: Option<PreBuiltNipFiBundle>,
 ) {
+    let opened = Instant::now();
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
     // connection_time is threaded in from the HTTP handler (captured immediately
@@ -520,7 +521,7 @@ async fn handle_active_connection(
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            warn!("Connection limit reached, rejecting {addr}");
+            warn!(peer_addr = %addr, "Connection limit reached, rejecting");
             return;
         }
     };
@@ -616,7 +617,7 @@ async fn handle_active_connection(
         community_control: control.clone(),
     });
 
-    info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
+    crate::access::log_connect(conn_id, conn.tenant.community(), addr);
     metrics::counter!(
         "buzz_ws_connections_total",
         "community" => conn.tenant.host().to_owned()
@@ -657,6 +658,12 @@ async fn handle_active_connection(
     let (ws_send, ws_recv) = socket.split();
 
     let send_cancel = cancel.child_token();
+    let sent = Arc::new(crate::access::SentTotals::default());
+    let counted = Arc::clone(&sent);
+    let ws_send = ws_send.with(move |frame: WsMessage| {
+        counted.record(&frame);
+        std::future::ready(Ok::<_, axum::Error>(frame))
+    });
     let send_task = tokio::spawn(send_loop(
         ws_send,
         rx,
@@ -747,6 +754,7 @@ async fn handle_active_connection(
     // Terminalize before joining writer/heartbeat tasks. A blocked socket sink
     // must not keep the authenticated gauge high during shutdown.
     let authenticated = auth_lifecycle.finish(close_outcome);
+    let closed_as = authenticated.as_ref().map(|ctx| ctx.pubkey);
 
     let _ = send_task.await;
     let _ = heartbeat_task.await;
@@ -770,7 +778,14 @@ async fn handle_active_connection(
         }
     }
     metrics::gauge!("buzz_ws_connections_active").decrement(1.0);
-    info!(conn_id = %conn_id, addr = %addr, "WebSocket connection closed");
+    crate::access::log_close(
+        conn_id,
+        conn.tenant.community(),
+        addr,
+        closed_as.as_ref(),
+        opened.elapsed(),
+        &sent,
+    );
 
     drop(permit);
 }
@@ -782,7 +797,7 @@ async fn handle_active_connection(
 /// is stalled, control frames queue in the small ctrl_rx buffer; callers
 /// treat a full control channel as terminal (Bug 7 fix).
 async fn send_loop(
-    ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    ws_send: impl Sink<WsMessage> + Unpin,
     data_rx: mpsc::Receiver<WsMessage>,
     ctrl_rx: mpsc::Receiver<WsMessage>,
     terminal_ctrl_rx: mpsc::Receiver<WsMessage>,

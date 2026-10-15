@@ -169,6 +169,70 @@ pub(crate) fn verify_bridge_auth_with_options(
     require_auth_token: bool,
     require_payload: bool,
 ) -> BridgeAuthResult {
+    check_bridge_proof(
+        headers,
+        method,
+        url,
+        body,
+        require_auth_token,
+        require_payload,
+    )
+    .map_err(|rejected| {
+        crate::access::AuthAttempt {
+            method: crate::access::AuthMethod::Nip98,
+            community: None,
+            conn_id: None,
+            route: Some(crate::access::url_path(url)),
+            pubkey: rejected.claimed,
+            pubkey_verified: false,
+        }
+        .log(crate::access::AuthResult::Failed(rejected.reason));
+        api_error(StatusCode::UNAUTHORIZED, &rejected.message)
+    })
+}
+
+/// [`verify_bridge_auth_with_options`] without the access line, for shadow
+/// observation re-checking a proof the request's real admission also checks.
+pub(crate) fn bridge_strict_proof(
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    require_payload: bool,
+) -> Result<(), ()> {
+    check_bridge_proof(headers, method, url, body, true, require_payload)
+        .map(drop)
+        .map_err(drop)
+}
+
+/// Why a bridge proof was rejected: a fixed `reason` code for the access log,
+/// the pubkey the proof claimed (unverified), and the client-facing message.
+struct BridgeRejection {
+    reason: &'static str,
+    claimed: Option<nostr::PublicKey>,
+    message: String,
+}
+
+fn rejected(
+    reason: &'static str,
+    claimed: Option<nostr::PublicKey>,
+    message: impl Into<String>,
+) -> BridgeRejection {
+    BridgeRejection {
+        reason,
+        claimed,
+        message: message.into(),
+    }
+}
+
+fn check_bridge_proof(
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    require_auth_token: bool,
+    require_payload: bool,
+) -> Result<VerifiedBridgeAuth, BridgeRejection> {
     // Try NIP-98 first (Authorization: Nostr <base64>)
     //
     // Cardinality is enforced at the NIP-FI admission boundary
@@ -184,14 +248,15 @@ pub(crate) fn verify_bridge_auth_with_options(
             use base64::engine::general_purpose::STANDARD as BASE64;
             let bytes = BASE64
                 .decode(auth_str)
-                .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid base64 in Nostr auth"))?;
+                .map_err(|_| rejected("invalid_encoding", None, "invalid base64 in Nostr auth"))?;
             String::from_utf8(bytes)
-                .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid UTF-8 in Nostr auth"))?
+                .map_err(|_| rejected("invalid_encoding", None, "invalid UTF-8 in Nostr auth"))?
         };
 
         let event: nostr::Event = serde_json::from_str(&event_json)
-            .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid NIP-98 event JSON"))?;
+            .map_err(|_| rejected("invalid_event", None, "invalid NIP-98 event JSON"))?;
         let event_id_bytes = event.id.to_bytes();
+        let claimed = Some(event.pubkey);
 
         if require_payload
             && !event
@@ -199,14 +264,21 @@ pub(crate) fn verify_bridge_auth_with_options(
                 .iter()
                 .any(|tag| tag.kind() == nostr::TagKind::Payload)
         {
-            return Err(api_error(
-                StatusCode::UNAUTHORIZED,
+            return Err(rejected(
+                "missing_payload",
+                claimed,
                 "NIP-98: missing payload tag",
             ));
         }
 
-        let pubkey = buzz_auth::verify_nip98_event(&event_json, url, method, body)
-            .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")))?;
+        let pubkey =
+            buzz_auth::verify_nip98_event(&event_json, url, method, body).map_err(|e| {
+                rejected(
+                    crate::access::auth_error_code(&e),
+                    claimed,
+                    format!("NIP-98: {e}"),
+                )
+            })?;
 
         return Ok(VerifiedBridgeAuth {
             pubkey,
@@ -219,7 +291,7 @@ pub(crate) fn verify_bridge_auth_with_options(
     if !require_auth_token {
         if let Some(hex_val) = headers.get("x-pubkey").and_then(|v| v.to_str().ok()) {
             let pubkey = nostr::PublicKey::from_hex(hex_val)
-                .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid X-Pubkey hex"))?;
+                .map_err(|_| rejected("invalid_x_pubkey", None, "invalid X-Pubkey hex"))?;
             // Zero event ID — no replay detection needed for dev mode
             return Ok(VerifiedBridgeAuth {
                 pubkey,
@@ -229,7 +301,7 @@ pub(crate) fn verify_bridge_auth_with_options(
         }
     }
 
-    Err(api_error(StatusCode::UNAUTHORIZED, "missing Nostr auth"))
+    Err(rejected("missing_auth", None, "missing Nostr auth"))
 }
 
 // ── NIP-FI Authority boundary ─────────────────────────────────────────────────
@@ -1003,7 +1075,7 @@ pub async fn submit_event(
     // assertion verify → pair → deny-map in fixed order. The proven pubkey is
     // only available through the returned NipFiAdmission. [FI-TRACE-AUTHORITY-UNIFORM]
     crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
-        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+        bridge_strict_proof(&headers, "POST", &url, Some(&body), true)
     });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
@@ -1355,7 +1427,7 @@ pub async fn query_events(
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
     crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
-        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+        bridge_strict_proof(&headers, "POST", &url, Some(&body), true)
     });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
@@ -2036,7 +2108,7 @@ pub async fn count_events(
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
     crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
-        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+        bridge_strict_proof(&headers, "POST", &url, Some(&body), true)
     });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
@@ -2877,7 +2949,7 @@ async fn authorize_moderation_read(
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
     crate::nip_fi_shadow::observe_strict_proof(state, headers, "bridge", || {
-        verify_bridge_auth(headers, "GET", &url, None, true).map(drop)
+        bridge_strict_proof(headers, "GET", &url, None, false)
     });
     let admission = admit_nip_fi_http_on_state(state, headers, || {
         verify_bridge_auth(

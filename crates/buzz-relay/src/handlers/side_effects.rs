@@ -918,7 +918,12 @@ pub async fn emit_system_message(
         .db
         .insert_event(tenant.community(), &event, Some(channel_id))
         .await
-        .map_err(|e| anyhow::anyhow!("system message insert failed: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "system message insert failed: {}",
+                crate::access::db_error_kind(&e)
+            )
+        })?;
 
     // Fan out to subscribers: best-effort, clients can retrieve the persisted event.
     if let Err(e) = state

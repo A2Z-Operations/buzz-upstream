@@ -41,11 +41,13 @@ pub(crate) fn db_read_error(
     context: &str,
     e: &buzz_db::DbError,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Only the error kind: DB error text can repeat a bound value.
+    let kind = crate::access::db_error_kind(e);
     if e.is_statement_cancelled() {
-        tracing::warn!("{context}: {e}");
+        tracing::warn!(error_kind = %kind, "{context}");
         return api_error(StatusCode::SERVICE_UNAVAILABLE, QUERY_TIMED_OUT);
     }
-    internal_error(&format!("{context}: {e}"))
+    internal_error(&format!("{context}: {kind}"))
 }
 
 #[allow(dead_code)]

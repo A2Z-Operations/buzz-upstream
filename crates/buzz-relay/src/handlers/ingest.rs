@@ -3332,8 +3332,9 @@ async fn ingest_event_inner(
                 emoji,
             )
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
-        {
+            .map_err(|e| {
+                IngestError::Internal(format!("error: {}", crate::access::db_error_kind(&e)))
+            })? {
             buzz_db::ReactionEventInsertOutcome::TargetMissing => {
                 return Err(IngestError::Rejected(format!(
                     "invalid: {REACTION_TARGET_NOT_FOUND}"
@@ -3502,7 +3503,10 @@ async fn ingest_event_inner(
                     buzz_db::DbError::AuthEventRejected => {
                         IngestError::Rejected("invalid: AUTH events cannot be stored".into())
                     }
-                    other => IngestError::Internal(format!("error: database error: {other}")),
+                    other => IngestError::Internal(format!(
+                        "error: database error: {}",
+                        crate::access::db_error_kind(&other)
+                    )),
                 });
             }
         }
