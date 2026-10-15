@@ -1,5 +1,5 @@
 //! Database-resolver admission through the real router (plan criteria 1, 2,
-//! 3, 4, 6f, 7e, 8). Root and audio upgrades and the protected-HTTP guard all
+//! 3, 4, 5, 6f, 7e, 8). Root and audio upgrades and the protected-HTTP guard all
 //! run against a resolver over an in-memory store that counts lookups; the
 //! assertion verifier is the production one with a seeded key snapshot.
 //! The relay database is unreachable, so a request that clears NIP-FI ends
@@ -120,6 +120,11 @@ fn issuer_policy(issuer: &str) -> IssuerPolicy {
 /// A valid assertion from `iss` for `https://<raw_host>`, signed by the
 /// fixture key.
 fn mint(iss: &str, raw_host: &str) -> String {
+    mint_for(iss, raw_host, &nostr::Keys::generate().public_key())
+}
+
+/// [`mint`] asserting `key`.
+fn mint_for(iss: &str, raw_host: &str, key: &nostr::PublicKey) -> String {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     let now = chrono::Utc::now().timestamp();
     let claims = serde_json::json!({
@@ -128,7 +133,7 @@ fn mint(iss: &str, raw_host: &str) -> String {
         "sub": "resolver-router-test",
         "iat": now,
         "exp": now + 600,
-        "nostr_pubkey": nostr::Keys::generate().public_key().to_hex(),
+        "nostr_pubkey": key.to_hex(),
     });
     let mut header = Header::new(Algorithm::ES256);
     header.typ = Some("nip-fi+jwt".to_owned());
@@ -416,4 +421,96 @@ async fn off_mode_with_database_source_neither_gates_nor_resolves() {
         assert!(cleared_nip_fi(&[outcome.clone()]), "{path}: {outcome:?}");
     }
     assert!(store.lookups.lock().unwrap().is_empty());
+}
+
+// ── Criterion 5: a disconnect covers communities created after it ──────────
+
+#[tokio::test]
+async fn key_disconnected_before_its_community_exists_is_denied_there() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let (store, clock) = setup();
+    let p = pod(&store, &clock, NipFiMode::Enforce).await;
+    let mut state = (*p.state).clone();
+    let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+        16,
+        vec![buzz_auth::IssuerCapacity {
+            issuer: ISS.to_owned(),
+            capacity: 16,
+        }],
+    ));
+    state.nip_fi_deny_map = Some(Arc::clone(&deny_map));
+    let p = Pod {
+        resolver: p.resolver,
+        state: Arc::new(state),
+    };
+
+    // Disconnect K while H does not exist anywhere.
+    let k = nostr::Keys::generate().public_key();
+    let control = nostr::Keys::generate().public_key();
+    let now = chrono::Utc::now();
+    let merged = deny_map.merge_cross_pod_deny(ISS, &k, now + chrono::Duration::hours(1), now);
+    assert!(matches!(merged, buzz_auth::CrossPodMergeResult::Merged));
+    let h = host("after");
+    assert_eq!(
+        p.send("/", &h, Some(&mint_for(ISS, &h, &k))).await,
+        unavailable()
+    );
+
+    // Provision H through this pod.
+    store.bind("after", &[ISS]);
+    p.resolver.record_creation(&h, &[ISS.to_owned()], 150).await;
+
+    let denied = (StatusCode::FORBIDDEN, b"authorization denied\n".to_vec());
+    assert_eq!(p.send("/", &h, Some(&mint_for(ISS, &h, &k))).await, denied);
+    assert!(cleared_nip_fi(&[p
+        .send("/", &h, Some(&mint_for(ISS, &h, &control)))
+        .await]));
+
+    let http_admit = |key: nostr::PublicKey| {
+        let state = Arc::clone(&p.state);
+        let h = h.clone();
+        async move {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::HOST, h.parse().unwrap());
+            headers.insert(
+                "Nostr-Federated-Identity",
+                format!("Bearer {}", mint_for(ISS, &h, &key))
+                    .parse()
+                    .unwrap(),
+            );
+            crate::nip_fi_http::admit_nip_fi_http_on_state(&state, &headers, || {
+                Ok(crate::nip_fi_http::Nip98Proof::new(key, ()))
+            })
+            .await
+            .map(drop)
+        }
+    };
+    let resp = http_admit(k)
+        .await
+        .expect_err("K is denied at HTTP admission");
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!((status, body.to_vec()), denied);
+    assert!(http_admit(control).await.is_ok(), "control key is admitted");
+
+    let http_denials: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| {
+            key.key().name() == "buzz_auth_failures_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|l| l.value() == "nip_fi_http_denied_pubkey")
+        })
+        .map(|(.., value)| match value {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(http_denials, 1);
 }
