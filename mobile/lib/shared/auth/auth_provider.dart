@@ -56,9 +56,14 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
   /// Authenticate with a community. Saves it and switches to it.
   /// Writes to storage directly to avoid circular dependency with community
   /// providers.
-  Future<void> authenticateWithCommunity(Community community) {
+  Future<void> authenticateWithCommunity(
+    Community community, {
+    bool Function()? shouldContinue,
+  }) {
     return ref.read(communityTransitionProvider).runExclusive(() async {
+      if (shouldContinue != null && !shouldContinue()) return;
       await ref.read(communityTransitionProvider).run();
+      if (shouldContinue != null && !shouldContinue()) return;
       final storage = ref.read(communityStorageProvider);
       await storage.save(community);
       await storage.saveActiveId(community.id);

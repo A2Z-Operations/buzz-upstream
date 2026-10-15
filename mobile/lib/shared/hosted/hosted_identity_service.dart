@@ -1,0 +1,229 @@
+import 'dart:convert';
+
+import 'package:nostr/nostr.dart' as nostr;
+
+import 'account_identity_store.dart';
+import 'builderlab_account.dart';
+
+enum HostedIdentityState {
+  ready,
+  needsBinding,
+  needsBackup,
+  mismatch,
+  recoveryBlocked,
+  needsAuthoritativeAbsence,
+}
+
+class HostedIdentityResult {
+  const HostedIdentityResult(this.state, {this.pubkey});
+  final HostedIdentityState state;
+  final String? pubkey;
+}
+
+/// Resolves identity safely. Generation requires a separately verified
+/// complete absence contract and explicit legacy-key reconciliation; neither a
+/// failed recovery nor an unbound account proves there is no prior identity.
+class HostedIdentityService {
+  HostedIdentityService({
+    required this.account,
+    required this.store,
+    this.canGenerateAfterLegacyReconciliation,
+  });
+
+  /// Return true only when legacy community identities have been reconciled.
+  /// Must not call AccountIdentityStore: invoked under its writer lock.
+  final Future<bool> Function()? canGenerateAfterLegacyReconciliation;
+  final BuilderlabAccountClient account;
+  final AccountIdentityStore store;
+  Future<void> _tail = Future<void>.value();
+
+  Future<HostedIdentityResult> resolve({bool Function()? isCurrent}) {
+    final result = _tail.then((_) => _resolve(isCurrent));
+    _tail = result.then<void>((_) {}, onError: (_) {});
+    return result;
+  }
+
+  Future<HostedIdentityResult> _resolve(bool Function()? isCurrent) async {
+    void checkCurrent() {
+      if (isCurrent != null && !isCurrent()) throw AccountFailure.unavailable;
+    }
+
+    checkCurrent();
+    final subject = account.account?.subject;
+    if (subject == null) throw AccountFailure.signedOut;
+    final local = await store.read();
+    final response = await account.currentIdentity();
+    _sameAccount(subject);
+    if (response['error'] != null) throw AccountFailure.invalidResponse;
+    final identity = response['identity'];
+    final String? bound;
+    if (identity == null) {
+      bound = null; // The current API omits the optional unbound identity.
+    } else if (identity is Map<String, dynamic>) {
+      bound = _pubkey(identity['pubkey_hex']);
+    } else {
+      throw AccountFailure.invalidResponse;
+    }
+    if (local != null) return _result(local, bound, subject);
+
+    final status = await account.post('/v1/buzz/nsec-backups/status', {});
+    _sameAccount(subject);
+    checkCurrent();
+    final listed = status['backup_nostr_pubkeys'];
+    if (status['error'] != null || listed is! List) {
+      throw AccountFailure.invalidResponse;
+    }
+    final statusBound = status['current_nostr_pubkey'] == null
+        ? null
+        : _pubkey(status['current_nostr_pubkey']);
+    final statusKeys = listed.map(_pubkey).toSet();
+    if (statusBound != bound) throw AccountFailure.invalidResponse;
+    if (statusBound == null && statusKeys.isEmpty) {
+      final generated = await store.generateIfAbsent(
+        authorize: () async {
+          _sameAccount(subject);
+          checkCurrent();
+          final reconciled =
+              await canGenerateAfterLegacyReconciliation?.call() ?? false;
+          _sameAccount(subject);
+          checkCurrent();
+          return reconciled;
+        },
+      );
+      _sameAccount(subject);
+      checkCurrent();
+      return generated == null
+          ? const HostedIdentityResult(
+              HostedIdentityState.needsAuthoritativeAbsence,
+            )
+          : _result(generated, bound, subject);
+    }
+
+    final recovered = await account.post('/v1/buzz/nsec-backups/recovery', {});
+    _sameAccount(subject);
+    final backups = recovered['backups'];
+    final failed = recovered['failed_backup_ids'];
+    if (recovered['error'] != null ||
+        backups is! List ||
+        failed is! List ||
+        failed.any((id) => id is! String)) {
+      throw AccountFailure.invalidResponse;
+    }
+    if (failed.isNotEmpty) {
+      return const HostedIdentityResult(HostedIdentityState.recoveryBlocked);
+    }
+    if (backups.isEmpty) {
+      return HostedIdentityResult(
+        bound == null
+            ? HostedIdentityState.needsAuthoritativeAbsence
+            : HostedIdentityState.recoveryBlocked,
+      );
+    }
+    // Validate the entire result before storing anything. Never trust its
+    // advertised pubkey without deriving it from the actual secret.
+    final candidates = <String, ({nostr.Keys keys, String backupId})>{};
+    try {
+      for (final backup in backups) {
+        if (backup is! Map<String, dynamic>) throw const FormatException();
+        final secret = backup['secret_key'];
+        final backupId = backup['backup_id'];
+        if (secret is! String ||
+            !RegExp(r'^[A-Za-z0-9_-]{43}$').hasMatch(secret) ||
+            backupId is! String ||
+            backupId.isEmpty) {
+          throw const FormatException();
+        }
+        final bytes = base64Url.decode(base64Url.normalize(secret));
+        if (bytes.length != 32) throw const FormatException();
+        final hex = bytes
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
+        final scalar = BigInt.parse(hex, radix: 16);
+        final order = BigInt.parse(
+          'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
+          radix: 16,
+        );
+        if (scalar <= BigInt.zero || scalar >= order) {
+          throw const FormatException();
+        }
+        final keys = nostr.Keys(hex);
+        if (keys.public != _pubkey(backup['nostr_pubkey'])) {
+          throw const FormatException();
+        }
+        candidates.putIfAbsent(
+          keys.public,
+          () => (keys: keys, backupId: backupId),
+        );
+      }
+    } catch (_) {
+      throw AccountFailure.invalidResponse;
+    }
+    if (candidates.length != 1) {
+      return const HostedIdentityResult(HostedIdentityState.recoveryBlocked);
+    }
+    final candidate = candidates.values.single;
+    if (bound != null && bound != candidate.keys.public) {
+      return const HostedIdentityResult(HostedIdentityState.mismatch);
+    }
+    _sameAccount(subject);
+    checkCurrent();
+    final saved = await store.create(
+      candidate.keys.nsec,
+      checkCurrent: () {
+        _sameAccount(subject);
+        checkCurrent();
+      },
+      recoveredBackup: BackupReceipt(
+        backend: BuilderlabAccountClient.origin.origin,
+        subject: subject,
+        pubkey: candidate.keys.public,
+        backupId: candidate.backupId,
+      ),
+    );
+    _sameAccount(subject);
+    checkCurrent();
+    return _result(saved, bound, subject);
+  }
+
+  HostedIdentityResult _result(
+    AccountIdentitySnapshot local,
+    String? bound,
+    String subject,
+  ) {
+    _sameAccount(subject);
+    if (bound != null && bound != local.pubkey) {
+      return HostedIdentityResult(
+        HostedIdentityState.mismatch,
+        pubkey: local.pubkey,
+      );
+    }
+    if (bound == null) {
+      return HostedIdentityResult(
+        HostedIdentityState.needsBinding,
+        pubkey: local.pubkey,
+      );
+    }
+    return HostedIdentityResult(
+      local.hasBackupFor(
+            backend: BuilderlabAccountClient.origin.origin,
+            subject: subject,
+          )
+          ? HostedIdentityState.ready
+          : HostedIdentityState.needsBackup,
+      pubkey: local.pubkey,
+    );
+  }
+
+  void _sameAccount(String subject) {
+    if (account.account?.subject != subject) {
+      throw AccountFailure.differentAccount;
+    }
+  }
+
+  static String _pubkey(dynamic value) {
+    if (value is! String || !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(value)) {
+      throw AccountFailure.invalidResponse;
+    }
+    return value.toLowerCase();
+  }
+}

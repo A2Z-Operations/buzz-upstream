@@ -1246,7 +1246,11 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
   }
 
   @override
-  Future<void> authenticateWithCommunity(Community community) async {
+  Future<void> authenticateWithCommunity(
+    Community community, {
+    bool Function()? shouldContinue,
+  }) async {
+    if (shouldContinue != null && !shouldContinue()) return;
     lastCommunity = community;
     await authentication?.future;
     state = AsyncData(

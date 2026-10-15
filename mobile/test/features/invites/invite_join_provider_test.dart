@@ -749,7 +749,11 @@ class _RecordingAuthNotifier extends AuthNotifier {
       const AuthState(status: AuthStatus.unauthenticated);
 
   @override
-  Future<void> authenticateWithCommunity(Community community) async {
+  Future<void> authenticateWithCommunity(
+    Community community, {
+    bool Function()? shouldContinue,
+  }) async {
+    if (shouldContinue != null && !shouldContinue()) return;
     final storage = ref.read(communityStorageProvider);
     await storage.save(community);
     await storage.saveActiveId(community.id);

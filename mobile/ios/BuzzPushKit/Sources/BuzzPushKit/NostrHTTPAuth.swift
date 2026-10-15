@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
-import P256K
+// Keep the signing library's C module out of app and extension interfaces.
+@_implementationOnly import P256K
 
 public enum NostrHTTPAuthError: Error, Equatable {
     case invalidHex

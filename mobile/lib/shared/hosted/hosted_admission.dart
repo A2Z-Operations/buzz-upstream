@@ -1,0 +1,138 @@
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+
+import '../community/community.dart';
+import '../deeplink/deep_link.dart';
+import '../relay/relay_session.dart';
+import '../relay/relay_socket.dart';
+import 'account_identity_store.dart';
+import 'builderlab_account.dart';
+
+/// Builds a community only after scoped backup evidence and current binding.
+/// The caller persists it through the existing community transition owner.
+class HostedAdmission {
+  HostedAdmission({
+    required this.account,
+    required this.store,
+    http.Client? client,
+    Future<void> Function(Community)? probe,
+  }) : _http = client ?? http.Client(),
+       _probe = probe ?? _authenticateRelay;
+  final BuilderlabAccountClient account;
+  final AccountIdentityStore store;
+  final http.Client _http;
+  final Future<void> Function(Community) _probe;
+
+  Future<Community> prepare(
+    BuzzDeepLink link,
+    String subject,
+    String pubkey, {
+    bool Function()? isCurrent,
+  }) async {
+    void checkCurrent() {
+      if (isCurrent != null && !isCurrent()) throw AccountFailure.unavailable;
+      if (account.account?.subject != subject) {
+        throw AccountFailure.differentAccount;
+      }
+    }
+
+    checkCurrent();
+    final relay = switch (link) {
+      InviteDeepLink(:final relayUrl) => relayUrl,
+      AddCommunityDeepLink(:final relayUrl) => relayUrl,
+      _ => throw AccountFailure.invalidResponse,
+    };
+    final uri = Uri.parse(relay);
+    if (uri.scheme != 'wss' ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment ||
+        (uri.path.isNotEmpty && uri.path != '/') ||
+        !uri.host.endsWith('.communities.buzz.xyz') ||
+        (uri.hasPort && uri.port != 443)) {
+      throw AccountFailure.denied;
+    }
+    if (account.account?.subject != subject) {
+      throw AccountFailure.differentAccount;
+    }
+    final snapshot = await store.read();
+    if (snapshot?.pubkey != pubkey ||
+        !snapshot!.hasBackupFor(
+          backend: BuilderlabAccountClient.origin.origin,
+          subject: subject,
+        )) {
+      throw AccountFailure.denied;
+    }
+    final binding = await account.currentIdentity();
+    final identity = binding['identity'];
+    if (identity is! Map || identity['pubkey_hex'] != pubkey) {
+      throw AccountFailure.denied;
+    }
+    if (link is InviteDeepLink) {
+      final body = jsonEncode({
+        'code': link.code,
+        if (link.policyReceipt != null) 'policy_receipt': link.policyReceipt,
+      });
+      final url = uri.replace(scheme: 'https', path: '/api/invites/claim');
+      final header = await store.withKeys(
+        (keys) async => buildNip98AuthHeader(
+          method: 'POST',
+          url: url.toString(),
+          bodyBytes: utf8.encode(body),
+          nsec: keys.nsec,
+        ),
+      );
+      checkCurrent();
+      final request = http.Request('POST', url)
+        ..followRedirects = false
+        ..headers.addAll({
+          'Authorization': header,
+          'Content-Type': 'application/json',
+        })
+        ..body = body;
+      final response = await _http
+          .send(request)
+          .timeout(const Duration(seconds: 30));
+      // Never render or log server response bodies.
+      await response.stream.drain<void>().timeout(const Duration(seconds: 30));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw AccountFailure.denied;
+      }
+    }
+    if (account.account?.subject != subject) {
+      throw AccountFailure.differentAccount;
+    }
+    final community = await store.withKeys((keys) async {
+      if (keys.public != pubkey) throw AccountIdentityFailure.mismatch;
+      return Community.create(
+        name: link is AddCommunityDeepLink ? link.name : uri.host,
+        relayUrl: relay,
+        pubkey: pubkey,
+        nsec: keys.nsec,
+      );
+    });
+    checkCurrent();
+    await _probe(community);
+    checkCurrent();
+    return community;
+  }
+
+  static Future<void> _authenticateRelay(Community community) async {
+    final socket = RelaySocket(
+      wsUrl: community.relayUrl,
+      nsec: community.nsec,
+      onMessage: (_) {},
+      onConnected: () {},
+      onDisconnected: (_) {},
+    );
+    try {
+      await socket.connect().timeout(const Duration(seconds: 30));
+      if (socket.state != SocketState.connected) throw AccountFailure.denied;
+    } finally {
+      socket.dispose();
+    }
+  }
+
+  void dispose() => _http.close();
+}
