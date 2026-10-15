@@ -663,3 +663,66 @@ fn snapshot_visibility_honours_the_in_progress_list() {
     assert!(!s.is_visible(55));
     assert!(!s.is_visible(60));
 }
+
+/// §8 bounds: unset or blank variables take the defaults, a set value
+/// overrides only its own bound, and out-of-range or non-numeric values fail
+/// startup rather than silently falling back.
+#[test]
+fn resolver_bounds_from_env_defaults_overrides_and_rejects() {
+    const VARS: [&str; 9] = [
+        "BUZZ_NIP_FI_RESOLVER_NEGATIVE_CACHE_MAX",
+        "BUZZ_NIP_FI_RESOLVER_MAX_INFLIGHT",
+        "BUZZ_NIP_FI_RESOLVER_MAX_PENDING_HOSTS",
+        "BUZZ_NIP_FI_RESOLVER_MAX_WAITERS",
+        "BUZZ_NIP_FI_RESOLVER_PERMIT_WAIT_MS",
+        "BUZZ_NIP_FI_RESOLVER_LOOKUP_TIMEOUT_MS",
+        "BUZZ_NIP_FI_SNAPSHOT_MAX_ROWS",
+        "BUZZ_NIP_FI_OVERLAY_MAX",
+        "BUZZ_NIP_FI_SNAPSHOT_REFRESH_TIMEOUT_MS",
+    ];
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            for v in VARS {
+                std::env::remove_var(v);
+            }
+        }
+    }
+    let _lock = crate::nip_fi_config::NIP_FI_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _clear = Clear;
+    for v in VARS {
+        std::env::remove_var(v);
+    }
+
+    assert_eq!(
+        ResolverBounds::from_env().unwrap(),
+        ResolverBounds::default()
+    );
+
+    std::env::set_var("BUZZ_NIP_FI_OVERLAY_MAX", "250");
+    std::env::set_var("BUZZ_NIP_FI_SNAPSHOT_REFRESH_TIMEOUT_MS", "7500");
+    std::env::set_var("BUZZ_NIP_FI_RESOLVER_MAX_INFLIGHT", " ");
+    let bounds = ResolverBounds::from_env().unwrap();
+    assert_eq!(bounds.overlay_max, 250);
+    assert_eq!(bounds.refresh_timeout, Duration::from_millis(7_500));
+    assert_eq!(bounds.max_inflight, ResolverBounds::default().max_inflight);
+
+    for (var, bad) in [
+        ("BUZZ_NIP_FI_OVERLAY_MAX", "0"),
+        ("BUZZ_NIP_FI_SNAPSHOT_MAX_ROWS", "lots"),
+        ("BUZZ_NIP_FI_RESOLVER_LOOKUP_TIMEOUT_MS", "600001"),
+    ] {
+        let prior = std::env::var(var).ok();
+        std::env::set_var(var, bad);
+        assert!(
+            ResolverBounds::from_env().is_err(),
+            "{var}={bad} must fail startup"
+        );
+        match prior {
+            Some(p) => std::env::set_var(var, p),
+            None => std::env::remove_var(var),
+        }
+    }
+}
