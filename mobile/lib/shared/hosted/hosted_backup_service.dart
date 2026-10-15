@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../storage/secure_storage.dart';
+
 import 'account_identity_store.dart';
 import 'builderlab_account.dart';
 import 'hosted_environment.dart';
@@ -26,13 +28,7 @@ class HostedBackupService {
     HpkeBackup? hpke,
     FlutterSecureStorage? storage,
   }) : _hpke = hpke ?? HpkeBackup(),
-       _storage =
-           storage ??
-           const FlutterSecureStorage(
-             iOptions: IOSOptions(
-               accessibility: KeychainAccessibility.first_unlock_this_device,
-             ),
-           );
+       _storage = storage ?? accountSecureStorage;
 
   final BuilderlabAccountClient account;
   final AccountIdentityStore identity;

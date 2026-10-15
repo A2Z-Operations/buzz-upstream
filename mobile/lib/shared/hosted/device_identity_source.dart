@@ -2,20 +2,23 @@ import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../storage/secure_storage.dart';
+
 import 'account_identity_store.dart';
 
 /// Public identity choices; never contains private signing material.
 class DeviceIdentityChoice {
-  const DeviceIdentityChoice(this.pubkey, this.label);
+  const DeviceIdentityChoice(this.pubkey, this.label, {this.fromCloud = false});
   final String pubkey;
   final String label;
+  final bool fromCloud;
 }
 
 /// Read-only inventory, including legacy records hidden by a newer community list.
 /// Do not call CommunityStorage.loadAll here: it migrates and deletes records.
 class DeviceIdentitySource {
   DeviceIdentitySource({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? communitySecureStorage;
   final FlutterSecureStorage _storage;
 
   Future<List<DeviceIdentityChoice>> choices() async => [
@@ -38,10 +41,10 @@ class DeviceIdentitySource {
   Future<Map<String, ({String nsec, String label})>> _read() async {
     try {
       final result = <String, ({String nsec, String label})>{};
+      final labels = <String, Set<String>>{};
       void add(dynamic nsec, dynamic advertised, String label) {
         if (nsec == null) {
-          // An identity reference without its secret is not authoritative absence.
-          if (advertised != null) throw AccountIdentityFailure.unreadable;
+          // Token-only legacy communities legitimately have no private key.
           return;
         }
         if (nsec is! String) throw AccountIdentityFailure.unreadable;
@@ -49,11 +52,8 @@ class DeviceIdentitySource {
         if (advertised != null && advertised != pubkey) {
           throw AccountIdentityFailure.unreadable;
         }
-        final previous = result[pubkey];
-        result[pubkey] = (
-          nsec: nsec,
-          label: previous == null ? label : '${previous.label}, $label',
-        );
+        final names = labels.putIfAbsent(pubkey, () => <String>{})..add(label);
+        result[pubkey] = (nsec: nsec, label: names.join(', '));
       }
 
       for (final key in ['buzz_communities', 'buzz_workspaces']) {
@@ -65,7 +65,9 @@ class DeviceIdentitySource {
           add(
             value['nsec'],
             value['pubkey'],
-            value['name'] as String? ?? 'Saved community',
+            (value['name'] as String?)?.trim().isNotEmpty == true
+                ? (value['name'] as String).trim()
+                : 'Saved community',
           );
         }
       }

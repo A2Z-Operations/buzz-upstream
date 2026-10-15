@@ -227,7 +227,8 @@ class HostedFlow extends ChangeNotifier {
 
   /// Resume only an offered public identity; reread local and cloud facts first.
   Future<void> chooseIdentity(String pubkey) {
-    if (stage != HostedFlowStage.chooseIdentity ||
+    if (_target == null ||
+        stage != HostedFlowStage.chooseIdentity ||
         !identityChoices.any((item) => item.pubkey == pubkey)) {
       return Future.value();
     }

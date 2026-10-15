@@ -225,7 +225,8 @@ class HostedIdentityService {
         choices: [
           DeviceIdentityChoice(
             candidate.keys.public,
-            'Builderlab backup (keep existing community identities)',
+            'Use Builderlab identity',
+            fromCloud: true,
           ),
         ],
       );

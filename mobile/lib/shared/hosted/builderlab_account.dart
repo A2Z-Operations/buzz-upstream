@@ -3,7 +3,10 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
 import 'package:http/http.dart' as http;
+
+import '../storage/secure_storage.dart';
 
 import 'hosted_environment.dart';
 
@@ -47,11 +50,7 @@ class BuilderlabAccountClient {
 
   /// Device-only: the session never syncs or restores onto another device.
   @visibleForTesting
-  static const defaultStorage = FlutterSecureStorage(
-    iOptions: IOSOptions(
-      accessibility: KeychainAccessibility.first_unlock_this_device,
-    ),
-  );
+  static const defaultStorage = accountSecureStorage;
 
   static final origin = HostedEnvironment.origin;
   static const _prefix = '/api/goose';

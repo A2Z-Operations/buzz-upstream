@@ -2,7 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
 import 'package:nostr/nostr.dart' as nostr;
+
+import '../storage/secure_storage.dart';
 
 import 'hosted_environment.dart';
 
@@ -77,13 +80,7 @@ class AccountIdentitySnapshot {
 /// FlutterSecureStorage does not provide a cross-process compare-and-set.
 class AccountIdentityStore {
   AccountIdentityStore({FlutterSecureStorage? storage})
-    : _storage =
-          storage ??
-          const FlutterSecureStorage(
-            iOptions: IOSOptions(
-              accessibility: KeychainAccessibility.first_unlock_this_device,
-            ),
-          );
+    : _storage = storage ?? accountSecureStorage;
 
   static final storageKey =
       'buzz_account_identity_${HostedEnvironment.origin.host.replaceAll('.', '_')}_v1';

@@ -7,7 +7,10 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
 import 'package:url_launcher/url_launcher.dart';
+
+import '../storage/secure_storage.dart';
 
 import 'hosted_environment.dart';
 
@@ -29,13 +32,7 @@ class BrowserAuth {
     FlutterSecureStorage? storage,
     Future<String?> Function(Uri)? openBrowser,
     DateTime Function()? now,
-  }) : _storage =
-           storage ??
-           const FlutterSecureStorage(
-             iOptions: IOSOptions(
-               accessibility: KeychainAccessibility.first_unlock_this_device,
-             ),
-           ),
+  }) : _storage = storage ?? accountSecureStorage,
        _openBrowser = openBrowser ?? _openPlatformBrowser,
        _now = now ?? DateTime.now;
 

@@ -124,7 +124,6 @@ void main() {
       for (final data in [
         {'buzz_workspaces': '{broken'},
         {'buzz_nsec': ''},
-        {'buzz_pubkey': first.public},
         {
           'buzz_communities': jsonEncode([
             {'nsec': first.nsec, 'pubkey': second.public},
@@ -192,6 +191,55 @@ void main() {
       account.backups = [second.public];
       expect((await service.resolve()).state, HostedIdentityState.mismatch);
       expect(await secure.readAll(), before);
+    },
+  );
+
+  test(
+    'token-only legacy records do not prevent recovering the same cloud identity',
+    () async {
+      final raw = jsonEncode([
+        {'pubkey': first.public, 'name': 'Token-only community'},
+      ]);
+      await secure.write(key: 'buzz_communities', value: raw);
+      await secure.write(key: 'buzz_pubkey', value: first.public);
+      account.bound = first.public;
+      account.backups = [first.public];
+      account.recovery = {
+        'backups': [
+          {
+            'backup_id': 'fixture-backup',
+            'nostr_pubkey': first.public,
+            'secret_key': base64UrlEncode([
+              ...List.filled(31, 0),
+              1,
+            ]).replaceAll('=', ''),
+          },
+        ],
+        'failed_backup_ids': [],
+      };
+      final result = await service.resolve();
+      expect(result.state, HostedIdentityState.ready);
+      expect(result.pubkey, first.public);
+      expect(account.calls, [
+        '/v1/buzz/nsec-backups/status',
+        '/v1/buzz/nsec-backups/recovery',
+      ]);
+      expect(await secure.read(key: 'buzz_communities'), raw);
+      expect(await secure.read(key: 'buzz_pubkey'), first.public);
+    },
+  );
+
+  test(
+    'inventory labels are deduplicated and empty names get a fallback',
+    () async {
+      final raw = jsonEncode([record(first, 'Team'), record(second, '  ')]);
+      await secure.write(key: 'buzz_communities', value: raw);
+      await secure.write(key: 'buzz_workspaces', value: raw);
+      final choices = await DeviceIdentitySource().choices();
+      expect(choices.map((choice) => choice.label), [
+        'Team',
+        'Saved community',
+      ]);
     },
   );
 

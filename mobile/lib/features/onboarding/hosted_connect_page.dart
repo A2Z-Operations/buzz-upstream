@@ -26,7 +26,9 @@ class HostedConnectPage extends HookConsumerWidget {
       HostedFlowStage.idle => 'Continue connecting your account.',
       HostedFlowStage.working => 'Connecting your account…',
       HostedFlowStage.chooseIdentity =>
-        'Choose the identity to connect to Builderlab. Existing device and cloud keys will be kept.',
+        flow.identityChoices.any((choice) => choice.fromCloud)
+            ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
+            : 'Choose the identity to connect to Builderlab. It will be bound to your account and backed up. Existing keys will be kept. This app cannot change the selected Builderlab identity later.',
       HostedFlowStage.signIn => 'Complete sign-in in your browser.',
       HostedFlowStage.browserReturned =>
         'Continue setup in your browser. Open your community in Buzz when it is ready.',
