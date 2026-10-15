@@ -727,4 +727,4 @@ fn resolver_bounds_from_env_defaults_overrides_and_rejects() {
     }
 }
 
-mod router;
+mod router_tests;
