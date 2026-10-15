@@ -125,7 +125,7 @@ void main() {
     expect(relay.requestedPages, [1, 2]);
   });
   test(
-    'owner discovery is scoped and bounded even when the relay keeps paging',
+    'directory discovery is bounded even when the relay keeps paging',
     () async {
       final repeated = [
         for (var i = 0; i < 99; i++) profile(agent, ownedBy: owner, time: i),
@@ -140,7 +140,7 @@ void main() {
       );
       expect(relay.requestedPages.length, 10);
       for (final filter in relay.requestedTags) {
-        expect(filter['#auth'], [owner.public]);
+        expect(filter.containsKey('#auth'), isFalse);
         expect(filter['limit'], 100);
       }
     },

@@ -43,6 +43,9 @@ Future<List<AgentDirectoryEntry>> _loadAssistants(
   final profiles = <String, NostrEvent>{};
   final seen = <String>{};
   const pageSize = 100;
+  // The current relay only indexes single-letter NIP-01 tag filters. It
+  // silently drops #auth, so owner-scoped discovery needs relay support.
+  // Until then fail visibly at this bound rather than drain the directory.
   const maxPages = 10;
   for (var page = 1; page <= maxPages; page++) {
     sync.check();
@@ -50,11 +53,6 @@ Future<List<AgentDirectoryEntry>> _loadAssistants(
       NostrFilter(
         kinds: const [0],
         authors: pubkey == null ? null : [pubkey],
-        tags: pubkey == null
-            ? {
-                '#auth': [sync.pubkey],
-              }
-            : const {},
         limit: pageSize,
         extensions: {'page': page},
       ),
