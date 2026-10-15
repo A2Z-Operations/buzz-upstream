@@ -114,7 +114,9 @@ pub fn validate_jwks_uri(uri: &str) -> Result<(), JwksFetchError> {
 /// All fields are validated at construction — an invalid value is caught at
 /// configuration time, not at first token verification. The mesh constructor
 /// is an operator assertion: this process cannot prove that mutual TLS peer
-/// authentication and integrity protection are enabled.
+/// authentication and integrity protection are enabled. See the
+/// [NIP-FI JWKS snapshot contract](../../../../../docs/nips/NIP-FI.md#jwks-snapshot)
+/// for the exact mesh address allow-list and operator requirements.
 ///
 /// ## Why these fields are contract, not mutable state
 ///
@@ -179,13 +181,10 @@ impl JwksSourceContract {
     ///
     /// The URI must use HTTP and a DNS hostname rather than an IP literal. It
     /// must have no userinfo (including an empty userinfo marker), query,
-    /// fragment, or backslash. Every resolved IPv4 address must be in RFC 1918
-    /// (`10/8`, `172.16/12`, or `192.168/16`), CGNAT (`100.64/10`), reserved
-    /// `240/4` except `255.255.255.255`, or loopback `127/8`. Every resolved
-    /// IPv6 address must be ULA (`fc00::/7`) or `::1`. IPv4-mapped,
-    /// IPv4-compatible, NAT64, 6to4, and SIIT IPv4-translated IPv6 addresses
-    /// are rejected. Every DNS answer is checked before the first allowed
-    /// address is pinned.
+    /// fragment, or backslash. Every DNS answer is checked before the first
+    /// allowed address is pinned; empty or mixed answers fail closed. See the
+    /// [NIP-FI JWKS snapshot contract](../../../../../docs/nips/NIP-FI.md#jwks-snapshot)
+    /// for the exact address allow-list and operator requirements.
     ///
     /// Selecting this mode is an operator assertion that the deployment
     /// authenticates and protects the HTTP transport. The relay cannot verify
@@ -546,11 +545,13 @@ pub trait JwksFetcher: super::verifier::sealed::Sealed + Send + Sync + 'static {
     /// policy; it does not infer mesh permission from a URI. The production
     /// HTTP fetcher overrides this method to honor the transport sealed into
     /// the contract. Raw calls always use public HTTPS. An override MUST select
-    /// URI and address checks only from that sealed mode, resolve once and pin
-    /// one checked address, deny redirects, disable proxies, bound the whole
+    /// URI and address validation only from that sealed mode, resolve once and
+    /// pin one checked address, deny redirects and proxies, bound the complete
     /// fetch with a finite deadline, stream at most
     /// [`MAX_JWKS_RESPONSE_BYTES`], reject non-2xx responses, and never fall
-    /// back to another transport or network path.
+    /// back to another transport or network path. The exact mesh address
+    /// allow-list is defined in the
+    /// [NIP-FI JWKS snapshot contract](../../../../../docs/nips/NIP-FI.md#jwks-snapshot).
     fn fetch_for_contract<'a>(
         &'a self,
         contract: &'a JwksSourceContract,
@@ -563,14 +564,12 @@ pub trait JwksFetcher: super::verifier::sealed::Sealed + Send + Sync + 'static {
 /// fetch builds a dedicated pinned client, with no shared connection state.
 ///
 /// Per-fetch boundary enforcement:
-/// - public HTTPS rejects any address denied by the shared public-address
-///   predicate; mesh HTTP permits only IPv4 RFC 1918 (`10/8`, `172.16/12`,
-///   `192.168/16`), CGNAT (`100.64/10`), reserved `240/4` except
-///   `255.255.255.255`, and loopback `127/8`, plus IPv6 ULA (`fc00::/7`) and
-///   `::1`. IPv4-mapped, IPv4-compatible, NAT64, 6to4, and SIIT-translated
-///   IPv6 addresses are rejected;
+/// - public HTTPS retains its strict address deny-list; explicit mesh HTTP
+///   checks addresses against the allow-list in the
+///   [NIP-FI JWKS snapshot contract](../../../../../docs/nips/NIP-FI.md#jwks-snapshot);
 /// - every DNS answer is validated, then the first permitted address is pinned
-///   to prevent DNS rebinding TOCTOU (the OS resolver is called once per fetch);
+///   to prevent DNS rebinding TOCTOU (empty or mixed answers fail closed; the
+///   OS resolver is called once per fetch);
 /// - the client disables proxies and never follows redirects;
 /// - the complete operation (resolution, connect, headers, body streaming) is
 ///   bounded by [`JWKS_REQUEST_TIMEOUT_SECS`] via `tokio::time::timeout`;
@@ -691,10 +690,7 @@ async fn fetch_jwks_inner_with_transport(
 
     // Resolve and check every IP before sending. Pins DNS to the validated
     // address to prevent rebinding TOCTOU between check and connect.
-    let safe_ip = match transport {
-        JwksTransport::PublicHttps => resolve_and_check_ssrf(&host, port).await?,
-        JwksTransport::Mesh => resolve_for_transport(&host, port, transport).await?,
-    };
+    let safe_ip = resolve_for_transport(&host, port, transport).await?;
 
     // Build a per-request client that:
     // - denies redirects (a 3xx to an internal host bypasses the URI check);

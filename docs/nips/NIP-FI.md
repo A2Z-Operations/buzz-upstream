@@ -207,25 +207,28 @@ regardless of issuer policy.
 
 Each issuer policy configures:
 
-- `jwks_uri`: the URI selecting the authenticated key source. By default it is
-  HTTPS and SSRF-protected at URI validation and DNS-resolution time; no
-  credentials, fragments, or private-IP endpoints are accepted.
+- `jwks_uri`: selects the authenticated key source. With the default
+  `public_https` transport, it MUST use HTTPS and contain no credentials or
+  fragment. DNS address checks and pinning are specified under
+  [Security considerations](#security-considerations).
 - `jwks_transport`: optional per-issuer transport, defaulting to
   `public_https`. The explicit value `mesh` permits an HTTP URI only when it
   uses a DNS hostname rather than an IP literal and has no userinfo, query,
-  fragment, or backslash. Every DNS answer MUST be in this allow-list: IPv4
-  RFC 1918 (`10/8`, `172.16/12`, or
-  `192.168/16`), CGNAT (`100.64/10`), reserved `240/4` except
-  `255.255.255.255`, or loopback `127/8`; IPv6 ULA (`fc00::/7`) or `::1`.
-  IPv4-mapped, IPv4-compatible, NAT64, 6to4, and SIIT IPv4-translated IPv6
-  addresses are rejected. The relay resolves the hostname once, checks every
-  answer, and pins the first allowed
-  address. An empty answer or any disallowed answer denies the fetch. This
-  transport does not authenticate itself: selecting it is an operator assertion
-  that the deployment enforces mutual TLS peer authentication and integrity
-  protection, endpoint authorization, and egress restrictions. The relay cannot
-  verify those properties. Unauthenticated HTTP permits JWKS key substitution
-  and issuer impersonation. There is no public-network fallback.
+  fragment, or backslash. The only accepted IPv4 ranges are RFC 1918 (`10/8`,
+  `172.16/12`, and `192.168/16`), CGNAT (`100.64/10`), reserved `240/4` except
+  `255.255.255.255`, and loopback `127/8`. The only accepted IPv6 ranges or
+  addresses are ULA (`fc00::/7`) and `::1`. Every other IPv4 or IPv6 class is
+  rejected. IPv4-mapped, IPv4-compatible, NAT64, 6to4, and SIIT-translated
+  IPv6 addresses are also rejected; embedded IPv4 does not inherit eligibility.
+  Every DNS answer is checked and the first allowed address is pinned. Empty or
+  mixed answers deny the fetch. Loopback is accepted for isolated local use;
+  in production it can reach services on the relay host, so operators MUST
+  constrain endpoint selection and egress accordingly. Mesh transport does not
+  authenticate itself: selecting it is an operator assertion that the
+  deployment enforces mutual TLS peer authentication and integrity protection,
+  endpoint authorization, and egress restrictions. The relay cannot verify
+  those properties. Unauthenticated HTTP permits JWKS key substitution and
+  issuer impersonation. There is no public-network fallback.
 - `refresh_interval_seconds`: positive, ≤ 1 year, strictly less than
   `key_snapshot_hard_deadline_seconds`.
 - `key_snapshot_hard_deadline_seconds`: the outer time bound after which no
@@ -946,22 +949,15 @@ gap by requiring assertion verification on every protected HTTP request.
 The per-request re-verification model means there is no cached admission
 window; a deny-set entry takes effect on the very next request.
 
-**SSRF and JWKS transport.** `public_https` MUST use HTTPS, reject every
-resolved address denied by the shared public-address predicate, pin the first
-permitted result, and deny redirects. The explicit per-issuer `mesh` transport
-permits HTTP only for a DNS hostname and MUST accept only IPv4 RFC 1918
-(`10/8`, `172.16/12`, or `192.168/16`), CGNAT (`100.64/10`), reserved `240/4`
-except `255.255.255.255`, or loopback `127/8`; IPv6 ULA (`fc00::/7`) or `::1`
-are also permitted. IPv4-mapped, IPv4-compatible, NAT64, 6to4, and SIIT
-IPv4-translated IPv6 addresses are outside the mesh allow-list. Every DNS
-answer is checked before the first permitted address is pinned; empty or mixed answers deny.
-Both modes resolve once, disable proxies,
-deny redirects, enforce a finite whole-fetch deadline, cap streaming at
-512 KiB, reject non-2xx responses, and have no fallback network path. Mesh
-selection is an operator assertion, not a property the Rust relay verifies.
-Operators MUST enforce mutual TLS peer authentication and integrity protection,
-authorize the JWKS endpoint, and restrict egress. Unauthenticated HTTP permits
-key substitution and issuer impersonation.
+**JWKS SSRF.** `public_https` MUST validate an HTTPS URI, reject every
+resolved address on its IP deny-list, pin the checked address to prevent DNS
+rebinding, and deny redirects. The IP deny-list covers the complete IANA
+Special-Purpose address registry. The `mesh` address allow-list and operator
+security boundary are defined in the [JWKS snapshot contract](#jwks-snapshot).
+Both modes MUST resolve once, validate every answer before pinning the first
+permitted address, disable proxies, deny redirects, enforce a 10-second
+whole-fetch deadline, cap the streamed response at 512 KiB, reject non-2xx
+responses, and provide no fallback network path.
 
 **Issuer compromise.** A compromised assertion issuer can impersonate any
 identity but cannot prove possession of the assertion-named Nostr key.  The NIP-42

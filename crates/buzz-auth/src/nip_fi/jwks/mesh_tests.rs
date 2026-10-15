@@ -441,7 +441,7 @@ async fn production_mesh_fetcher_denies_redirects_and_non_success_statuses() {
     assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn production_fetch_wrapper_deadline_covers_waiting_for_response() {
     use std::time::Duration;
 
@@ -461,7 +461,11 @@ async fn production_fetch_wrapper_deadline_covers_waiting_for_response() {
         .expect("fetcher should send request headers before waiting for response");
     assert!(request.starts_with("GET /jwks.json HTTP/1.1\r\n"));
 
+    // Establish real socket readiness before freezing Tokio time. Starting
+    // paused lets timer auto-advance race the OS accept/read readiness.
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(JWKS_REQUEST_TIMEOUT_SECS)).await;
+    tokio::time::resume();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), fetch)
             .await
@@ -469,6 +473,9 @@ async fn production_fetch_wrapper_deadline_covers_waiting_for_response() {
             .expect("fetch task"),
         Err(JwksFetchError::NetworkError)
     );
+    // Keep the peer open until the bounded assertion above. Without the
+    // production deadline the fetch remains stalled instead of seeing EOF.
+    drop(stream);
 }
 
 #[tokio::test]

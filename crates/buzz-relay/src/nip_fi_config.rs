@@ -71,15 +71,15 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 /// ```
 /// `jwks_transport` is optional and defaults to `public_https`. The `mesh`
 /// form requires an HTTP URI with a DNS hostname (not an IP literal) and no
-/// userinfo, query, fragment, or backslash. Every DNS answer must be IPv4 RFC
-/// 1918 (`10/8`, `172.16/12`, or `192.168/16`), CGNAT (`100.64/10`), reserved
-/// `240/4` except `255.255.255.255`, or loopback `127/8`; or IPv6 ULA
-/// (`fc00::/7`) or `::1`. IPv4-mapped, IPv4-compatible, NAT64, 6to4, and SIIT
-/// IPv4-translated IPv6 addresses are rejected. Selecting
-/// `mesh` is an operator assertion: the deployment must enforce mutual TLS
-/// peer authentication and integrity protection, authorize the JWKS endpoint,
-/// and restrict egress. The relay cannot verify those properties, and
-/// unauthenticated HTTP permits key substitution and issuer impersonation.
+/// userinfo, query, fragment, or backslash. Every DNS answer is checked
+/// against the positive address allow-list in the
+/// [NIP-FI JWKS snapshot contract](../../../docs/nips/NIP-FI.md#jwks-snapshot);
+/// empty or mixed answers deny, and the first checked address is pinned.
+/// Selecting `mesh` is an operator assertion: the deployment must enforce
+/// mutual TLS peer authentication and integrity protection, authorize the
+/// JWKS endpoint, and restrict egress. The relay cannot verify those
+/// properties, and unauthenticated HTTP permits key substitution and issuer
+/// impersonation.
 ///
 /// For example:
 /// ```json
@@ -109,7 +109,8 @@ pub(super) struct IssuerEnvConfig {
     /// `iat + maximum_assertion_age` residual bound in seconds.
     pub maximum_assertion_age_seconds: u64,
     /// JWK Set endpoint for this issuer; HTTPS by default, or HTTP with the
-    /// explicitly selected mesh transport and its address allow-list.
+    /// explicitly selected mesh transport and its
+    /// [NIP-FI address allow-list](../../../docs/nips/NIP-FI.md#jwks-snapshot).
     pub jwks_uri: String,
     /// Per-issuer JWKS transport. Unknown values are rejected during parsing.
     #[serde(default)]
