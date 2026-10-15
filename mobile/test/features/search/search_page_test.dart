@@ -63,7 +63,12 @@ void main() {
         expect(tester.getRect(close).left, greaterThan(fieldRect.right));
         expect(tester.getSize(close), const Size(48, 48));
         for (final label in ['All', 'Messages', 'Channels', 'People']) {
-          expect(find.text(label).hitTestable(), findsOneWidget);
+          expect(
+            platform == TargetPlatform.iOS
+                ? find.byTooltip(label)
+                : find.text(label).hitTestable(),
+            findsOneWidget,
+          );
         }
         final input = tester.element(find.byType(TextField));
         await tester.tap(find.byType(TextField));
@@ -76,7 +81,19 @@ void main() {
           isTrue,
         );
         await tester.enterText(find.byType(TextField), 'design');
-        await tester.tap(find.text('Channels'));
+        if (platform == TargetPlatform.iOS) {
+          tester
+              .widget<IosGlassNavigationButton>(
+                find.byWidgetPredicate(
+                  (widget) =>
+                      widget is IosGlassNavigationButton &&
+                      widget.label == 'Channels',
+                ),
+              )
+              .onPressed!();
+        } else {
+          await tester.tap(find.text('Channels'));
+        }
         await tester.pumpAndSettle();
         expect(tester.getRect(field), fieldRect);
         expect(tester.getRect(filters), filtersRect);
@@ -90,7 +107,7 @@ void main() {
         );
         expect(
           find.byType(IosGlassNavigationButton),
-          platform == TargetPlatform.iOS ? findsOneWidget : findsNothing,
+          platform == TargetPlatform.iOS ? findsNWidgets(5) : findsNothing,
         );
         expect(tester.takeException(), isNull);
         await tester.pumpWidget(const SizedBox.shrink());

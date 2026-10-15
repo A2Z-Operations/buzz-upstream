@@ -86,7 +86,13 @@ class SearchPage extends HookConsumerWidget {
     final searchPrimaryColor = navigationPrimaryForeground(context);
     final searchPlaceholderColor = navigationSecondaryForeground(context);
     final fieldHeight = _idleSearchFieldHeight(context);
-    final filtersHeight = _searchHeaderFiltersHeight(context);
+    final filtersHeight = nativeIos
+        ? (MediaQuery.textScalerOf(context).scale(16) * 1.4 + 16).clamp(
+                48.0,
+                double.infinity,
+              ) +
+              Grid.xxs * 2
+        : _searchHeaderFiltersHeight(context);
 
     void activateSearch() => focusNode.requestFocus();
 
@@ -208,6 +214,7 @@ class SearchPage extends HookConsumerWidget {
               key: const ValueKey('search-header-filters'),
               height: filtersHeight,
               child: FilterChipBar<_SearchFilter>(
+                useNativeGlass: nativeIos,
                 expandItems: true,
                 visualDensity: const VisualDensity(horizontal: -2),
                 chipVerticalPadding: _searchFilterChipVerticalPadding,

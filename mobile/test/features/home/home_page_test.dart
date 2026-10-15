@@ -148,10 +148,10 @@ void main() {
     final searchRoute = ModalRoute.of(tester.element(find.byType(SearchPage)))!;
     expect(searchRoute.allowSnapshotting, isFalse);
     expect(searchRoute.opaque, isTrue);
-    expect(searchRoute.transitionDuration, const Duration(milliseconds: 260));
+    expect(searchRoute.transitionDuration, const Duration(milliseconds: 500));
     expect(
       searchRoute.reverseTransitionDuration,
-      const Duration(milliseconds: 220),
+      const Duration(milliseconds: 500),
     );
     Navigator.of(tester.element(find.byType(SearchPage))).pop();
     await tester.pumpAndSettle();
