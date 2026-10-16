@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -228,6 +228,8 @@ pub enum LoadFailure {
     Timeout,
     /// Its read started before the published one's (defensive).
     Superseded,
+    /// An earlier attempt's map build is still running; no new load starts.
+    BuildOutstanding,
 }
 
 impl LoadFailure {
@@ -237,6 +239,7 @@ impl LoadFailure {
             Self::OverCap => "over_cap",
             Self::Timeout => "timeout",
             Self::Superseded => "superseded",
+            Self::BuildOutstanding => "build_outstanding",
         }
     }
 }
@@ -255,8 +258,11 @@ pub struct DatabaseResolver {
     pending: Mutex<HashMap<String, PendingLookup>>,
     waiters: AtomicUsize,
     permits: Arc<Semaphore>,
+    /// Set while an attempt (its load or its map build) is alive. A build
+    /// abandoned by a timeout keeps it set until the builder thread returns.
+    building: Arc<AtomicBool>,
     #[cfg(test)]
-    pub(crate) hooks: hooks::Hooks,
+    pub(crate) hooks: Arc<hooks::Hooks>,
 }
 
 impl DatabaseResolver {
@@ -301,8 +307,9 @@ impl DatabaseResolver {
             sequence: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             waiters: AtomicUsize::new(0),
+            building: Arc::default(),
             #[cfg(test)]
-            hooks: hooks::Hooks::default(),
+            hooks: Arc::default(),
         }
     }
 
@@ -394,6 +401,13 @@ impl DatabaseResolver {
         let deadline = started + self.bounds.refresh_timeout;
         let started_wall = std::time::SystemTime::now();
         let timer = std::time::Instant::now();
+        // Held by the attempt, then by its builder thread: dropping the
+        // attempt on timeout cannot release it while the build still runs.
+        let Some(slot) = BuildSlot::claim(&self.building) else {
+            metrics::counter!("buzz_nip_fi_snapshot_load_failures_total", "reason" => LoadFailure::BuildOutstanding.label())
+                .increment(1);
+            return Err(LoadFailure::BuildOutstanding);
+        };
         let attempt = async {
             let after_snapshot: BoxFuture<'_, ()> = {
                 #[cfg(test)]
@@ -418,9 +432,25 @@ impl DatabaseResolver {
             let rows = load.rows.len();
             // Up to the row cap of grouping and binding construction: run it
             // off the runtime worker.
-            let map = tokio::task::spawn_blocking(move || build_map(load.rows))
-                .await
-                .map_err(|e| LoadFailure::Store(format!("map build failed: {e}")))?;
+            // Set when this attempt is dropped (timeout or cancel); the
+            // builder checks it, and the deadline, as it goes.
+            let abandoned = Abandoned::default();
+            let stop = {
+                let flag = Arc::clone(&abandoned.0);
+                let clock = Arc::clone(&self.clock);
+                move || flag.load(Ordering::Acquire) || clock.now() >= deadline
+            };
+            #[cfg(test)]
+            let test_hooks = Arc::clone(&self.hooks);
+            let map = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                #[cfg(test)]
+                test_hooks.hit_sync(hooks::BUILD_START);
+                build_map(load.rows, stop)
+            })
+            .await
+            .map_err(|e| LoadFailure::Store(format!("map build failed: {e}")))?
+            .ok_or(LoadFailure::Timeout)?;
             #[cfg(test)]
             self.hooks.hit(hooks::REFRESH_BEFORE_PUBLISH).await;
             self.publish(map, load.snapshot, started, deadline)?;
@@ -739,18 +769,61 @@ fn binding_for(host: &str, issuers: Vec<String>) -> Option<Arc<CommunityBinding>
         .map(Arc::new)
 }
 
-fn build_map(rows: Vec<(String, String)>) -> HashMap<String, Arc<CommunityBinding>> {
+/// Group rows into bindings, or `None` as soon as `stop` reports the
+/// attempt abandoned or expired; checked in both passes.
+fn build_map(
+    rows: Vec<(String, String)>,
+    stop: impl Fn() -> bool,
+) -> Option<HashMap<String, Arc<CommunityBinding>>> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (host, issuer) in rows {
+        if stop() {
+            return None;
+        }
         grouped
             .entry(normalize_host(&host))
             .or_default()
             .push(issuer);
     }
-    grouped
-        .into_iter()
-        .filter_map(|(host, issuers)| binding_for(&host, issuers).map(|binding| (host, binding)))
-        .collect()
+    let mut map = HashMap::with_capacity(grouped.len());
+    for (host, issuers) in grouped {
+        if stop() {
+            return None;
+        }
+        if let Some(binding) = binding_for(&host, issuers) {
+            map.insert(host, binding);
+        }
+    }
+    Some(map)
+}
+
+/// The resolver's single in-flight attempt; released on drop, wherever the
+/// owner (the attempt or its builder thread) ends, including a panic.
+struct BuildSlot(Arc<AtomicBool>);
+
+impl BuildSlot {
+    fn claim(building: &Arc<AtomicBool>) -> Option<Self> {
+        building
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(building)))
+    }
+}
+
+impl Drop for BuildSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Raised when the awaiting attempt is dropped, telling its builder to stop.
+#[derive(Default)]
+struct Abandoned(Arc<AtomicBool>);
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -767,6 +840,8 @@ pub(crate) mod hooks {
     pub(crate) const CREATION_BEFORE_OVERLAY: &str = "creation.before_overlay";
     /// Synchronous, under the publication lock: see [`Hooks::on_sync`].
     pub(crate) const PUBLISH_BEFORE_WRITE: &str = "publish.before_write";
+    /// Synchronous, on the builder thread before the map build.
+    pub(crate) const BUILD_START: &str = "build.start";
 
     /// An armed pause: production signals `reached`, then waits for `release`.
     pub(crate) struct Gate {

@@ -13,8 +13,8 @@ use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::StreamExt;
 
 use super::hooks::{
-    CREATION_BEFORE_OVERLAY, MISS_AFTER_READ, PUBLISH_BEFORE_WRITE, REFRESH_AFTER_SNAPSHOT,
-    REFRESH_BEFORE_PUBLISH,
+    BUILD_START, CREATION_BEFORE_OVERLAY, MISS_AFTER_READ, PUBLISH_BEFORE_WRITE,
+    REFRESH_AFTER_SNAPSHOT, REFRESH_BEFORE_PUBLISH,
 };
 use super::*;
 
@@ -366,6 +366,95 @@ async fn refresh_crossing_its_deadline_while_preparing_publishes_nothing() {
     assert_eq!(f.store.lookups_for("a"), 0);
     f.clock.set(secs(120.0));
     assert_eq!(f.resolve("a").await, UNAVAILABLE, "old deadline retained");
+}
+
+// A map build abandoned by a timeout keeps running on its blocking thread;
+// until it returns, no new load starts, so at most one cap-sized build is
+// ever outstanding. Once released it stops cooperatively, publishes nothing,
+// and the next tick loads normally. Mutation: releasing the slot with the
+// attempt (or not holding one) starts a second build while the first lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_build_blocks_new_loads_until_it_returns_and_publishes_nothing() {
+    let f = fixture_with(
+        &["a"],
+        ResolverBounds {
+            refresh_timeout: Duration::from_millis(50),
+            ..ResolverBounds::default()
+        },
+    );
+    f.resolver.refresh().await.unwrap();
+    f.store.remove("a");
+    f.store.add("b");
+
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    f.resolver.hooks.on_sync(BUILD_START, {
+        let (outstanding, peak, started, release) = (
+            Arc::clone(&outstanding),
+            Arc::clone(&peak),
+            Arc::clone(&started),
+            Arc::clone(&release),
+        );
+        move || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let now = outstanding.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            let (open, signal) = &*release;
+            // Bounded, so a regression fails the test instead of hanging it.
+            let _ = signal
+                .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+                .unwrap();
+            outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
+    });
+
+    assert_eq!(f.resolver.refresh().await, Err(LoadFailure::Timeout));
+    let loads = f.store.loads.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        assert_eq!(
+            f.resolver.refresh().await,
+            Err(LoadFailure::BuildOutstanding)
+        );
+    }
+    assert_eq!(f.store.loads.load(Ordering::SeqCst), loads, "no new load");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+
+    let (open, signal) = &*release;
+    *open.lock().unwrap() = true;
+    signal.notify_all();
+    for _ in 0..200 {
+        if !f.resolver.building.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !f.resolver.building.load(Ordering::SeqCst),
+        "build released"
+    );
+    assert_eq!(f.resolve("a").await, Ok(()), "nothing published late");
+    assert_eq!(f.store.lookups_for("a"), 0);
+
+    f.resolver.refresh().await.unwrap();
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "one build at a time");
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(f.resolve("b").await, Ok(()));
+    assert_eq!(f.store.lookups_for("b"), 0, "new snapshot published");
+}
+
+#[test]
+fn build_map_stops_in_either_pass_once_told_to() {
+    let rows = vec![(host("a"), ISS.to_owned()), (host("b"), ISS.to_owned())];
+    assert!(build_map(rows.clone(), || true).is_none(), "grouping pass");
+    let checks = AtomicUsize::new(0);
+    let stop_in_second_pass = || checks.fetch_add(1, Ordering::SeqCst) >= rows.len();
+    assert!(
+        build_map(rows.clone(), stop_in_second_pass).is_none(),
+        "binding pass"
+    );
+    assert_eq!(build_map(rows, || false).map(|m| m.len()), Some(2));
 }
 
 // Criterion 17(a)(2): a miss lookup streaming N + 1 issuers (N = the registry

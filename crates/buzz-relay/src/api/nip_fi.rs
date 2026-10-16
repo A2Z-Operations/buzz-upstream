@@ -3632,7 +3632,9 @@ mod route_integration_tests {
         /// Run `state`'s production disconnect subscriber and apply what it
         /// hears through the production consumer, like `main.rs`.  Yields
         /// the target of each applied message.
-        fn listen(state: &Arc<AppState>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        pub(super) fn listen(
+            state: &Arc<AppState>,
+        ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
             let mut rx = state.pubsub.subscribe_nip_fi_disconnect();
             let channels = disconnect_subscribe_channels(state.config.nip_fi.mode);
             tokio::spawn(Arc::clone(&state.pubsub).run_nip_fi_disconnect_subscriber(channels));
@@ -3650,7 +3652,7 @@ mod route_integration_tests {
         /// Return once a probe that `prober` publishes has been applied via
         /// `seen`: the subscription is live, and anything published earlier
         /// on the probe's channel has been applied.
-        async fn await_probe(
+        pub(super) async fn await_probe(
             seen: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
             prober: &Arc<AppState>,
         ) {
@@ -3670,7 +3672,7 @@ mod route_integration_tests {
         }
 
         /// Return once `seen` has applied a message for `key`.
-        async fn await_target(
+        pub(super) async fn await_target(
             seen: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
             key: &nostr::PublicKey,
         ) {
@@ -3739,246 +3741,6 @@ mod route_integration_tests {
             target_on_shadow.assert_open("shadow pod, enforce command");
         }
 
-        /// Two enforce pods on one Redis, each running the production
-        /// subscriber, with both subscriptions confirmed live. Each also
-        /// admits login assertions from the test issuer at any Host.
-        async fn enforce_pair(
-        ) -> [(Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>); 2] {
-            let mut pods = Vec::new();
-            for _ in 0..2 {
-                let mut state = (*pod_in(NipFiMode::Enforce).await).clone();
-                Arc::make_mut(&mut state.config).nip_fi.communities =
-                    crate::nip_fi_core::test_support::any_host(TEST_AUD);
-                let key_source = Arc::new(
-                    ProductionJwksSource::new(
-                        vec![test_jwks_config()],
-                        buzz_auth::HttpJwksFetcher::new(),
-                    )
-                    .expect("key source"),
-                );
-                key_source
-                    .seed_snapshot_for_test(TEST_ISS, test_jwks())
-                    .await;
-                state.nip_fi_verifier = Some(Arc::new(buzz_auth::FederatedAssertionVerifier::new(
-                    state.config.nip_fi.registry.clone(),
-                    key_source,
-                )));
-                let pod = Arc::new(state);
-                let seen = listen(&pod);
-                pods.push((pod, seen));
-            }
-            for (pod, seen) in &mut pods {
-                await_probe(seen, pod).await;
-            }
-            pods.try_into().unwrap_or_else(|_| unreachable!())
-        }
-
-        /// A login assertion for `key`, minted once and replayed as the same
-        /// bytes: the retained pre-revocation assertion of criterion 10.
-        fn retained_assertion(key: &nostr::Keys) -> String {
-            use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-            let now = chrono::Utc::now().timestamp();
-            let claims = serde_json::json!({
-                "iss": TEST_ISS, "aud": TEST_AUD, "sub": "restart-test",
-                "iat": now, "exp": now + 600, "nostr_pubkey": key.public_key().to_hex(),
-            });
-            let mut header = Header::new(Algorithm::ES256);
-            header.typ = Some("nip-fi+jwt".to_owned());
-            header.kid = Some(TEST_KID.to_owned());
-            let signing = EncodingKey::from_ec_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap();
-            encode(&header, &claims, &signing).unwrap()
-        }
-
-        /// Whether `token` (a retained assertion for `key`) is denied at
-        /// `host` on `pod` at each admission site, each with a fresh proof of
-        /// possession of `key`:
-        /// - root: the WebSocket upgrade. A deny is the 403 deny body at
-        ///   upgrade, before any session. An upgrade that clears NIP-FI ends
-        ///   at tenant binding with 404 (this host has no community), so it
-        ///   counts as "not denied by NIP-FI", not as a completed session.
-        /// - audio: a completed NIP-42 session, denied or passed at its
-        ///   post-authentication deny-set check.
-        /// - HTTP: protected-route admission with a NIP-98 proof.
-        #[allow(clippy::result_large_err)] // the NIP-98 closure returns the production `Response` error type
-        async fn denied_at_every_site(
-            pod: &Arc<AppState>,
-            key: &nostr::Keys,
-            host: &str,
-            token: &str,
-        ) -> [bool; 3] {
-            let root_denied = |status: StatusCode, body: &[u8]| match status {
-                StatusCode::FORBIDDEN => {
-                    assert_eq!(body, b"authorization denied\n", "root deny body");
-                    true
-                }
-                StatusCode::NOT_FOUND => false,
-                other => panic!(
-                    "unexpected root upgrade outcome {other}: {}",
-                    String::from_utf8_lossy(body)
-                ),
-            };
-
-            let request = Request::get("/")
-                .header(axum::http::header::HOST, host)
-                .header("Upgrade", "websocket")
-                .header("Connection", "Upgrade")
-                .header("Sec-WebSocket-Version", "13")
-                .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-                .header("Nostr-Federated-Identity", format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap();
-            let resp = crate::router::build_router(Arc::clone(pod))
-                .oneshot(request)
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let root = root_denied(status, &body);
-
-            let binding = pod.config.nip_fi.communities.resolve(host).expect("served");
-            let assertion = pod
-                .nip_fi_verifier
-                .as_deref()
-                .expect("verifier")
-                .verify_assertion(token, binding)
-                .expect("the retained assertion is still valid");
-            let audio = crate::audio::handler::test_support::deny_set_refuses(
-                Arc::clone(pod),
-                assertion,
-                key,
-            )
-            .await;
-
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(axum::http::header::HOST, host.parse().unwrap());
-            headers.insert(
-                "Nostr-Federated-Identity",
-                format!("Bearer {token}").parse().unwrap(),
-            );
-            let proven = key.public_key();
-            let http = match crate::nip_fi_http::admit_nip_fi_http_on_state(pod, &headers, || {
-                Ok(crate::nip_fi_http::Nip98Proof::new(proven, ()))
-            })
-            .await
-            {
-                Ok(_) => false,
-                Err(resp) => {
-                    let status = resp.status();
-                    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-                    assert_eq!(
-                        (status, &body[..]),
-                        (StatusCode::FORBIDDEN, &b"authorization denied\n"[..]),
-                        "HTTP denial is the deny body"
-                    );
-                    true
-                }
-            };
-            [root, audio, http]
-        }
-
-        /// A key with its retained assertion for each of the two communities.
-        struct Retained {
-            keys: nostr::Keys,
-            assertions: [(String, String); 2],
-        }
-
-        impl Retained {
-            fn mint(hosts: &[String; 2]) -> Self {
-                let keys = nostr::Keys::generate();
-                let assertions = hosts.clone().map(|host| {
-                    let token = retained_assertion(&keys);
-                    (host, token)
-                });
-                Self { keys, assertions }
-            }
-        }
-
-        /// Asserts K's retained assertions are denied on every pod, community
-        /// and site exactly when `key_denied`, and the control key's never.
-        async fn check(
-            pods: [&Arc<AppState>; 2],
-            [key, control]: [&Retained; 2],
-            key_denied: bool,
-            phase: &str,
-        ) {
-            for (n, pod) in pods.into_iter().enumerate() {
-                let pod_name = n + 1;
-                for (who, retained, expected) in
-                    [("K", key, key_denied), ("control", control, false)]
-                {
-                    for (host, token) in &retained.assertions {
-                        assert_eq!(
-                            denied_at_every_site(pod, &retained.keys, host, token).await,
-                            [expected; 3],
-                            "{phase}: {who} at {host} on P{pod_name} [root, audio, HTTP]"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Plan criterion 10: restart recovery across pods. Assertions for K
-        // and a control key in two fixed communities are minted before the
-        // revocation and replayed as the same bytes in every phase. A
-        // disconnect sent to P1 denies K's retained assertions on P1 *and*
-        // P2 at every site (P1's reply alone proves only P1). Restarting both
-        // pods empties their deny maps, so the retained assertions are
-        // accepted again until the issuer re-sends; that is the exposure
-        // window, recorded from restart to restored denial. Once one pod
-        // accepts the re-send (fresh `jti`, same `until`), every pod denies
-        // K again. The control key is never denied.
-        #[tokio::test]
-        #[ignore = "requires Redis"]
-        async fn re_sent_disconnect_restores_the_deny_on_every_pod_after_restart() {
-            let tag = uuid::Uuid::new_v4().simple().to_string();
-            let hosts = [
-                format!("restart-a-{tag}.example"),
-                format!("restart-b-{tag}.example"),
-            ];
-            let key_retained = Retained::mint(&hosts);
-            let control = Retained::mint(&hosts);
-            let both = [&key_retained, &control];
-            let key = key_retained.keys.public_key();
-            let until = chrono::Utc::now().timestamp() + 300;
-            let send = |pod: Arc<AppState>| async move {
-                let token = mint_token(&key.to_hex(), 0, serde_json::json!({ "until": until }));
-                let (status, body) = post_command(&pod, &token, &key.to_hex()).await;
-                assert_eq!(status, StatusCode::OK);
-                assert_eq!(&body[..], br#"{"disconnected": true}"#);
-                drain_publishes(&pod).await;
-            };
-            let [(p1, _), (p2, mut p2_seen)] = enforce_pair().await;
-            check([&p1, &p2], both, false, "before the disconnect").await;
-            send(Arc::clone(&p1)).await;
-            await_target(&mut p2_seen, &key).await;
-            check([&p1, &p2], both, true, "after the disconnect").await;
-
-            // Restart: fresh pods, empty deny maps.
-            let [(p1, mut p1_seen), (p2, mut p2_seen)] = enforce_pair().await;
-            let restarted = std::time::Instant::now();
-            let (first_host, first_token) = &key_retained.assertions[0];
-            assert_eq!(
-                denied_at_every_site(&p1, &key_retained.keys, first_host, first_token).await,
-                [false; 3],
-                "restarted: K's retained assertion is admitted on P1"
-            );
-            let first_admitted = restarted.elapsed();
-            check([&p1, &p2], both, false, "restarted, before the re-send").await;
-
-            send(Arc::clone(&p2)).await;
-            await_target(&mut p1_seen, &key).await;
-            await_target(&mut p2_seen, &key).await;
-            check([&p1, &p2], both, true, "after the re-send").await;
-            let restored = restarted.elapsed();
-            eprintln!(
-                "criterion 10 exposure: first retained admission {first_admitted:?} after \
-                 restart; denial restored on every pod {restored:?} after restart"
-            );
-            assert!(first_admitted < restored);
-        }
-
         // Pins finding 1 (replay half): shadow and enforce share one Redis
         // but claim under disjoint prefixes, so a shadow accept leaves the
         // command usable by enforce, while shadow still rejects its own
@@ -4028,6 +3790,486 @@ mod route_integration_tests {
         #[ignore = "requires Redis"]
         async fn redis_deny_set_full_leaves_shared_claim_retryable() {
             deny_set_full_leaves_command_retryable(redis_guard()).await;
+        }
+    }
+
+    /// Plan criterion 10 over real infrastructure: PostgreSQL holds the two
+    /// communities, Redis carries the disconnect between pods, and every
+    /// admission runs the production path end to end.
+    mod postgres_tests {
+        use super::external_infra_redis::{await_probe, await_target, listen};
+        use super::*;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message};
+
+        const DENY_BODY: &[u8] = b"authorization denied\n";
+
+        fn redis_url() -> String {
+            std::env::var("BUZZ_TEST_REDIS_URL")
+                .or_else(|_| std::env::var("REDIS_URL"))
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+        }
+
+        /// An enforce pod serving `hosts` as two exact communities over the
+        /// shared PostgreSQL and Redis, listening on a real socket and
+        /// running the production disconnect subscriber.
+        struct Pod {
+            state: Arc<AppState>,
+            addr: std::net::SocketAddr,
+            seen: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for Pod {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn pod(hosts: &[String; 2]) -> Pod {
+            let mut config = crate::config::Config::for_test();
+            config.database_url = crate::test_support::database_url();
+            config.redis_url = redis_url();
+            config.require_relay_membership = false;
+            config.nip_fi.mode = NipFiMode::Enforce;
+            config.nip_fi.registry.insert(test_issuer_policy());
+            let uris = hosts.clone().map(|host| format!("https://{host}"));
+            config.nip_fi.communities = crate::nip_fi_config::NipFiCommunities::for_test_many(
+                &[&uris[0], &uris[1]],
+                &[TEST_ISS],
+            );
+            let mut state = build_test_app_state(1000, config).await;
+            state.nip_fi_command_replay =
+                command_replay_guard(state.redis_pool.clone(), state.config.nip_fi.mode);
+            let key_source = Arc::new(
+                ProductionJwksSource::new(
+                    vec![test_jwks_config()],
+                    buzz_auth::HttpJwksFetcher::new(),
+                )
+                .expect("key source"),
+            );
+            key_source
+                .seed_snapshot_for_test(TEST_ISS, test_jwks())
+                .await;
+            state.nip_fi_verifier = Some(Arc::new(buzz_auth::FederatedAssertionVerifier::new(
+                state.config.nip_fi.registry.clone(),
+                key_source,
+            )));
+            let state = Arc::new(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = crate::router::build_router(Arc::clone(&state))
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let seen = listen(&state);
+            Pod {
+                state,
+                addr,
+                seen,
+                server,
+            }
+        }
+
+        /// Both pods, with each subscription confirmed live.
+        async fn pair(hosts: &[String; 2]) -> [Pod; 2] {
+            let mut pods = [pod(hosts).await, pod(hosts).await];
+            for p in &mut pods {
+                await_probe(&mut p.seen, &p.state).await;
+            }
+            pods
+        }
+
+        /// A login assertion for `key` whose audience is `host`'s community.
+        /// Minted once and replayed as the same bytes in every phase.
+        fn retained_assertion(key: &nostr::Keys, host: &str) -> String {
+            use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+            let now = chrono::Utc::now().timestamp();
+            let claims = serde_json::json!({
+                "iss": TEST_ISS, "aud": format!("https://{host}"), "sub": "restart-test",
+                "iat": now, "exp": now + 600, "nostr_pubkey": key.public_key().to_hex(),
+            });
+            let mut header = Header::new(Algorithm::ES256);
+            header.typ = Some("nip-fi+jwt".to_owned());
+            header.kid = Some(TEST_KID.to_owned());
+            let signing = EncodingKey::from_ec_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+            encode(&header, &claims, &signing).unwrap()
+        }
+
+        /// A key and its retained assertion for each community.
+        struct Retained {
+            keys: nostr::Keys,
+            assertions: [(String, String); 2],
+        }
+
+        impl Retained {
+            fn mint(hosts: &[String; 2]) -> Self {
+                let keys = nostr::Keys::generate();
+                let assertions = hosts.clone().map(|host| {
+                    let token = retained_assertion(&keys, &host);
+                    (host, token)
+                });
+                Self { keys, assertions }
+            }
+        }
+
+        /// How one admission ended; allowed cases must reach real admission.
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum Outcome {
+            Admitted,
+            Denied,
+        }
+        use Outcome::{Admitted, Denied};
+
+        /// A root socket past the upgrade, holding its NIP-42 challenge.
+        struct RootSession {
+            socket: tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            challenge: String,
+            relay: String,
+        }
+
+        /// Upgrade the root socket at `host` with `token`. A deny at upgrade
+        /// is the 403 deny body; anything else that is not an upgrade fails.
+        async fn open_root(pod: &Pod, host: &str, token: &str) -> Result<RootSession, Outcome> {
+            let mut req = format!("ws://{}/", pod.addr)
+                .into_client_request()
+                .expect("request");
+            req.headers_mut().insert("host", host.parse().unwrap());
+            req.headers_mut().insert(
+                "nostr-federated-identity",
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            let mut socket = match tokio_tungstenite::connect_async(req).await {
+                Ok((socket, _)) => socket,
+                Err(tungstenite::Error::Http(resp)) => {
+                    let body = resp.body().clone().unwrap_or_default();
+                    assert_eq!(
+                        (resp.status().as_u16(), &body[..]),
+                        (403, DENY_BODY),
+                        "root upgrade refused other than by the deny body"
+                    );
+                    return Err(Denied);
+                }
+                Err(e) => panic!("root upgrade failed: {e}"),
+            };
+            let challenge = loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("AUTH challenge in time");
+                if let Some(Ok(Message::Text(text))) = frame {
+                    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if json[0] == "AUTH" {
+                        break json[1].as_str().unwrap().to_owned();
+                    }
+                } else {
+                    panic!("expected the AUTH challenge, got {frame:?}");
+                }
+            };
+            let relay = format!(
+                "{}://{host}",
+                if pod.state.config.relay_url.starts_with("wss://") {
+                    "wss"
+                } else {
+                    "ws"
+                }
+            );
+            Ok(RootSession {
+                socket,
+                challenge,
+                relay,
+            })
+        }
+
+        impl RootSession {
+            /// Complete NIP-42 as `keys`: `Admitted` on OK true, `Denied` on
+            /// the authorization-denied frame followed by the close.
+            async fn authenticate(mut self, keys: &nostr::Keys) -> Outcome {
+                let auth = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                    .tag(nostr::Tag::parse(["relay", &self.relay]).unwrap())
+                    .tag(nostr::Tag::parse(["challenge", &self.challenge]).unwrap())
+                    .sign_with_keys(keys)
+                    .unwrap();
+                let id = auth.id.to_hex();
+                let frame = serde_json::json!(["AUTH", auth]).to_string();
+                self.socket.send(Message::Text(frame.into())).await.unwrap();
+                let denial = buzz_auth::DenialClass::AuthorizationDenied.nostr_text();
+                let mut denied = false;
+                loop {
+                    let frame =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), self.socket.next())
+                            .await
+                            .expect("AUTH outcome in time");
+                    match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if json[0] == "OK" && json[1] == id.as_str() && json[2] == true {
+                                assert!(!denied, "admitted after a denial frame");
+                                return Admitted;
+                            }
+                            denied |= text.contains(denial);
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                            assert!(denied, "root closed without the denial frame");
+                            return Denied;
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                }
+            }
+        }
+
+        /// A full root session: upgrade, then NIP-42.
+        async fn root(pod: &Pod, keys: &nostr::Keys, host: &str, token: &str) -> Outcome {
+            match open_root(pod, host, token).await {
+                Ok(session) => session.authenticate(keys).await,
+                Err(denied) => denied,
+            }
+        }
+
+        /// A signed NIP-98 `POST /query` through the real handler: 200 when
+        /// admitted, the deny body when denied.
+        async fn http(pod: &Pod, keys: &nostr::Keys, host: &str, token: &str) -> Outcome {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let body = br#"[{"kinds":[1],"limit":1}]"#;
+            let scheme = if pod.state.config.relay_url.starts_with("wss://") {
+                "https"
+            } else {
+                "http"
+            };
+            let proof = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+                .tags([
+                    nostr::Tag::parse(["u", &format!("{scheme}://{host}/query")]).unwrap(),
+                    nostr::Tag::parse(["method", "POST"]).unwrap(),
+                    // A fresh proof per request: the replay guard is shared.
+                    nostr::Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
+                    nostr::Tag::parse(["payload", &hex::encode(sha2::Sha256::digest(body))])
+                        .unwrap(),
+                ])
+                .sign_with_keys(keys)
+                .unwrap();
+            let proof = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&proof).unwrap());
+            let request = Request::post("/query")
+                .header(axum::http::header::HOST, host)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::AUTHORIZATION, format!("Nostr {proof}"))
+                .header(CLIENT_ATTACHED_HEADER, format!("Bearer {token}"))
+                .body(Body::from(&body[..]))
+                .unwrap();
+            let resp = crate::router::build_router(Arc::clone(&pod.state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            match status {
+                StatusCode::OK => Admitted,
+                StatusCode::FORBIDDEN if &body[..] == DENY_BODY => Denied,
+                other => panic!(
+                    "unexpected HTTP outcome {other}: {}",
+                    String::from_utf8_lossy(&body)
+                ),
+            }
+        }
+
+        /// The audio deny-set check after a real NIP-42 session.
+        async fn audio(pod: &Pod, keys: &nostr::Keys, host: &str, token: &str) -> Outcome {
+            let binding = pod
+                .state
+                .config
+                .nip_fi
+                .communities
+                .resolve(host)
+                .expect("served");
+            let assertion = pod
+                .state
+                .nip_fi_verifier
+                .as_deref()
+                .expect("verifier")
+                .verify_assertion(token, binding)
+                .expect("the retained assertion is still valid");
+            if crate::audio::handler::test_support::deny_set_refuses(
+                Arc::clone(&pod.state),
+                assertion,
+                keys,
+            )
+            .await
+            {
+                Denied
+            } else {
+                Admitted
+            }
+        }
+
+        /// Asserts every retained assertion of K (expected `key`) and the
+        /// control key (always admitted), on both pods and in both
+        /// communities, at root, audio and HTTP.
+        async fn check(pods: &[Pod; 2], [k, control]: [&Retained; 2], key: Outcome, phase: &str) {
+            for (n, pod) in pods.iter().enumerate() {
+                for (who, retained, expected) in [("K", k, key), ("control", control, Admitted)] {
+                    for (host, token) in &retained.assertions {
+                        let keys = &retained.keys;
+                        assert_eq!(
+                            [
+                                root(pod, keys, host, token).await,
+                                audio(pod, keys, host, token).await,
+                                http(pod, keys, host, token).await,
+                            ],
+                            [expected; 3],
+                            "{phase}: {who} at {host} on P{} [root, audio, HTTP]",
+                            n + 1
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Root sessions for every retained assertion on both pods, upgraded
+        /// but not yet authenticated.
+        async fn open_all(pods: &[Pod; 2], retained: &Retained) -> Vec<(String, RootSession)> {
+            let mut sessions = Vec::new();
+            for (n, pod) in pods.iter().enumerate() {
+                for (host, token) in &retained.assertions {
+                    let session = open_root(pod, host, token)
+                        .await
+                        .unwrap_or_else(|_| panic!("{host} on P{} must upgrade", n + 1));
+                    sessions.push((format!("{host} on P{}", n + 1), session));
+                }
+            }
+            sessions
+        }
+
+        /// Sessions K upgraded before a disconnect landed, now finishing
+        /// NIP-42: only the post-registration deny-set check refuses them.
+        /// The control key's open sessions are admitted.
+        async fn authenticate_all(
+            phase: &str,
+            k: (&nostr::Keys, Vec<(String, RootSession)>),
+            control: (&nostr::Keys, Vec<(String, RootSession)>),
+        ) {
+            for (who, (keys, sessions), expected) in
+                [("K", k, Denied), ("control", control, Admitted)]
+            {
+                for (at, session) in sessions {
+                    assert_eq!(
+                        session.authenticate(keys).await,
+                        expected,
+                        "{phase}: {who}'s session upgraded before it, at {at}"
+                    );
+                }
+            }
+        }
+
+        // Plan criterion 10: restart recovery across pods. K and a control
+        // key each hold one assertion per community (two exact host bindings
+        // in PostgreSQL and config), minted before the revocation and replayed
+        // as the same bytes in every phase, on both pods, through a real root
+        // NIP-42 session, the audio deny-set check and a signed NIP-98 request
+        // to a real handler. A disconnect sent to one pod denies K on both. A
+        // root session K upgraded before the disconnect is refused at NIP-42
+        // by the post-registration deny-set check. Restarting both pods
+        // empties their deny maps, so the retained assertions are admitted
+        // again until the issuer re-sends; that is the exposure window,
+        // recorded from restart to restored denial. The control key is
+        // admitted throughout. Mutations: dropping the post-registration
+        // check admits K's pre-upgraded sessions; dropping cross-pod
+        // application leaves K admitted on the other pod.
+        #[tokio::test]
+        #[ignore = "requires Postgres and Redis"]
+        async fn re_sent_disconnect_restores_the_deny_on_every_pod_after_restart() {
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let hosts = [
+                format!("restart-a-{tag}.example"),
+                format!("restart-b-{tag}.example"),
+            ];
+            let db = sqlx::PgPool::connect(&crate::test_support::database_url())
+                .await
+                .expect("PostgreSQL must be available");
+            for host in &hosts {
+                sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                    .bind(uuid::Uuid::new_v4())
+                    .bind(host)
+                    .execute(&db)
+                    .await
+                    .expect("seed community");
+            }
+            let k = Retained::mint(&hosts);
+            let control = Retained::mint(&hosts);
+            let minted: Vec<String> = [&k, &control]
+                .iter()
+                .flat_map(|r| r.assertions.iter().map(|(_, t)| t.clone()))
+                .collect();
+            let both = [&k, &control];
+            let key = k.keys.public_key();
+            let until = chrono::Utc::now().timestamp() + 300;
+            let send = |pod: Arc<AppState>| async move {
+                let token = mint_token(&key.to_hex(), 0, serde_json::json!({ "until": until }));
+                let (status, body) = post_command(&pod, &token, &key.to_hex()).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(&body[..], br#"{"disconnected": true}"#);
+                drain_publishes(&pod).await;
+            };
+
+            let mut pods = pair(&hosts).await;
+            check(&pods, both, Admitted, "before the disconnect").await;
+            let (k_open, control_open) =
+                (open_all(&pods, &k).await, open_all(&pods, &control).await);
+            send(Arc::clone(&pods[0].state)).await;
+            await_target(&mut pods[1].seen, &key).await;
+            authenticate_all(
+                "after the disconnect",
+                (&k.keys, k_open),
+                (&control.keys, control_open),
+            )
+            .await;
+            check(&pods, both, Denied, "after the disconnect").await;
+
+            // Restart: fresh pods over the same database, empty deny maps.
+            drop(pods);
+            let mut pods = pair(&hosts).await;
+            let restarted = std::time::Instant::now();
+            let (first_host, first_token) = &k.assertions[0];
+            assert_eq!(
+                root(&pods[0], &k.keys, first_host, first_token).await,
+                Admitted,
+                "restarted: K's retained assertion completes a root session on P1"
+            );
+            let first_admitted = restarted.elapsed();
+            check(&pods, both, Admitted, "restarted, before the re-send").await;
+
+            let (k_open, control_open) =
+                (open_all(&pods, &k).await, open_all(&pods, &control).await);
+            send(Arc::clone(&pods[1].state)).await;
+            let [p1, p2] = &mut pods;
+            await_target(&mut p1.seen, &key).await;
+            await_target(&mut p2.seen, &key).await;
+            authenticate_all(
+                "after the re-send",
+                (&k.keys, k_open),
+                (&control.keys, control_open),
+            )
+            .await;
+            check(&pods, both, Denied, "after the re-send").await;
+            let restored = restarted.elapsed();
+
+            let replayed: Vec<String> = [&k, &control]
+                .iter()
+                .flat_map(|r| r.assertions.iter().map(|(_, t)| t.clone()))
+                .collect();
+            assert_eq!(replayed, minted, "assertion bytes unchanged");
+            eprintln!(
+                "criterion 10 exposure: first retained root admission {first_admitted:?} after \
+                 restart; denial restored on every pod {restored:?} after restart"
+            );
+            assert!(first_admitted < restored);
         }
     }
 }

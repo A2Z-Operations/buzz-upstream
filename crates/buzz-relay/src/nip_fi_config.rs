@@ -749,12 +749,20 @@ impl NipFiRelayConfig {
 impl NipFiCommunities {
     /// One community at `canonical_uri` authorizing `issuers`.
     pub(crate) fn for_test(canonical_uri: &str, issuers: &[&str]) -> Self {
-        let entries = vec![CommunityEnvConfig {
-            canonical_uri: canonical_uri.to_owned(),
-            authorized_issuers: issuers.iter().map(|i| (*i).to_owned()).collect(),
-        }];
+        Self::for_test_many(&[canonical_uri], issuers)
+    }
+
+    /// One community per entry of `canonical_uris`, each authorizing `issuers`.
+    pub(crate) fn for_test_many(canonical_uris: &[&str], issuers: &[&str]) -> Self {
+        let entries = canonical_uris
+            .iter()
+            .map(|uri| CommunityEnvConfig {
+                canonical_uri: (*uri).to_owned(),
+                authorized_issuers: issuers.iter().map(|i| (*i).to_owned()).collect(),
+            })
+            .collect();
         Self::from_entries(entries, &issuers.iter().copied().collect())
-            .expect("valid test community")
+            .expect("valid test communities")
     }
 
     /// One community, expecting `aud` and authorizing `issuers`, served at
