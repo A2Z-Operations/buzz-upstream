@@ -755,7 +755,7 @@ mod postgres_tests {
         assert!(
             retire_nip_rs.find("SET LOCAL lock_timeout").unwrap()
                 < retire_nip_rs.find("DROP TRIGGER").unwrap(),
-            "0058 must bound its ACCESS EXCLUSIVE lock on events before the first DROP"
+            "0066 must bound its ACCESS EXCLUSIVE lock on events before the first DROP"
         );
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
