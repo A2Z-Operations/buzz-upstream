@@ -47,6 +47,26 @@ class BridgeTest(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_oversized_report_is_journaled_and_does_not_block_replay_or_summary(self):
+        with patch('bridge.subprocess.run') as run:
+            run.return_value.returncode = 0
+            oversized = dict(self.event, content='x' * 60001)
+            bridge.ingest(self.db, self.route, oversized)
+            bridge.deliver(self.db, self.cfg)
+            run.assert_not_called()
+            self.assertEqual(self.db.execute('SELECT id FROM rejected').fetchone()[0], oversized['id'])
+            reopened = bridge.open_db(self.path, self.cfg)
+            try:
+                bridge.ingest(reopened, self.route, oversized)
+                summary = dict(self.event, id='c' * 64, content='short summary')
+                bridge.ingest(reopened, self.route, summary)
+                bridge.deliver(reopened, self.cfg)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn('short summary', run.call_args.args[0][-1])
+                self.assertEqual(reopened.execute('SELECT count(*) FROM rejected').fetchone()[0], 1)
+            finally:
+                reopened.close()
+
     def test_ambiguous_submission_is_not_retried(self):
         bridge.ingest(self.db, self.route, self.event)
         with patch('bridge.subprocess.run', side_effect=TimeoutError('queue timed out')):

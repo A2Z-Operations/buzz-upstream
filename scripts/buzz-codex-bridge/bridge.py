@@ -58,7 +58,8 @@ def open_db(path, cfg):
     db.executescript('''CREATE TABLE IF NOT EXISTS config (digest TEXT NOT NULL, since INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS deliveries (
         id TEXT PRIMARY KEY, channel TEXT NOT NULL, payload TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('pending','sending','sent')));''')
+        state TEXT NOT NULL CHECK(state IN ('pending','sending','sent')));
+    CREATE TABLE IF NOT EXISTS rejected (id TEXT PRIMARY KEY, channel TEXT NOT NULL, reason TEXT NOT NULL);''')
     digest = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
     row = db.execute('SELECT digest, since FROM config').fetchone()
     if row and row[0] != digest:
@@ -78,13 +79,20 @@ def ingest(db, route, event):
         raise ValueError('event outside authorized author/kind scope')
     if ['h', route['channel']] not in [t[:2] for t in event['tags']]:
         raise ValueError('event outside authorized channel')
-    if not isinstance(event['content'], str) or len(event['content'].encode()) > 60000:
-        raise ValueError('report exceeds 60000 bytes; agent must send a summary')
-    existing = db.execute('SELECT 1 FROM deliveries WHERE id=?', (event['id'],)).fetchone()
+    if not isinstance(event['content'], str):
+        raise ValueError('report content must be a string')
+    existing = db.execute('SELECT 1 FROM deliveries WHERE id=? UNION ALL SELECT 1 FROM rejected WHERE id=?',
+                          (event['id'], event['id'])).fetchone()
     if existing:
         return
-    if db.execute('SELECT count(*) FROM deliveries').fetchone()[0] >= MAX_EVENTS:
+    if db.execute('SELECT (SELECT count(*) FROM deliveries) + (SELECT count(*) FROM rejected)').fetchone()[0] >= MAX_EVENTS:
         raise RuntimeError('delivery journal reached 10000 events; archive this task before continuing')
+    if len(event['content'].encode()) > 60000:
+        reason = 'report exceeds 60000 bytes; send a smaller summary as a new event'
+        with db:
+            db.execute('INSERT INTO rejected VALUES (?,?,?)', (event['id'], route['channel'], reason))
+        print(json.dumps({'rejected': event['id'], 'channel': route['channel'], 'reason': reason}), file=sys.stderr, flush=True)
+        return
     with db:
         db.execute('INSERT INTO deliveries VALUES (?,?,?,?)',
                    (event['id'], route['channel'], json.dumps(event), 'pending'))

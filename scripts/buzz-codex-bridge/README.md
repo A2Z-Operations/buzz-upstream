@@ -56,7 +56,10 @@ events and channel/author/kind scope, emits stored messages oldest-first, then
 Supported message kinds are 9, 45001, and 45003. No human-name resolution is used.
 
 The bridge journals a report before invoking Codex, and records successful queue
-acceptance. Replayed event IDs already recorded as sent are ignored. Queue success
+acceptance. Replayed event IDs already recorded as sent are ignored. Reports over 60,000 bytes
+are recorded in a terminal `rejected` table and reported on stderr without stopping
+other deliveries. Send a smaller summary as a new event; replay skips the rejected
+event. Rejected records count toward the journal limit. Queue success
 means accepted by Codex, not that an agent finished processing the report.
 
 On timeout/crash between submission and recording success, the row stays `sending`.
