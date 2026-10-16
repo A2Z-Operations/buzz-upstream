@@ -1,4 +1,5 @@
-//! Upgrade contract for push-only trigger retirement.
+//! Upgrade contracts for the event follow-up trigger retirements: push
+//! (0063), then channel TTL (0065).
 use super::postgres_tests::{connect_test_pool, reset_public_schema};
 use super::{run_migrations, run_migrations_through};
 use sqlx::PgPool;
@@ -47,7 +48,9 @@ async fn migration_schema_push_retirement_preserves_ttl_and_published_checksums(
     .await
     .unwrap();
 
-    run_migrations(&pool).await.expect("retire push trigger");
+    run_migrations_through(&pool, 63)
+        .await
+        .expect("retire push trigger");
     assert_eq!(
         push_trigger_count(&pool).await,
         0,
@@ -111,5 +114,51 @@ async fn migration_schema_push_retirement_preserves_ttl_and_published_checksums(
         refreshed,
         "raw inserts still refresh TTL after push retirement"
     );
+    pool.close().await;
+}
+
+async fn ttl_function_present(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT to_regprocedure('refresh_channel_ttl_after_event_insert()') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("look up TTL function")
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn migration_schema_ttl_retirement_drops_every_partition_trigger_and_keeps_checksums() {
+    let pool = connect_test_pool().await;
+    reset_public_schema(&pool).await;
+    run_migrations_through(&pool, 64)
+        .await
+        .expect("apply published migrations");
+    assert!(
+        ttl_definitions(&pool).await.len() > 1,
+        "parent and partition TTL triggers exist before upgrade"
+    );
+    assert!(ttl_function_present(&pool).await);
+    let checksums_before: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 64 ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    run_migrations(&pool).await.expect("retire TTL trigger");
+    assert!(
+        ttl_definitions(&pool).await.is_empty(),
+        "retired on parent and every partition"
+    );
+    assert!(!ttl_function_present(&pool).await);
+    assert_eq!(push_trigger_count(&pool).await, 0);
+    let checksums_after: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 64 ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checksums_after, checksums_before);
     pool.close().await;
 }

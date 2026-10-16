@@ -3259,7 +3259,7 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn event_insert_ttl_trigger_handles_permanent_ephemeral_duplicate_and_activation_race() {
+    async fn event_insert_ttl_refresh_handles_permanent_ephemeral_duplicate_and_activation_race() {
         let pool = setup_pool().await;
         let community_uuid = make_test_community(&pool).await;
         let community = CommunityId::from_uuid(community_uuid);
@@ -3326,8 +3326,8 @@ mod postgres_tests {
 
         // Reproduce the blocked stale-prefetch ordering: ingest has already
         // observed a permanent channel, then TTL activation locks/updates the
-        // row before the event INSERT reaches its trigger. The trigger must
-        // wait and refresh from the later event after activation commits.
+        // row before the event INSERT reaches its pre-commit TTL refresh. The
+        // refresh must wait, then use the later event once activation commits.
         let racing = make_test_channel(&pool, community_uuid, None).await;
         let stale_ttl: Option<i32> = sqlx::query_scalar(
             "SELECT ttl_seconds FROM channels WHERE community_id = $1 AND id = $2",
@@ -3342,7 +3342,7 @@ mod postgres_tests {
         let mut activation = pool.begin().await.expect("begin TTL activation");
         // Model the repaired update_channel protocol (migration 0024): the
         // TTL transition holds the per-channel advisory key EXCLUSIVE, which
-        // is what the event trigger's shared acquisition now waits on.
+        // is what the event TTL refresh's shared acquisition waits on.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("buzz_channel_ttl:{community_uuid}:{racing}"))
             .execute(&mut *activation)
@@ -3367,7 +3367,7 @@ mod postgres_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             !insert.is_finished(),
-            "event trigger must wait on TTL activation"
+            "event TTL refresh must wait on TTL activation"
         );
         activation.commit().await.expect("commit TTL activation");
         assert!(
