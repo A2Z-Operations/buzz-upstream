@@ -3321,17 +3321,7 @@ pub async fn guard_community_write(
     tx: &mut Transaction<'_, Postgres>,
     community: CommunityId,
 ) -> Result<()> {
-    let isolation = lock_community_deletion_shared(tx, community).await?;
-    // The lock statement may pin a snapshot in REPEATABLE READ/SERIALIZABLE.
-    // Refuse it before reading state; READ COMMITTED takes a fresh snapshot
-    // for the state query after any wait for the deletion lock.
-    if isolation != "read committed" {
-        tracing::error!(%isolation, %community, "community write admission requires read committed isolation");
-        // AccessDenied deliberately refuses writes; the log distinguishes config errors from fences.
-        return Err(DbError::AccessDenied(format!(
-            "community write admission requires read committed isolation, got {isolation}"
-        )));
-    }
+    lock_community_deletion_shared(tx, community).await?;
     let state: Option<String> = sqlx::query_scalar(
         "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
     )
@@ -3349,10 +3339,18 @@ pub async fn guard_community_write(
     }
 }
 
+/// Take the shared community deletion lock before an admission read.
+///
+/// Every caller reads lifecycle state after this returns, so the transaction
+/// must be READ COMMITTED: the lock statement may pin a snapshot under
+/// REPEATABLE READ/SERIALIZABLE, and a later state read would then miss a
+/// fence committed while this transaction waited for the lock. The isolation
+/// level is read in the same statement as the lock and refused as
+/// [`DbError::AccessDenied`].
 pub(crate) async fn lock_community_deletion_shared(
     tx: &mut Transaction<'_, Postgres>,
     community: CommunityId,
-) -> Result<String> {
+) -> Result<()> {
     let (_, isolation): ((), String) = crate::observability::observe_advisory_lock(
         crate::observability::LockType::Deletion,
         sqlx::query_as(
@@ -3363,7 +3361,14 @@ pub(crate) async fn lock_community_deletion_shared(
         .fetch_one(&mut **tx),
     )
     .await?;
-    Ok(isolation)
+    if isolation != "read committed" {
+        tracing::error!(%isolation, %community, "community write admission requires read committed isolation");
+        // AccessDenied deliberately refuses writes; the log distinguishes config errors from fences.
+        return Err(DbError::AccessDenied(format!(
+            "community write admission requires read committed isolation, got {isolation}"
+        )));
+    }
+    Ok(())
 }
 
 /// Take the shared schema/destruction advisory lock for the current
@@ -4399,7 +4404,8 @@ mod postgres_tests {
             .id;
         for objects_present in [true, false] {
             if !objects_present {
-                // Inline the contract migration: B1 ships no schema changes.
+                // Drop the fence objects by hand, as the retirement migration
+                // will; this change itself ships no schema changes.
                 sqlx::raw_sql(r#"
 DROP TRIGGER IF EXISTS community_write_fence_api_tokens ON api_tokens;
 DROP TRIGGER IF EXISTS community_write_fence_archived_identities ON archived_identities;
@@ -7210,8 +7216,8 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn app_admission_rejects_pinned_snapshot_isolation_before_authorization() {
-        let (db, _) = store().await;
+    async fn deletion_lock_admission_rejects_pinned_snapshot_isolation() {
+        let (db, store) = store().await;
         let community = db
             .ensure_configured_community(&format!(
                 "isolation-guard-{}.example",
@@ -7220,29 +7226,44 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
             .await
             .expect("create community")
             .id;
+        // Never acquired: under READ COMMITTED this lease is refused as stale,
+        // so a stale-lease error here means the isolation check did not run.
+        let lease = ServingWriteLease {
+            id: Uuid::new_v4(),
+            community_id: community,
+            operation: "isolation-probe".to_owned(),
+            owner: "isolation-probe".to_owned(),
+            generation: 0,
+            fence_generation: 0,
+            lease_until: Utc::now(),
+        };
 
         for isolation in ["REPEATABLE READ", "SERIALIZABLE"] {
-            let mut tx = db.pool.begin().await.expect("begin isolation probe");
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SET TRANSACTION ISOLATION LEVEL {isolation}"
-            )))
-            .execute(&mut *tx)
-            .await
-            .expect("set transaction isolation");
-            sqlx::query(
-                "SELECT set_config('buzz.deletion_executor_community', $1, true), \
-                        set_config('buzz.deletion_fence_generation', '0', true)",
-            )
-            .bind(community.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("forge executor authorization");
-            let error = guard_community_write(&mut tx, community)
+            for path in [
+                "guard_community_write",
+                "guard_transaction_with_serving_lease",
+            ] {
+                let mut tx = db.pool.begin().await.expect("begin isolation probe");
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {isolation}"
+                )))
+                .execute(&mut *tx)
                 .await
-                .expect_err("pinned snapshot isolation must fail before authorization");
-            assert!(
-                matches!(error, DbError::AccessDenied(message) if message.contains("requires read committed"))
-            );
+                .expect("set transaction isolation");
+                let error = match path {
+                    "guard_community_write" => guard_community_write(&mut tx, community).await,
+                    _ => {
+                        store
+                            .guard_transaction_with_serving_lease(&mut tx, &lease)
+                            .await
+                    }
+                }
+                .expect_err("pinned snapshot isolation must be refused");
+                assert!(
+                    matches!(&error, DbError::AccessDenied(message) if message.contains("requires read committed")),
+                    "{path} under {isolation}: {error:?}"
+                );
+            }
         }
     }
 

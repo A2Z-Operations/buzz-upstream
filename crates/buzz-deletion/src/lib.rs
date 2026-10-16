@@ -2444,7 +2444,8 @@ mod postgres_tests {
             .await
             .expect("live catalog");
         // Simulate the retired catalog while retaining the legacy digest above.
-        // B1 itself must still report live fences for old executors during rollout.
+        // While the fence objects exist, inventory still reports them so
+        // executors that predate fence-optional catalogs keep validating.
         live.fenced_tables.clear();
         validate_approved_schema(&live, &decoded)
             .expect("legacy fence list is no longer structural");
