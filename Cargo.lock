@@ -1415,6 +1415,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "minicbor",
  "nostr 0.44.7",
+ "percent-encoding",
  "proptest",
  "rand 0.10.1",
  "reqwest 0.13.4",
