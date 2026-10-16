@@ -139,7 +139,7 @@ NOT issue an agent assertion while the owner is not authorized by the issuer.
 A relay advertising `agent_assertions: true` MUST verify `nostr_owner_pubkey`
 as part of the assertion.  A malformed value, or one equal to `nostr_pubkey`,
 MUST deny `evidence_rejected`.  The relay MUST record the value as the
-session's owner.  If the relay already associates a different owner with the
+owner of the session or request the assertion admits.  If the relay already associates a different owner with the
 asserted key in the resolved community, it MUST deny `authorization_denied`.
 For every agent assertion, regardless of whether the asserted key is itself
 authorized in the community, the relay MUST deny when the community bans the
@@ -271,8 +271,14 @@ VerifyAssertion(token, community, D, R_t):
   AssertAudienceMatch(claims.aud, community.expected_aud) or DENY(evidence_rejected)
   AssertTimeBounds(claims, policy) or DENY(evidence_rejected)  // [FI-TRACE-ASSERTION-VALIDATION]
   k_claimed := ParseHexKey(claims.nostr_pubkey) or DENY(evidence_rejected)
+  owner := absent
+  if claims.nostr_owner_pubkey is present:
+    AssertAgentAssertionsAdvertised(relay) or DENY(evidence_rejected)
+    owner := ParseHexKey(claims.nostr_owner_pubkey) or DENY(evidence_rejected)
+    AssertNotEqual(owner, k_claimed) or DENY(evidence_rejected)
 
   return VerifiedAssertion(identity=(claims.iss, claims.sub), asserted_key=k_claimed,
+                           owner=owner,
                            authority_deadlines=ComputeDeadlines(claims, snapshot))
 ```
 
@@ -303,11 +309,12 @@ On WebSocket upgrade:
    ensures any connection that straddles a concurrent disconnect is caught by
    one side or the other: either the close scan sees the registered session, or
    the deny-set check (step 7) sees the inserted entry.  Both checks use the
-   same `(iss, k)` key.  A concurrent disconnect close scan MAY cancel this
+   same keys: `(iss, k)` and, for a session with an owner, `(iss, o)`.  A concurrent disconnect close scan MAY cancel this
    registered connection before step 8; cancellation is terminal, so a
    cancelled connection MUST NOT be admitted.
-7. Check the deny set for `(iss, k)` and, if the session has an owner `o`,
-   for `(iss, o)`.  Either active entry denies `authorization_denied`.
+7. Check the deny set for `(iss, k)` and, if `verified.owner` is present, for
+   `(iss, verified.owner)`.  Either active entry (`now < until`) denies
+   `authorization_denied`.
    [FI-TRACE-DENY-SET]
 8. Admit the connection only if it remains live and uncancelled.  The session's
    authority deadline is the minimum of all `authority_deadlines`; see Session
@@ -376,8 +383,8 @@ A disconnect call causes the relay to:
    capacity and a new entry cannot be inserted, the relay MUST reject the command
    `503`; no sessions are closed and no replay state is consumed.
 2. Close all live WebSocket connections registered under the command's issuer
-   whose proven `k` equals the target pubkey, whether or not admission has
-   completed, synchronously.  Disconnect cancellation is terminal: a cancelled
+   whose proven `k` equals the target pubkey or whose recorded owner equals
+   the target pubkey, whether or not admission has completed, synchronously.  Disconnect cancellation is terminal: a cancelled
    in-progress connection MUST NOT be subsequently admitted.  Connections
    registered under another issuer are not affected.
 
@@ -547,8 +554,9 @@ registered under the command's issuer (`claims.iss`) whose proven key equals
 `CommandResult.target_pubkey` or whose recorded owner equals
 `CommandResult.target_pubkey`, whether or not admission has completed.
 Disconnect cancellation is terminal: a cancelled in-progress connection MUST NOT
-be subsequently admitted.  This close scan matches the same
-`(iss, target_pubkey)` key as the deny entry; connections registered under
+be subsequently admitted.  This close scan matches the deny
+entry's `target_pubkey` against each connection's proven key and recorded
+owner; connections registered under
 another issuer are not affected.  The `until` expiry is taken exclusively from
 the signed command JWT claim; the request body carries no `until` field.  An
 unknown or unprovable pubkey is not an error; the relay responds `200`
@@ -769,8 +777,9 @@ On each protected HTTP request:
    `evidence_rejected`.  [FI-TRACE-HTTP-INGRESS]
 5. Assert `verified.asserted_key == k`; mismatch → deny `authorization_denied`.
    [FI-TRACE-ASSERTION-KEY-MISMATCH]
-6. Check the deny set for `(iss, k)` and, if the session has an owner `o`,
-   for `(iss, o)`.  Either active entry denies `authorization_denied`.
+6. Check the deny set for `(iss, k)` and, if `verified.owner` is present, for
+   `(iss, verified.owner)`.  Either active entry (`now < until`) denies
+   `authorization_denied`.
    [FI-TRACE-DENY-SET]
 7. Admit the request.
 
@@ -930,7 +939,8 @@ For the deny-until-TTL disconnect model (issuer issues a successful disconnect
 call with an `until` timestamp), the relay inserts a deny entry for the target
 pubkey with expiry `until` and then closes all matching connections synchronously.
 Here, matching means connections registered under that issuer whose proven `k`
-equals that target pubkey, whether or not admission has completed; disconnect
+equals that target pubkey or whose recorded owner equals the target pubkey,
+whether or not admission has completed; disconnect
 cancellation is terminal, so a cancelled in-progress connection MUST NOT be
 subsequently admitted.  Connections registered under another issuer are not
 affected.  Any subsequent admission attempt for that pubkey under the same issuer
