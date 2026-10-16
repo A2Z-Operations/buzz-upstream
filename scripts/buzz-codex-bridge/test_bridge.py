@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from pathlib import Path
 import sys
 import selectors
@@ -31,8 +32,8 @@ class BridgeTest(unittest.TestCase):
 
     def test_replay_after_restart_delivers_only_once(self):
         bridge.ingest(self.db, self.route, self.event)
-        with patch('bridge.subprocess.run') as run:
-            run.return_value.returncode = 0
+        with patch('bridge.run_queue') as run:
+            run.return_value = 0
             bridge.deliver(self.db, self.cfg)
             self.assertEqual(run.call_count, 1)
             args = run.call_args.args[0]
@@ -48,8 +49,8 @@ class BridgeTest(unittest.TestCase):
                 reopened.close()
 
     def test_oversized_report_is_journaled_and_does_not_block_replay_or_summary(self):
-        with patch('bridge.subprocess.run') as run:
-            run.return_value.returncode = 0
+        with patch('bridge.run_queue') as run:
+            run.return_value = 0
             oversized = dict(self.event, content='x' * 60001)
             bridge.ingest(self.db, self.route, oversized)
             bridge.deliver(self.db, self.cfg)
@@ -69,7 +70,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_ambiguous_submission_is_not_retried(self):
         bridge.ingest(self.db, self.route, self.event)
-        with patch('bridge.subprocess.run', side_effect=TimeoutError('queue timed out')):
+        with patch('bridge.run_queue', side_effect=TimeoutError('queue timed out')):
             with self.assertRaises(TimeoutError):
                 bridge.deliver(self.db, self.cfg)
         with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
@@ -113,6 +114,46 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(args[0], 'queue')
         self.assertIn(self.event['content'], args[-1])
         self.assertEqual(self.db.execute('SELECT state FROM deliveries').fetchone()[0], 'sent')
+
+    def process_tree_command(self):
+        child = self.root / 'child.py'
+        child.write_text('import os,signal,time\nfrom pathlib import Path\n'
+                         'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                         'Path(' + repr(str(self.root / 'child.pid')) + ').write_text(str(os.getpid()))\n'
+                         'time.sleep(60)\n')
+        wrapper = self.root / 'wrapper.py'
+        wrapper.write_text('import subprocess,sys,time\n'
+                           'subprocess.Popen([sys.executable, ' + repr(str(child)) + '])\n'
+                           'time.sleep(60)\n')
+        return [sys.executable, str(wrapper)]
+
+    def assert_child_stopped(self):
+        pid = int((self.root / 'child.pid').read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+            if status.returncode != 0 or status.stdout.strip().startswith('Z'):
+                return
+            time.sleep(0.02)
+        self.fail('wrapper descendant is still running')
+
+    def test_stop_kills_wrapper_descendant_that_ignores_termination(self):
+        process = subprocess.Popen(self.process_tree_command(), stdout=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.root / 'child.pid').exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue((self.root / 'child.pid').exists())
+            bridge.stop(process)
+            self.assert_child_stopped()
+        finally:
+            if process.poll() is None:
+                bridge.stop(process)
+
+    def test_queue_timeout_kills_descendants(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bridge.run_queue(self.process_tree_command(), timeout=2)
+        self.assert_child_stopped()
 
     def test_foreground_bridge_streams_and_stops_its_watcher(self):
         watcher = self.root / 'watcher.py'

@@ -42,7 +42,8 @@ python3 scripts/buzz-codex-bridge/bridge.py --config /private/routes.json --stat
 ```
 
 The bridge remains in the foreground. Stop with Ctrl-C. It cleans up its watch
-children. No login daemon or scheduled task is installed automatically. Use the
+process groups, including descendants of authentication wrappers. Codex queue
+commands use the same containment on exit, timeout, or cancellation. No login daemon or scheduled task is installed automatically. Use the
 same state DB after restart; a different routing configuration requires a new DB.
 The DB and lock are created owner-only. Treat the DB as private conversation data.
 

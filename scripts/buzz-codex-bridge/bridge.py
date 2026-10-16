@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -112,24 +113,42 @@ def deliver(db, cfg):
         # An interruption after queue acceptance is ambiguous. Do not blindly replay it.
         with db:
             db.execute("UPDATE deliveries SET state='sending' WHERE id=?", (eid,))
-        result = subprocess.run(cfg['codex_command'] + ['queue', '--thread', route['thread'], '--message', message],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=30, check=False)
-        if result.returncode:
-            raise RuntimeError(f'Codex queue exited {result.returncode}; delivery {eid} requires reconciliation')
+        returncode = run_queue(cfg['codex_command'] + ['queue', '--thread', route['thread'], '--message', message])
+        if returncode:
+            raise RuntimeError(f'Codex queue exited {returncode}; delivery {eid} requires reconciliation')
         with db:
             db.execute("UPDATE deliveries SET state='sent' WHERE id=?", (eid,))
         print(json.dumps({'delivered': eid, 'thread': route['thread']}), flush=True)
 
 
 def stop(process):
-    if process.poll() is None:
-        process.terminate()
+    # Every owned command starts a new session. Its group survives wrapper exit.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    process.stdout.close()
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def run_queue(argv, timeout=30):
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    finally:
+        # Includes timeout, cancellation, and wrappers exiting before descendants.
+        stop(process)
 
 
 def run(cfg, db):
@@ -152,7 +171,7 @@ def run(cfg, db):
                 cmd = cfg['buzz_command'] + ['--relay', cfg['relay'], 'messages', 'watch', '--channel', route['channel'], '--since', since]
                 for author in route['authors']:
                     cmd += ['--author', author]
-                p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+                p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, start_new_session=True)
                 worker.update(process=p, buffer=b'', started=time.monotonic())
                 sel.register(p.stdout, selectors.EVENT_READ, worker)
             for key, _ in sel.select(timeout=1):
