@@ -1943,6 +1943,8 @@ fn every_production_event_insert_runs_the_follow_up_hook() {
 
 // Fixed channel-less kinds cannot be channel rosters. The startup probes must
 // exercise the retained DB backstops directly and roll back all their writes.
+// Exemptions match by function header, so a kind 39002 insert added inside one
+// of these functions would pass the policy; keep them single-purpose.
 const EVENT_INSERT_ROSTER_GUARD_EXCEPTIONS: [&str; 4] = [
     // NIP-43 membership is kind 13534 with channel_id NULL.
     "pub async fn publish_nip43_membership_locked(",
@@ -2027,6 +2029,10 @@ mod tests {
     );
 }
 
+/// Presence check: every production `INSERT INTO events` function must contain
+/// a real (uncommented, unquoted) roster-guard call. It does not prove the call
+/// is awaited, reachable, or given the event's real kind and channel; the PG
+/// `app_roster_guard_*` tests cover behavior.
 #[test]
 fn every_production_event_insert_runs_the_roster_guard() {
     let mut checked_writers = 0;

@@ -199,8 +199,14 @@ async fn acquire_channel_membership_lock(
 
 /// Check the same p-tag shape and canonical active membership as migration 0032.
 /// The caller holds this channel's membership advisory lock on the admitted
-/// transaction before calling. Membership writers take that key before reading
-/// roles or changing rows. Legacy replacement takes the replacement key, locks
+/// transaction before calling. The membership writers in this module take that
+/// key before reading roles or changing rows. Not every writer does yet:
+/// `execute_kick_with_marker` and `deploy_kick_member` (relay_admin_actions.rs)
+/// set `removed_at` without it, so a kick can commit after this check passes
+/// and before the roster commits. The retained trigger has the same gap. Both
+/// kick paths must take the key, with a concurrent kick-vs-roster-publication
+/// test, before anything relies on complete serialization (phase 2 included).
+/// Legacy replacement takes the replacement key, locks
 /// old-head rows in its UPDATE, then takes the membership key at trigger INSERT.
 /// The app path takes replacement key -> membership key -> old-head row locks,
 /// removing the row-lock/membership-key cycle rather than preserving it.
@@ -3068,6 +3074,9 @@ mod postgres_tests {
         (community, channel.id, owner_a, owner_b)
     }
 
+    /// Commits `DISABLE TRIGGER` on the test database. Safe only under the
+    /// per-test database wrapper; do not run these against a shared database,
+    /// or later trigger-dependent tests there will see no trigger.
     async fn disable_roster_trigger(pool: &PgPool) {
         let partitions: Vec<String> = sqlx::query_scalar(
             "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
