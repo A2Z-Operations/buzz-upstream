@@ -149,6 +149,18 @@ struct Pod {
 }
 
 async fn pod(store: &Arc<Bindings>, clock: &Arc<ManualClock>, mode: NipFiMode) -> Pod {
+    let base =
+        crate::state::tests::test_state_with_database_url("postgres://127.0.0.1:1/none").await;
+    pod_on(base, store, clock, mode).await
+}
+
+/// [`pod`] over a caller-built base state (its tenant store).
+async fn pod_on(
+    base: Arc<AppState>,
+    store: &Arc<Bindings>,
+    clock: &Arc<ManualClock>,
+    mode: NipFiMode,
+) -> Pod {
     let resolver = Arc::new(DatabaseResolver::with_clock(
         Arc::clone(store) as Arc<dyn BindingSource>,
         policy(),
@@ -158,8 +170,6 @@ async fn pod(store: &Arc<Bindings>, clock: &Arc<ManualClock>, mode: NipFiMode) -
     ));
     resolver.refresh().await.expect("startup load");
 
-    let base =
-        crate::state::tests::test_state_with_database_url("postgres://127.0.0.1:1/none").await;
     let mut state = (*base).clone();
     let config = Arc::make_mut(&mut state.config);
     config.nip_fi.mode = mode;
@@ -215,6 +225,17 @@ fn sites() -> [String; 3] {
 
 impl Pod {
     async fn send(&self, path: &str, raw_host: &str, token: Option<&str>) -> (StatusCode, Vec<u8>) {
+        self.send_signed(path, raw_host, token, None).await
+    }
+
+    /// [`Pod::send`] with an optional `Authorization` (NIP-98) header.
+    async fn send_signed(
+        &self,
+        path: &str,
+        raw_host: &str,
+        token: Option<&str>,
+        authorization: Option<String>,
+    ) -> (StatusCode, Vec<u8>) {
         let mut builder = Request::get(path)
             .header(axum::http::header::HOST, raw_host)
             .header("Upgrade", "websocket")
@@ -223,6 +244,9 @@ impl Pod {
             .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
         if let Some(token) = token {
             builder = builder.header("Nostr-Federated-Identity", format!("Bearer {token}"));
+        }
+        if let Some(authorization) = authorization {
+            builder = builder.header(axum::http::header::AUTHORIZATION, authorization);
         }
         let response = crate::router::build_router(Arc::clone(&self.state))
             .oneshot(builder.body(Body::empty()).expect("request"))
@@ -455,8 +479,8 @@ async fn key_disconnected_before_its_community_exists_is_denied_there() {
     };
 
     // Disconnect K while H does not exist anywhere.
-    let k = nostr::Keys::generate().public_key();
-    let control = nostr::Keys::generate().public_key();
+    let (k_keys, control_keys) = (nostr::Keys::generate(), nostr::Keys::generate());
+    let (k, control) = (k_keys.public_key(), control_keys.public_key());
     let now = chrono::Utc::now();
     let merged = deny_map.merge_cross_pod_deny(ISS, &k, now + chrono::Duration::hours(1), now);
     assert!(matches!(merged, buzz_auth::CrossPodMergeResult::Merged));
@@ -475,6 +499,24 @@ async fn key_disconnected_before_its_community_exists_is_denied_there() {
     assert!(cleared_nip_fi(&[p
         .send("/", &h, Some(&mint_for(ISS, &h, &control)))
         .await]));
+
+    // Audio resolves H at upgrade and denies after NIP-42, at its deny-set
+    // check, on an assertion verified against H's resolved binding.
+    let audio = format!("/huddle/{}/audio", uuid::Uuid::new_v4());
+    let (binding, _) = p.resolver.resolve(&h).await.expect("H resolves");
+    let verifier = p.state.nip_fi_verifier.as_deref().expect("verifier");
+    for (keys, refused) in [(&k_keys, true), (&control_keys, false)] {
+        let token = mint_for(ISS, &h, &keys.public_key());
+        assert!(cleared_nip_fi(&[p.send(&audio, &h, Some(&token)).await]));
+        let assertion = verifier.verify_assertion(&token, &binding).expect("valid");
+        let outcome = crate::audio::handler::test_support::deny_set_refuses(
+            Arc::clone(&p.state),
+            assertion,
+            keys,
+        )
+        .await;
+        assert_eq!(outcome, refused, "audio deny-set check");
+    }
 
     let http_admit = |key: nostr::PublicKey| {
         let state = Arc::clone(&p.state);
@@ -520,4 +562,165 @@ async fn key_disconnected_before_its_community_exists_is_denied_there() {
         })
         .sum();
     assert_eq!(http_denials, 1);
+}
+
+// ── Reachable handlers over a real tenant store ─────────────────────────────
+
+/// Requests reach their handlers: the tenant store is real PostgreSQL with a
+/// row for each test host, and protected HTTP uses a valid workflow path with
+/// a NIP-98 proof, so the handler itself calls `admit_nip_fi_http_on_state`.
+/// The first tenant-store connection a request takes can move the resolver
+/// clock, which places a deadline crossing inside the tenant-lookup await.
+mod postgres_tests {
+    use super::*;
+
+    /// Pod over a one-connection pool whose next acquire, once armed, moves
+    /// the clock to the armed time.
+    struct TenantPod {
+        pod: Pod,
+        clock: Arc<ManualClock>,
+        advance_on_acquire: Arc<Mutex<Option<Duration>>>,
+        label: String,
+    }
+
+    async fn tenant_pod(store: &Arc<Bindings>, clock: &Arc<ManualClock>) -> TenantPod {
+        let label = format!("t{}", uuid::Uuid::new_v4().simple());
+        let advance_on_acquire = Arc::new(Mutex::new(None::<Duration>));
+        let (hook, hook_clock) = (Arc::clone(&advance_on_acquire), Arc::clone(clock));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .before_acquire(move |_, _| {
+                if let Some(at) = hook.lock().unwrap().take() {
+                    hook_clock.set(at);
+                }
+                Box::pin(async { Ok(true) })
+            })
+            .connect(&crate::test_support::database_url())
+            .await
+            .expect("PostgreSQL must be available");
+        // Seeding leaves the pool's only connection idle, so every request
+        // acquire reuses it and runs the hook.
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(uuid::Uuid::new_v4())
+            .bind(host(&label))
+            .execute(&pool)
+            .await
+            .expect("seed community");
+        store.bind(&label, &[ISS]);
+        let base = crate::state::tests::test_state_with_database_pool(pool).await;
+        let pod = pod_on(base, store, clock, NipFiMode::Enforce).await;
+        TenantPod {
+            pod,
+            clock: Arc::clone(clock),
+            advance_on_acquire,
+            label,
+        }
+    }
+
+    fn nip98(keys: &nostr::Keys, url: &str) -> String {
+        use base64::Engine as _;
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .tags([
+                nostr::Tag::parse(["u", url]).unwrap(),
+                nostr::Tag::parse(["method", "GET"]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&event).unwrap())
+        )
+    }
+
+    impl TenantPod {
+        /// Each admission site's outcome for one fresh key: root and audio
+        /// upgrades, then the workflow-runs handler with a matching proof.
+        /// With `crossing = Some((start, at))` every request resolves at
+        /// `start` and its tenant lookup moves the clock to `at`.
+        async fn every_site(
+            &self,
+            crossing: Option<(Duration, Duration)>,
+        ) -> Vec<(StatusCode, Vec<u8>)> {
+            let raw_host = host(&self.label);
+            let keys = nostr::Keys::generate();
+            let token = mint_for(ISS, &raw_host, &keys.public_key());
+            let scheme = if self.pod.state.config.relay_url.starts_with("wss://") {
+                "https"
+            } else {
+                "http"
+            };
+            let workflow = format!("/workflows/{}/runs", uuid::Uuid::new_v4());
+            let requests = [
+                ("/".to_owned(), None),
+                (format!("/huddle/{}/audio", uuid::Uuid::new_v4()), None),
+                (
+                    workflow.clone(),
+                    Some(nip98(&keys, &format!("{scheme}://{raw_host}{workflow}"))),
+                ),
+            ];
+            let mut outcomes = Vec::new();
+            for (path, proof) in requests {
+                if let Some((start, at)) = crossing {
+                    self.clock.set(start);
+                    *self.advance_on_acquire.lock().unwrap() = Some(at);
+                }
+                outcomes.push(
+                    self.pod
+                        .send_signed(&path, &raw_host, Some(&token), proof)
+                        .await,
+                );
+            }
+            outcomes
+        }
+    }
+
+    /// Every site cleared NIP-FI and its handler went on past tenant
+    /// binding: a oneshot request cannot upgrade, so root falls back to its
+    /// NIP-11 document and audio refuses the upgrade, and the workflow handler
+    /// passed admission to its rate limiter, whose Redis is unreachable.
+    fn reached_handlers(outcomes: &[(StatusCode, Vec<u8>)]) -> bool {
+        let body = |o: &(StatusCode, Vec<u8>)| String::from_utf8_lossy(&o.1).into_owned();
+        match outcomes {
+            [root, audio, http] => {
+                root.0 == StatusCode::OK
+                    && body(root).contains("\"federated_identity\"")
+                    && audio.0 == StatusCode::UPGRADE_REQUIRED
+                    && http.0 == StatusCode::SERVICE_UNAVAILABLE
+                    && body(http).contains("shared admission unavailable")
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn every_reachable_handler_resolves_its_host_exactly_once() {
+        let (store, clock) = setup();
+        let p = tenant_pod(&store, &clock).await;
+        // Absent from the published map, so every resolution is a counted miss.
+        let raw_host = host(&p.label);
+        store.unbind(&p.label);
+        p.pod.resolver.refresh().await.expect("refresh");
+        store.bind(&p.label, &[ISS]);
+
+        let outcomes = p.every_site(None).await;
+        assert!(reached_handlers(&outcomes), "{outcomes:?}");
+        assert_eq!(store.lookups_for(&raw_host), 3, "one lookup per admission");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn snapshot_going_stale_during_the_tenant_lookup_admits_nowhere() {
+        let (store, clock) = setup();
+        let p = tenant_pod(&store, &clock).await;
+        let inside = (secs(119.0), secs(119.9));
+        assert!(
+            reached_handlers(&p.every_site(Some(inside)).await),
+            "control"
+        );
+
+        // Startup loaded at 0 s: fresh at resolution, stale at admission.
+        let crossing = (secs(119.9), secs(120.1));
+        assert_eq!(p.every_site(Some(crossing)).await, vec![unavailable(); 3]);
+    }
 }

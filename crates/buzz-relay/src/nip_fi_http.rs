@@ -61,21 +61,21 @@ use chrono::{DateTime, Utc};
 use nostr::PublicKey;
 use std::fmt;
 
+use crate::nip_fi_core::ResolvedCommunity;
 use crate::nip_fi_core::{
     asserted_key_matches, evaluate_attached_assertion, http_denial, AssertionRejection, Communities,
 };
 use buzz_auth::CommunityBinding;
-use std::sync::Arc;
 
 tokio::task_local! {
     /// The community the enforce-mode router guard resolved for this request.
-    static GUARD_COMMUNITY: Arc<CommunityBinding>;
+    static GUARD_COMMUNITY: ResolvedCommunity;
 }
 
 /// Run `next` with the guard's resolved community, so the handler's
 /// admission reuses it instead of resolving the Host a second time.
 pub(crate) async fn with_resolved_community<F: std::future::Future>(
-    community: Arc<CommunityBinding>,
+    community: ResolvedCommunity,
     next: F,
 ) -> F::Output {
     GUARD_COMMUNITY.scope(community, next).await
@@ -86,8 +86,8 @@ pub(crate) async fn with_resolved_community<F: std::future::Future>(
 async fn resolve_for_admission(
     communities: Communities<'_>,
     headers: &HeaderMap,
-) -> Result<Arc<CommunityBinding>, DenialClass> {
-    match GUARD_COMMUNITY.try_with(Arc::clone) {
+) -> Result<ResolvedCommunity, DenialClass> {
+    match GUARD_COMMUNITY.try_with(ResolvedCommunity::clone) {
         Ok(community) => Ok(community),
         Err(_) => communities.resolve(headers).await,
     }
@@ -372,6 +372,11 @@ where
         }
         http_denial(class)
     })?;
+    // The handler may have awaited (tenant lookup) since the guard resolved
+    // the community; a snapshot that went stale meanwhile admits nothing.
+    if let Ok(community) = &community {
+        community.deadline().check().map_err(http_denial)?;
+    }
 
     // Step 8: admit.
     Ok(NipFiAdmission {

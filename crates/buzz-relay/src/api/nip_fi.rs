@@ -3740,12 +3740,30 @@ mod route_integration_tests {
         }
 
         /// Two enforce pods on one Redis, each running the production
-        /// subscriber, with both subscriptions confirmed live.
+        /// subscriber, with both subscriptions confirmed live. Each also
+        /// admits login assertions from the test issuer at any Host.
         async fn enforce_pair(
         ) -> [(Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>); 2] {
             let mut pods = Vec::new();
             for _ in 0..2 {
-                let pod = pod_in(NipFiMode::Enforce).await;
+                let mut state = (*pod_in(NipFiMode::Enforce).await).clone();
+                Arc::make_mut(&mut state.config).nip_fi.communities =
+                    crate::nip_fi_core::test_support::any_host(TEST_AUD);
+                let key_source = Arc::new(
+                    ProductionJwksSource::new(
+                        vec![test_jwks_config()],
+                        buzz_auth::HttpJwksFetcher::new(),
+                    )
+                    .expect("key source"),
+                );
+                key_source
+                    .seed_snapshot_for_test(TEST_ISS, test_jwks())
+                    .await;
+                state.nip_fi_verifier = Some(Arc::new(buzz_auth::FederatedAssertionVerifier::new(
+                    state.config.nip_fi.registry.clone(),
+                    key_source,
+                )));
+                let pod = Arc::new(state);
                 let seen = listen(&pod);
                 pods.push((pod, seen));
             }
@@ -3755,18 +3773,133 @@ mod route_integration_tests {
             pods.try_into().unwrap_or_else(|_| unreachable!())
         }
 
+        /// Whether `key`'s login is denied on `pod` at each admission site:
+        /// the root upgrade, the audio session's deny-set check (audio denies
+        /// after NIP-42, not at upgrade), and protected HTTP admission. A root
+        /// upgrade that clears NIP-FI ends at tenant binding.
+        #[allow(clippy::result_large_err)] // the NIP-98 closure returns the production `Response` error type
+        async fn denied_at_every_site(pod: &Arc<AppState>, key: &nostr::Keys) -> [bool; 3] {
+            use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+            let now = chrono::Utc::now().timestamp();
+            let claims = serde_json::json!({
+                "iss": TEST_ISS, "aud": TEST_AUD, "sub": "restart-test",
+                "iat": now, "exp": now + 300, "nostr_pubkey": key.public_key().to_hex(),
+            });
+            let mut header = Header::new(Algorithm::ES256);
+            header.typ = Some("nip-fi+jwt".to_owned());
+            header.kid = Some(TEST_KID.to_owned());
+            let signing = EncodingKey::from_ec_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+            let token = encode(&header, &claims, &signing).unwrap();
+            let raw_host = format!("restart-{}.example", uuid::Uuid::new_v4().simple());
+            let denied = |status: StatusCode, body: &[u8]| {
+                let cleared = status == StatusCode::NOT_FOUND;
+                assert!(
+                    cleared
+                        || (status, body)
+                            == (StatusCode::FORBIDDEN, &b"authorization denied\n"[..]),
+                    "unexpected outcome {status}: {}",
+                    String::from_utf8_lossy(body)
+                );
+                !cleared
+            };
+
+            let request = Request::get("/")
+                .header(axum::http::header::HOST, &raw_host)
+                .header("Upgrade", "websocket")
+                .header("Connection", "Upgrade")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("Nostr-Federated-Identity", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = crate::router::build_router(Arc::clone(pod))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let root = denied(status, &body);
+
+            let binding = pod
+                .config
+                .nip_fi
+                .communities
+                .resolve(&raw_host)
+                .expect("served");
+            let assertion = pod
+                .nip_fi_verifier
+                .as_deref()
+                .expect("verifier")
+                .verify_assertion(&token, binding)
+                .expect("valid assertion");
+            let audio = crate::audio::handler::test_support::deny_set_refuses(
+                Arc::clone(pod),
+                assertion,
+                key,
+            )
+            .await;
+
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::HOST, raw_host.parse().unwrap());
+            headers.insert(
+                "Nostr-Federated-Identity",
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            let proven = key.public_key();
+            let http = match crate::nip_fi_http::admit_nip_fi_http_on_state(pod, &headers, || {
+                Ok(crate::nip_fi_http::Nip98Proof::new(proven, ()))
+            })
+            .await
+            {
+                Ok(_) => false,
+                Err(resp) => {
+                    let status = resp.status();
+                    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+                    assert!(denied(status, &body), "HTTP denial is the deny body");
+                    true
+                }
+            };
+            [root, audio, http]
+        }
+
+        /// Asserts K's denial on every pod and site matches `key_denied`, and
+        /// that the control key is admitted everywhere.
+        async fn check(
+            pods: [&Arc<AppState>; 2],
+            [key, control]: [&nostr::Keys; 2],
+            key_denied: bool,
+            phase: &str,
+        ) {
+            for (n, pod) in pods.into_iter().enumerate() {
+                let pod_name = n + 1;
+                assert_eq!(
+                    denied_at_every_site(pod, key).await,
+                    [key_denied; 3],
+                    "{phase}: K on P{pod_name}"
+                );
+                assert_eq!(
+                    denied_at_every_site(pod, control).await,
+                    [false; 3],
+                    "{phase}: control on P{pod_name}"
+                );
+            }
+        }
+
         // Plan criterion 10: restart recovery across pods. A disconnect sent
-        // to P1 is applied by P1 *and* by P2 (P1's reply alone proves only
-        // P1). Restarting both pods empties their deny maps, so K is accepted
-        // until the issuer re-sends; that gap is the exposure window. The
-        // re-send (fresh `jti`, same `until`) to one pod restores the deny on
-        // every pod. A control key is never denied. Admission paths read
-        // this deny map (see `nip_fi_resolver::tests::router`).
+        // to P1 denies K's logins on P1 *and* P2 at every admission site
+        // (P1's reply alone proves only P1). Restarting both pods empties
+        // their deny maps, so K is admitted everywhere until the issuer
+        // re-sends; that gap is the exposure window, and it closes at the
+        // re-send: once one pod accepts it (fresh `jti`, same `until`), every
+        // pod denies K again at every site. A control key is never denied.
         #[tokio::test]
         #[ignore = "requires Redis"]
         async fn re_sent_disconnect_restores_the_deny_on_every_pod_after_restart() {
-            let key = nostr::Keys::generate().public_key();
-            let control = nostr::Keys::generate().public_key();
+            let key_keys = nostr::Keys::generate();
+            let control = nostr::Keys::generate();
+            let key = key_keys.public_key();
             let until = chrono::Utc::now().timestamp() + 300;
             let send = |pod: Arc<AppState>| async move {
                 let token = mint_token(&key.to_hex(), 0, serde_json::json!({ "until": until }));
@@ -3775,25 +3908,38 @@ mod route_integration_tests {
                 assert_eq!(&body[..], br#"{"disconnected": true}"#);
                 drain_publishes(&pod).await;
             };
-
             let [(p1, _), (p2, mut p2_seen)] = enforce_pair().await;
+            check(
+                [&p1, &p2],
+                [&key_keys, &control],
+                false,
+                "before the disconnect",
+            )
+            .await;
             send(Arc::clone(&p1)).await;
-            assert!(is_denied(&p1, &key), "P1 applies its own command");
             await_target(&mut p2_seen, &key).await;
-            assert!(is_denied(&p2, &key), "P2 applies P1's command");
-            assert!(!is_denied(&p1, &control) && !is_denied(&p2, &control));
+            check(
+                [&p1, &p2],
+                [&key_keys, &control],
+                true,
+                "after the disconnect",
+            )
+            .await;
 
-            // Restart: fresh pods, empty deny maps. K is accepted again
-            // until the re-send arrives.
+            // Restart: fresh pods, empty deny maps.
             let [(p1, mut p1_seen), (p2, mut p2_seen)] = enforce_pair().await;
-            assert!(!is_denied(&p1, &key) && !is_denied(&p2, &key));
+            check(
+                [&p1, &p2],
+                [&key_keys, &control],
+                false,
+                "restarted, before the re-send",
+            )
+            .await;
 
             send(Arc::clone(&p2)).await;
             await_target(&mut p1_seen, &key).await;
             await_target(&mut p2_seen, &key).await;
-            assert!(is_denied(&p1, &key), "P1 applies the re-send");
-            assert!(is_denied(&p2, &key), "P2 applies its own re-send");
-            assert!(!is_denied(&p1, &control) && !is_denied(&p2, &control));
+            check([&p1, &p2], [&key_keys, &control], true, "after the re-send").await;
         }
 
         // Pins finding 1 (replay half): shadow and enforce share one Redis

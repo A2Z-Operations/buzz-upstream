@@ -176,6 +176,24 @@ impl Clock for TokioClock {
     }
 }
 
+/// The staleness deadline of the snapshot an admission resolved against.
+/// Admission re-checks it after its own awaits, so a binding resolved just
+/// inside the two-minute limit cannot be admitted after it. Holds no map.
+#[derive(Clone)]
+pub struct FreshUntil {
+    clock: Arc<dyn Clock>,
+    deadline: Duration,
+}
+
+impl FreshUntil {
+    /// `authorization_unavailable` once the deadline has passed.
+    pub fn check(&self) -> Result<(), DenialClass> {
+        (self.clock.now() < self.deadline)
+            .then_some(())
+            .ok_or(DenialClass::AuthorizationUnavailable)
+    }
+}
+
 /// One published full load.
 struct Published {
     map: HashMap<String, Arc<CommunityBinding>>,
@@ -297,23 +315,23 @@ impl DatabaseResolver {
     pub async fn resolve(
         self: &Arc<Self>,
         raw_host: &str,
-    ) -> Result<Arc<CommunityBinding>, DenialClass> {
+    ) -> Result<(Arc<CommunityBinding>, FreshUntil), DenialClass> {
         const UNAVAILABLE: DenialClass = DenialClass::AuthorizationUnavailable;
         let host = normalize_host(raw_host);
         if !self.passes_prefilter(&host) {
             return Err(UNAVAILABLE);
         }
-        self.ensure_fresh()?;
+        let fresh = self.fresh_until()?;
         if let Some(binding) = self.lookup_in_memory(&host) {
-            return Ok(binding);
+            return Ok((binding, fresh));
         }
         if self.negatively_cached(&host) {
             return Err(UNAVAILABLE);
         }
         let outcome = self.miss(host).await;
-        self.ensure_fresh()?;
+        let fresh = self.fresh_until()?;
         match outcome {
-            Ok(Some(binding)) => Ok(binding),
+            Ok(Some(binding)) => Ok((binding, fresh)),
             Ok(None) | Err(()) => Err(UNAVAILABLE),
         }
     }
@@ -370,6 +388,11 @@ impl DatabaseResolver {
     /// leaves the staleness deadline where it was.
     pub async fn refresh(&self) -> Result<(), LoadFailure> {
         let started = self.clock.now();
+        // The attempt's absolute deadline. The timeout below only fires at an
+        // await; the synchronous map build and publication after the read
+        // check this instead, so expired work is never published.
+        let deadline = started + self.bounds.refresh_timeout;
+        let started_wall = std::time::SystemTime::now();
         let timer = std::time::Instant::now();
         let attempt = async {
             let after_snapshot: BoxFuture<'_, ()> = {
@@ -396,7 +419,7 @@ impl DatabaseResolver {
             let map = self.build_map(load.rows);
             #[cfg(test)]
             self.hooks.hit(hooks::REFRESH_BEFORE_PUBLISH).await;
-            self.publish(map, load.snapshot, started)?;
+            self.publish(map, load.snapshot, started, deadline)?;
             Ok(rows)
         };
         let result = match tokio::time::timeout(self.bounds.refresh_timeout, attempt).await {
@@ -408,7 +431,12 @@ impl DatabaseResolver {
         match result {
             Ok(rows) => {
                 metrics::gauge!("buzz_nip_fi_snapshot_rows").set(rows as f64);
-                self.record_age();
+                // A timestamp, not an age: it keeps aging at scrape time
+                // (`time() - ...`) even if the refresh task stops.
+                if let Ok(since_epoch) = started_wall.duration_since(std::time::UNIX_EPOCH) {
+                    metrics::gauge!("buzz_nip_fi_snapshot_loaded_timestamp_seconds")
+                        .set(since_epoch.as_secs_f64());
+                }
                 Ok(())
             }
             Err(failure) => {
@@ -418,7 +446,6 @@ impl DatabaseResolver {
                 );
                 metrics::counter!("buzz_nip_fi_snapshot_load_failures_total", "reason" => failure.label())
                     .increment(1);
-                self.record_age();
                 Err(failure)
             }
         }
@@ -460,13 +487,19 @@ impl DatabaseResolver {
         self.policy.is_suffix_host(host) && !self.policy.is_reserved(host)
     }
 
-    fn ensure_fresh(&self) -> Result<(), DenialClass> {
-        let fresh = self.published.load().as_ref().is_some_and(|published| {
-            self.clock.now().saturating_sub(published.loaded_at) < STALE_AFTER
-        });
-        fresh
-            .then_some(())
-            .ok_or(DenialClass::AuthorizationUnavailable)
+    /// The published snapshot's staleness deadline, if it has not passed.
+    fn fresh_until(&self) -> Result<FreshUntil, DenialClass> {
+        let fresh = FreshUntil {
+            clock: Arc::clone(&self.clock),
+            deadline: self
+                .published
+                .load()
+                .as_ref()
+                .map_or(Duration::ZERO, |published| {
+                    published.loaded_at + STALE_AFTER
+                }),
+        };
+        fresh.check().map(|()| fresh)
     }
 
     /// Snapshot, then overlay. Clones only the selected binding; each guard
@@ -528,8 +561,14 @@ impl DatabaseResolver {
         map: HashMap<String, Arc<CommunityBinding>>,
         snapshot: PgSnapshot,
         started: Duration,
+        deadline: Duration,
     ) -> Result<(), LoadFailure> {
         let mut writable = self.lock();
+        // Checked under the lock: waiting for it must not let an expired
+        // attempt publish.
+        if self.clock.now() >= deadline {
+            return Err(LoadFailure::Timeout);
+        }
         if self
             .published
             .load()
@@ -556,17 +595,6 @@ impl DatabaseResolver {
         metrics::gauge!("buzz_nip_fi_resolver_negative_cache_size").set(0.0);
         self.bump(&writable);
         Ok(())
-    }
-
-    fn record_age(&self) {
-        if let Some(published) = self.published.load().as_ref() {
-            metrics::gauge!("buzz_nip_fi_snapshot_age_seconds").set(
-                self.clock
-                    .now()
-                    .saturating_sub(published.loaded_at)
-                    .as_secs_f64(),
-            );
-        }
     }
 
     /// The bounded, single-flight miss lookup. A positive answer is returned

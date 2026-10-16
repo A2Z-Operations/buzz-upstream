@@ -16,13 +16,14 @@ use axum::http::{HeaderMap, Response};
 use buzz_auth::{DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion};
 
 use crate::nip_fi_core::{
-    evaluate_attached_assertion, http_denial, AssertionRejection, Communities,
+    evaluate_attached_assertion, http_denial, AdmissionDeadline, AssertionRejection, Communities,
 };
 
 /// Outcome of NIP-FI assertion validation at upgrade time.
 pub(crate) enum NipFiUpgradeOutcome {
-    /// Assertion validated successfully. Carry the result into the connection.
-    Admitted(VerifiedAssertion),
+    /// Assertion validated successfully. Carry the result into the connection,
+    /// with the deadline the upgrade re-checks after its tenant lookup.
+    Admitted(VerifiedAssertion, AdmissionDeadline),
     /// Off, or Shadow without a passing assertion — none is required.
     NotRequired,
     /// Shadow: the assertion passed and is only observed from here on.
@@ -32,16 +33,21 @@ pub(crate) enum NipFiUpgradeOutcome {
     Denied(Response<Body>),
 }
 
-/// The enforced and the shadow-observed assertion slots of an admitted upgrade.
-pub(crate) type UpgradeAssertions = (Option<VerifiedAssertion>, Option<VerifiedAssertion>);
+/// The enforced and the shadow-observed assertion slots of an admitted upgrade,
+/// and the deadline to re-check immediately before accepting the socket.
+pub(crate) type UpgradeAssertions = (
+    Option<VerifiedAssertion>,
+    Option<VerifiedAssertion>,
+    AdmissionDeadline,
+);
 
 impl NipFiUpgradeOutcome {
     /// The enforced and the shadow-observed assertion, or the denial response.
     pub(crate) fn into_assertions(self) -> Result<UpgradeAssertions, Box<Response<Body>>> {
         match self {
-            Self::NotRequired => Ok((None, None)),
-            Self::Admitted(assertion) => Ok((Some(assertion), None)),
-            Self::Observed(assertion) => Ok((None, Some(assertion))),
+            Self::NotRequired => Ok((None, None, AdmissionDeadline::default())),
+            Self::Admitted(assertion, deadline) => Ok((Some(assertion), None, deadline)),
+            Self::Observed(assertion) => Ok((None, Some(assertion), AdmissionDeadline::default())),
             Self::Denied(response) => Err(Box::new(response)),
         }
     }
@@ -106,7 +112,7 @@ pub(crate) async fn check_nip_fi_at_upgrade<'a>(
         Err(class) => return NipFiUpgradeOutcome::Denied(http_denial(class)),
     };
     match evaluate_attached_assertion(headers, &community, verifier) {
-        Ok(assertion) => NipFiUpgradeOutcome::Admitted(assertion),
+        Ok(assertion) => NipFiUpgradeOutcome::Admitted(assertion, community.deadline()),
         Err(rejection) => {
             if let AssertionRejection::Verifier(err) = rejection {
                 tracing::debug!(code = err.code(), "nip-fi assertion denied at upgrade");
@@ -582,7 +588,7 @@ mod tests {
         .now_or_never()
         .expect("env resolution never waits")
         {
-            NipFiUpgradeOutcome::Admitted(assertion) => {
+            NipFiUpgradeOutcome::Admitted(assertion, _) => {
                 assert_eq!(assertion.asserted_key(), None);
             }
             _ => panic!("claimless assertion must be admitted at upgrade"),
@@ -643,11 +649,11 @@ mod tests {
             .now_or_never()
             .expect("env resolution never waits")
         };
-        let Ok((None, Some(_))) = check().into_assertions() else {
+        let Ok((None, Some(_), _)) = check().into_assertions() else {
             panic!("a passing shadow assertion is observed, never enforced");
         };
         assert_eq!(verifier.calls(), 1, "shadow must evaluate the assertion");
-        let Ok((None, None)) = check_nip_fi_at_upgrade(
+        let Ok((None, None, _)) = check_nip_fi_at_upgrade(
             ROOT,
             &host_headers(),
             &communities(),

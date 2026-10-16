@@ -69,6 +69,48 @@ pub(crate) fn resolve_community<'a>(
         .ok_or(DenialClass::AuthorizationUnavailable)
 }
 
+/// A community resolved for one enforce admission.
+#[derive(Clone)]
+pub(crate) struct ResolvedCommunity {
+    binding: std::sync::Arc<CommunityBinding>,
+    deadline: AdmissionDeadline,
+}
+
+impl ResolvedCommunity {
+    /// A shadow lookup: observed only, never admitted, so no deadline.
+    pub(crate) fn observed(binding: std::sync::Arc<CommunityBinding>) -> Self {
+        Self {
+            binding,
+            deadline: AdmissionDeadline::default(),
+        }
+    }
+
+    /// The deadline admission must re-check after its own awaits.
+    pub(crate) fn deadline(&self) -> AdmissionDeadline {
+        self.deadline.clone()
+    }
+}
+
+impl std::ops::Deref for ResolvedCommunity {
+    type Target = CommunityBinding;
+    fn deref(&self) -> &CommunityBinding {
+        &self.binding
+    }
+}
+
+/// The point past which admitting on a resolved community is
+/// `authorization_unavailable`: the database snapshot's staleness deadline.
+/// A static `env` binding never goes stale.
+#[derive(Clone, Default)]
+pub(crate) struct AdmissionDeadline(Option<crate::nip_fi_resolver::FreshUntil>);
+
+impl AdmissionDeadline {
+    /// Run immediately before admitting.
+    pub(crate) fn check(&self) -> Result<(), DenialClass> {
+        self.0.as_ref().map_or(Ok(()), |fresh| fresh.check())
+    }
+}
+
 /// The relay's community source (`BUZZ_NIP_FI_COMMUNITY_SOURCE`): the
 /// static `env` map, or the database resolver.
 #[derive(Clone, Copy)]
@@ -84,15 +126,20 @@ impl Communities<'_> {
     pub(crate) async fn resolve(
         self,
         headers: &HeaderMap,
-    ) -> Result<std::sync::Arc<CommunityBinding>, DenialClass> {
+    ) -> Result<ResolvedCommunity, DenialClass> {
         match self {
-            Self::Env(map) => {
-                resolve_community(headers, map).map(|b| std::sync::Arc::new(b.clone()))
+            Self::Env(map) => resolve_community(headers, map).map(|b| ResolvedCommunity {
+                binding: std::sync::Arc::new(b.clone()),
+                deadline: AdmissionDeadline::default(),
+            }),
+            Self::Database(resolver) => {
+                let host = request_host(headers).ok_or(DenialClass::AuthorizationUnavailable)?;
+                let (binding, fresh) = resolver.resolve(host).await?;
+                Ok(ResolvedCommunity {
+                    binding,
+                    deadline: AdmissionDeadline(Some(fresh)),
+                })
             }
-            Self::Database(resolver) => match request_host(headers) {
-                Some(host) => resolver.resolve(host).await,
-                None => Err(DenialClass::AuthorizationUnavailable),
-            },
         }
     }
 

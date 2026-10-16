@@ -10,6 +10,7 @@ use std::time::Duration;
 use buzz_auth::{DenialClass, ProvisionBindingPolicy};
 use buzz_db::{NipFiSnapshotLoad, PgSnapshot, RowCapExceeded};
 use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::StreamExt;
 
 use super::hooks::{
     CREATION_BEFORE_OVERLAY, MISS_AFTER_READ, REFRESH_AFTER_SNAPSHOT, REFRESH_BEFORE_PUBLISH,
@@ -57,6 +58,8 @@ struct FakeStore {
     fail_loads: std::sync::atomic::AtomicBool,
     lookup_fails: std::sync::atomic::AtomicBool,
     loads: AtomicUsize,
+    /// Rows the last load pulled from its stream.
+    rows_pulled: Arc<AtomicUsize>,
     lookups: Mutex<Vec<String>>,
     lookup_delay: Mutex<Duration>,
     load_delay: Mutex<Duration>,
@@ -70,6 +73,7 @@ impl FakeStore {
             fail_loads: false.into(),
             lookup_fails: false.into(),
             loads: AtomicUsize::new(0),
+            rows_pulled: Arc::default(),
             lookups: Mutex::new(Vec::new()),
             lookup_delay: Mutex::new(Duration::ZERO),
             load_delay: Mutex::new(Duration::ZERO),
@@ -123,10 +127,15 @@ impl BindingSource for FakeStore {
                 .iter()
                 .map(|h| (h.clone(), ISS.to_owned()))
                 .collect();
-            if rows.len() > max_rows {
-                return Ok(Err(RowCapExceeded(max_rows)));
-            }
-            Ok(Ok(NipFiSnapshotLoad { snapshot, rows }))
+            // Streamed through the production cap, counting every pull.
+            let pulled = Arc::clone(&self.rows_pulled);
+            pulled.store(0, Ordering::SeqCst);
+            let stream = futures_util::stream::iter(rows).map(move |row| {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, String>(row)
+            });
+            let rows = buzz_db::collect_capped(stream, max_rows).await?;
+            Ok(rows.map(|rows| NipFiSnapshotLoad { snapshot, rows }))
         }
         .boxed()
     }
@@ -290,6 +299,54 @@ async fn timed_out_refresh_publishes_nothing_and_keeps_the_deadline() {
     assert_eq!(f.resolve("a").await, UNAVAILABLE);
 }
 
+// Criterion 3 (publication bound): a deadline that passes during the
+// synchronous build/publish tail fails the attempt. The manual clock moves
+// while tokio time does not, so only the attempt deadline can catch it.
+#[tokio::test]
+async fn refresh_whose_deadline_passes_before_publication_publishes_nothing() {
+    let f = fixture(&["a"]);
+    f.resolver.refresh().await.unwrap();
+    f.store.remove("a");
+    f.clock.set(secs(30.0));
+    let gate = f.resolver.hooks.arm(REFRESH_BEFORE_PUBLISH);
+    let refresh = tokio::spawn({
+        let resolver = Arc::clone(&f.resolver);
+        async move { resolver.refresh().await }
+    });
+    gate.reached().await;
+    f.clock.set(secs(40.0));
+    gate.release();
+    assert_eq!(refresh.await.unwrap(), Err(LoadFailure::Timeout));
+    assert_eq!(f.resolve("a").await, Ok(()), "old map retained");
+    f.clock.set(secs(120.0));
+    assert_eq!(f.resolve("a").await, UNAVAILABLE, "old deadline retained");
+}
+
+// Criterion 17: the load streams through `collect_capped`, which stops at
+// cap + 1 rows; a loaded snapshot survives an over-cap refresh unchanged.
+#[tokio::test]
+async fn over_cap_refresh_stops_streaming_and_keeps_the_loaded_snapshot() {
+    let f = fixture_with(
+        &["a", "b"],
+        ResolverBounds {
+            snapshot_max_rows: 2,
+            ..ResolverBounds::default()
+        },
+    );
+    f.resolver.refresh().await.unwrap();
+    for label in ["c", "d", "e", "f"] {
+        f.store.add(label);
+    }
+    f.store.remove("b");
+    f.clock.set(secs(60.0));
+    assert_eq!(f.resolver.refresh().await, Err(LoadFailure::OverCap));
+    assert_eq!(f.store.rows_pulled.load(Ordering::SeqCst), 3, "cap + 1");
+    assert_eq!(f.resolve("b").await, Ok(()), "old map retained");
+    assert_eq!(f.store.lookups_for("b"), 0);
+    f.clock.set(secs(120.0));
+    assert_eq!(f.resolve("a").await, UNAVAILABLE, "old deadline retained");
+}
+
 #[tokio::test]
 async fn failed_miss_lookup_denies_and_stores_no_negative_entry() {
     let f = fixture(&["a"]);
@@ -364,27 +421,47 @@ async fn overlay_entry_created_after_refresh_snapshot_survives_until_a_snapshot_
 
 #[tokio::test(start_paused = true)]
 async fn unbinding_after_a_snapshot_is_enforced_within_forty_seconds() {
-    let f = fixture(&["a", "gone"]);
-    f.resolver.refresh().await.unwrap();
-    f.store.remove("gone");
-    // Next refresh starts at +30s and is held for just under its 10s limit.
-    f.clock.set(secs(30.0));
-    let gate = f.resolver.hooks.arm(REFRESH_BEFORE_PUBLISH);
-    let refresh = tokio::spawn({
-        let resolver = Arc::clone(&f.resolver);
-        async move { resolver.refresh().await }
-    });
-    gate.reached().await;
-    tokio::time::advance(Duration::from_millis(9_900)).await;
-    f.clock.set(secs(39.9));
+    // The production scheduler on the tokio clock: refresh at +30s, its
+    // read held for just under the 10s limit.
+    let store = FakeStore::new(&["a", "gone"]);
+    let resolver = Arc::new(DatabaseResolver::new(
+        Arc::clone(&store) as Arc<dyn BindingSource>,
+        policy(),
+        vec![ISS.to_owned()],
+        ResolverBounds::default(),
+    ));
+    let resolve = |label: &str| {
+        let resolver = Arc::clone(&resolver);
+        let host = host(label);
+        async move { resolver.resolve(&host).await.map(drop) }
+    };
+    resolver.refresh().await.unwrap();
+    store.remove("gone");
+    *store.load_delay.lock().unwrap() = Duration::from_millis(9_900);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let refresh_loop = tokio::spawn(Arc::clone(&resolver).run_refresh_loop(cancel.clone()));
+    tokio::task::yield_now().await; // the loop arms its schedule at t=0
+
+    // Step the paused clock so the loop wakes on its +30s tick.
+    tokio::time::advance(REFRESH_INTERVAL).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(9_800)).await;
     assert_eq!(
-        f.resolve("gone").await,
+        resolve("gone").await,
         Ok(()),
-        "still resolves before publish"
+        "before the refresh publishes"
     );
-    gate.release();
-    refresh.await.unwrap().unwrap();
-    assert_eq!(f.resolve("gone").await, UNAVAILABLE);
+    // +39.9s: the held read returns and publishes inside its deadline.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(resolve("gone").await, UNAVAILABLE, "removed by +40s");
+    assert_eq!(resolve("a").await, Ok(()));
+    cancel.cancel();
+    refresh_loop.await.unwrap();
 }
 
 // ── Criterion 15: creation vs refresh, serialized publication ──────────────
@@ -634,7 +711,7 @@ async fn old_snapshot_maps_are_dropped_while_admissions_keep_their_bindings() {
     assert_eq!(alive, 0, "only the published map is alive");
     assert!(held
         .iter()
-        .all(|b| b.expected_aud() == "https://a.communities.buzz.xyz"));
+        .all(|b| b.0.expected_aud() == "https://a.communities.buzz.xyz"));
 }
 
 // ── Pre-filter ──────────────────────────────────────────────────────────────

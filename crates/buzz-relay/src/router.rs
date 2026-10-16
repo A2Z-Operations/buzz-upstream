@@ -193,7 +193,9 @@ async fn nip_fi_assertion_guard(
     // binding to the handler's admission, so a request costs one resolution.
     let communities = state.nip_fi_communities();
     let community = if mode.observes_only() {
-        communities.resolve_from_memory(request.headers())
+        communities
+            .resolve_from_memory(request.headers())
+            .map(crate::nip_fi_core::ResolvedCommunity::observed)
     } else {
         communities.resolve(request.headers()).await
     };
@@ -648,7 +650,7 @@ async fn nip11_or_ws_handler(
     //
     // Keying on the header pair (not on `Accept`) means an HTML Accept header
     // on a real WS upgrade is still gated correctly.
-    let (upgrade_checked, nip_fi_assertion, shadow_assertion) = {
+    let (upgrade_checked, nip_fi_assertion, shadow_assertion, nip_fi_deadline) = {
         let is_h1_ws_upgrade = headers
             .get(axum::http::header::UPGRADE)
             .and_then(|v| v.to_str().ok())
@@ -680,14 +682,14 @@ async fn nip11_or_ws_handler(
                 .await
                 .into_assertions()
             {
-                Ok((assertion, shadow)) => (true, assertion, shadow),
+                Ok((assertion, shadow, deadline)) => (true, assertion, shadow, deadline),
                 Err(resp) => return (*resp).into_response(),
             }
         } else {
             // Not a WS upgrade shape — a NIP-11 request or a plain browser GET.
             // The `Ok(ws)` arm below backstops any extractor-accepted shape this
             // predicate misses. [F3-H2-GATE]
-            (false, None, None)
+            (false, None, None, Default::default())
         }
     };
 
@@ -743,6 +745,11 @@ async fn nip11_or_ws_handler(
                 .into_response();
         }
     };
+    // The tenant lookup awaited since the community resolved; a snapshot
+    // that went stale meanwhile accepts no socket.
+    if let Err(class) = nip_fi_deadline.check() {
+        return http_denial(class).into_response();
+    }
 
     let max_frame_bytes = state.config.max_frame_bytes;
 
@@ -765,11 +772,12 @@ async fn nip11_or_ws_handler(
                 let mode = state.config.nip_fi.mode;
                 let verifier = state.nip_fi_verifier.as_deref();
                 let communities = state.nip_fi_communities();
+                // Resolved after every await of this upgrade: nothing to re-check.
                 match check_nip_fi_at_upgrade(Root, &headers, communities, verifier, mode)
                     .await
                     .into_assertions()
                 {
-                    Ok(assertions) => assertions,
+                    Ok((assertion, shadow, _deadline)) => (assertion, shadow),
                     Err(resp) => return (*resp).into_response(),
                 }
             } else {

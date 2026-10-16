@@ -655,4 +655,47 @@ mod postgres_tests {
         assert!(admission(&db, &foreign, &issuers()).await.is_empty());
         assert!(!snapshot_hosts(&db, &issuers()).await.contains(&foreign));
     }
+
+    async fn inserting_xid(db: &Db, host: &str) -> u64 {
+        sqlx::query_scalar::<_, String>(
+            "SELECT b.xmin::text FROM community_nip_fi_issuers b \
+             JOIN communities c ON c.id = b.community_id WHERE c.host = $1",
+        )
+        .bind(host)
+        .fetch_one(&db.pool)
+        .await
+        .expect("binding xmin")
+        .parse()
+        .expect("xid")
+    }
+
+    // Criterion 15 (real SQL): a creation committed after the load records
+    // its snapshot but before the scan is absent from the rows, and the
+    // recorded snapshot reports it invisible, so the overlay keeps it. A
+    // creation committed before the snapshot is in both. Weakening the
+    // transaction to READ COMMITTED puts the late row in the scan.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn snapshot_excludes_creations_committed_after_it_is_recorded() {
+        let db = setup_db().await;
+        let early = unique_host("early");
+        let late = unique_host("late");
+        db.ensure_configured_community_with_nip_fi_issuers(&early, &issuers())
+            .await
+            .expect("seed early");
+        let load = db
+            .load_nip_fi_binding_snapshot(&issuers(), 100_000, async {
+                db.ensure_configured_community_with_nip_fi_issuers(&late, &issuers())
+                    .await
+                    .expect("seed late");
+            })
+            .await
+            .expect("snapshot")
+            .expect("under cap");
+        let hosts: Vec<_> = load.rows.iter().map(|(host, _)| host).collect();
+        assert!(hosts.contains(&&early));
+        assert!(!hosts.contains(&&late), "late creation must not be scanned");
+        assert!(load.snapshot.is_visible(inserting_xid(&db, &early).await));
+        assert!(!load.snapshot.is_visible(inserting_xid(&db, &late).await));
+    }
 }
