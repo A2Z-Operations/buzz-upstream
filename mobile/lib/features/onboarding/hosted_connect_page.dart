@@ -3,6 +3,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/hosted/hosted_flow.dart';
+import 'hosted_community_selection.dart';
 import '../../shared/hosted/hosted_flow_problem_message.dart';
 import '../../shared/utils/string_utils.dart';
 import '../../shared/theme/grid.dart';
@@ -24,7 +25,14 @@ class HostedConnectPage extends HookConsumerWidget {
     final working = flow.stage == HostedFlowStage.working;
     final message = switch (flow.stage) {
       HostedFlowStage.idle => 'Continue connecting your account.',
-      HostedFlowStage.working => 'Connecting your account…',
+      HostedFlowStage.working =>
+        flow.addingCommunityName == null
+            ? 'Securing your account and finding communities…'
+            : 'Adding ${flow.addingCommunityName}…',
+      HostedFlowStage.chooseCommunities =>
+        flow.communities.isEmpty
+            ? 'No active owned communities yet. Create one in Builderlab, then refresh, or enter a community link.'
+            : 'Choose your communities',
       HostedFlowStage.chooseIdentity =>
         flow.identityChoices.any((choice) => choice.fromCloud)
             ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
@@ -77,10 +85,19 @@ class HostedConnectPage extends HookConsumerWidget {
                           ),
                         ),
                       ),
+                    if (flow.stage == HostedFlowStage.chooseCommunities)
+                      HostedCommunitySelection(flow: flow),
+                    if (flow.stage == HostedFlowStage.blocked &&
+                        flow.addedCommunityCount > 0)
+                      Text(
+                        '${flow.addedCommunityCount} communities added. '
+                        'They have been kept; retry continues the remaining additions.',
+                      ),
                     if (working)
                       const Center(child: CircularProgressIndicator()),
                     if (!working &&
                         flow.stage != HostedFlowStage.chooseIdentity &&
+                        flow.stage != HostedFlowStage.chooseCommunities &&
                         flow.stage != HostedFlowStage.complete &&
                         flow.stage != HostedFlowStage.browserReturned &&
                         flow.canRetry)

@@ -31,8 +31,7 @@ class OnboardingAppEntry extends HookConsumerWidget {
         flow.accountOnly &&
         (flow.stage == HostedFlowStage.working ||
             flow.stage == HostedFlowStage.signIn);
-    final connected =
-        flow.accountOnly && flow.stage == HostedFlowStage.complete;
+    final connected = flow.account.account != null;
     final problem = flow.accountOnly ? flow.problem : null;
     final status = connected
         ? 'Connected to Builderlab. Your session is saved securely on this device.'
@@ -64,12 +63,10 @@ class OnboardingAppEntry extends HookConsumerWidget {
         existingUser: existingUser.value,
         enteringCommunityLink: enteringCommunityLink.value,
         onCommunityLink: () => enteringCommunityLink.value = true,
-        onBuilderlab: busy || connected
-            ? null
-            : () => unawaited(flow.signInAccount()),
+        onBuilderlab: busy ? null : () => unawaited(flow.signInAccount()),
         accountStatus: status,
         builderlabLabel: connected
-            ? 'Connected to Builderlab'
+            ? 'Continue with Builderlab'
             : busy
             ? 'Signing in…'
             : 'Connect to Builderlab',

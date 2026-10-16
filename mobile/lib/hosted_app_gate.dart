@@ -112,7 +112,6 @@ class HostedAppGate extends HookConsumerWidget {
     }, [flow]);
     final inlineEntry = ref.watch(hostedInlineEntryProvider);
     final visible =
-        !flow.accountOnly &&
         flow.stage != HostedFlowStage.idle &&
         flow.stage != HostedFlowStage.complete;
     return DeepLinkDispatcher(
@@ -198,7 +197,9 @@ class HostedAppGate extends HookConsumerWidget {
         children: [
           child,
           if (visible &&
-              (!inlineEntry || flow.stage == HostedFlowStage.chooseIdentity))
+              (!inlineEntry ||
+                  flow.accountOnly ||
+                  flow.stage == HostedFlowStage.chooseIdentity))
             HostedConnectPage(
               flow: flow,
               onClose: () => unawaited(flow.leave()),

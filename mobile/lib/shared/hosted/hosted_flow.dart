@@ -12,6 +12,7 @@ import 'hosted_identity_service.dart';
 import 'hosted_backup_service.dart';
 import 'hpke_backup.dart';
 import 'hosted_environment.dart';
+import 'hosted_communities.dart';
 import 'web_connect_binding.dart';
 
 enum HostedFlowStage {
@@ -19,6 +20,7 @@ enum HostedFlowStage {
   working,
   signIn,
   chooseIdentity,
+  chooseCommunities,
   blocked,
   browserReturned,
   complete,
@@ -76,6 +78,12 @@ class HostedFlow extends ChangeNotifier {
   List<DeviceIdentityChoice> identityChoices = const [];
   BuzzDeepLink? _target;
   bool accountOnly = false;
+  List<AddCommunityDeepLink> communities = const [];
+  Set<String> selectedRelays = const {};
+  final Set<String> _addedRelays = {};
+  bool _addingCommunities = false;
+  String? addingCommunityName;
+  int get addedCommunityCount => _addedRelays.length;
   Future<void> _tail = Future.value();
   StreamSubscription<BrowserAuthCode>? _codes;
   StreamSubscription<BrowserAuthFailure>? _failures;
@@ -96,8 +104,7 @@ class HostedFlow extends ChangeNotifier {
           _set(HostedFlowStage.working);
           await account.exchange(code: code.code, verifier: code.verifier);
           if (_disposed || generation != _generation) return;
-          await browser.clearIntent();
-          _set(HostedFlowStage.complete);
+          await _continue(generation);
           return;
         }
         accountOnly = false;
@@ -155,7 +162,8 @@ class HostedFlow extends ChangeNotifier {
     });
   }
 
-  /// Account setup only: never resolve or generate a Nostr identity here.
+  /// Explicit Connect completes identity setup and discovers owned communities.
+  /// Passive startup restore only checks the saved session.
   Future<void> signInAccount({bool openBrowser = true}) {
     if (_target != null ||
         stage == HostedFlowStage.working ||
@@ -165,24 +173,27 @@ class HostedFlow extends ChangeNotifier {
     final generation = openBrowser ? ++_generation : _generation;
     if (openBrowser) {
       accountOnly = true;
+      communities = const [];
+      selectedRelays = const {};
+      _addedRelays.clear();
+      _addingCommunities = false;
+      addingCommunityName = null;
       _set(HostedFlowStage.working);
     }
     return _enqueue(() async {
       if (!openBrowser) {
         if (_target != null || stage != HostedFlowStage.idle) return;
-        accountOnly = true;
-        _set(HostedFlowStage.working);
       }
       final restored = await account.restore();
       if (_disposed || generation != _generation) return;
-      if (restored != null) {
-        await browser.clearIntent();
-        _set(HostedFlowStage.complete);
-      } else if (openBrowser) {
+      if (!openBrowser) {
+        // Mounting the welcome page must not create/bind/back up a key.
+        _set(HostedFlowStage.idle);
+      } else if (restored != null) {
+        await _continue(generation);
+      } else {
         _set(HostedFlowStage.signIn);
         await browser.start({'type': 'account'});
-      } else {
-        _set(HostedFlowStage.idle);
       }
     });
   }
@@ -213,11 +224,26 @@ class HostedFlow extends ChangeNotifier {
 
   Future<void> retry() async {
     final target = _target;
-    if (target == null) return;
+    if (target == null && !accountOnly) return;
     final generation = ++_generation;
     try {
       await browser.cancel();
-      if (!_disposed && generation == _generation) await start(target);
+      if (_disposed || generation != _generation) return;
+      if (target != null) {
+        await start(target);
+      } else {
+        _set(HostedFlowStage.working);
+        await _enqueue(() async {
+          final restored = await account.restore();
+          if (_disposed || generation != _generation) return;
+          if (restored == null) {
+            _set(HostedFlowStage.signIn);
+            await browser.start({'type': 'account'});
+          } else {
+            await _continue(generation);
+          }
+        });
+      }
     } catch (_) {
       if (!_disposed && generation == _generation) {
         _set(HostedFlowStage.blocked, HostedFlowProblem.retry);
@@ -227,7 +253,7 @@ class HostedFlow extends ChangeNotifier {
 
   /// Resume only an offered public identity; reread local and cloud facts first.
   Future<void> chooseIdentity(String pubkey) {
-    if (_target == null ||
+    if ((_target == null && !accountOnly) ||
         stage != HostedFlowStage.chooseIdentity ||
         !identityChoices.any((item) => item.pubkey == pubkey)) {
       return Future.value();
@@ -240,8 +266,10 @@ class HostedFlow extends ChangeNotifier {
   Future<void> _continue(int generation, {String? selectedPubkey}) async {
     final target = _target;
     final session = account.account;
-    if (target == null || session == null) throw AccountFailure.signedOut;
-    if (!_acceptTarget(target)) return;
+    if ((target == null && !accountOnly) || session == null) {
+      throw AccountFailure.signedOut;
+    }
+    if (target != null && !_acceptTarget(target)) return;
     var resolved = await identity.resolve(
       isCurrent: () => !_disposed && generation == _generation,
       selectedPubkey: selectedPubkey,
@@ -338,6 +366,10 @@ class HostedFlow extends ChangeNotifier {
       _set(HostedFlowStage.blocked, failure);
       return;
     }
+    if (target == null) {
+      await _continueCommunities(generation, session.subject, pubkey);
+      return;
+    }
     await enterCommunity(
       target,
       session.subject,
@@ -347,6 +379,89 @@ class HostedFlow extends ChangeNotifier {
     if (generation != _generation || _disposed) return;
     await browser.clearIntent();
     _set(HostedFlowStage.complete);
+  }
+
+  void selectCommunity(String relay, bool selected) {
+    if (stage != HostedFlowStage.chooseCommunities ||
+        !communities.any((item) => item.relayUrl == relay)) {
+      return;
+    }
+    selectedRelays = Set.unmodifiable({
+      ...selectedRelays.where((item) => item != relay),
+      if (selected) relay,
+    });
+    notifyListeners();
+  }
+
+  Future<void> addSelectedCommunities() {
+    if (!accountOnly ||
+        stage != HostedFlowStage.chooseCommunities ||
+        selectedRelays.isEmpty) {
+      return Future.value();
+    }
+    _addingCommunities = true;
+    final generation = ++_generation;
+    _set(HostedFlowStage.working);
+    return _enqueue(() => _continue(generation));
+  }
+
+  Future<void> refreshCommunities() {
+    if (!accountOnly || stage != HostedFlowStage.chooseCommunities) {
+      return Future.value();
+    }
+    return retry();
+  }
+
+  Future<void> openCommunityCreation() async {
+    if (stage != HostedFlowStage.chooseCommunities) return;
+    final generation = _generation;
+    try {
+      if (!await _openWeb(HostedEnvironment.origin.resolve('/buzz'))) {
+        throw BrowserAuthFailure.unavailable;
+      }
+    } catch (error) {
+      if (!_disposed && generation == _generation) {
+        _set(HostedFlowStage.blocked, _problemFor(error));
+      }
+    }
+  }
+
+  Future<void> _continueCommunities(
+    int generation,
+    String subject,
+    String pubkey,
+  ) async {
+    bool current() =>
+        !_disposed &&
+        generation == _generation &&
+        account.account?.subject == subject;
+    if (!_addingCommunities) {
+      final listed = await loadHostedCommunities(account);
+      if (!current()) return;
+      communities = listed;
+      selectedRelays = Set.unmodifiable(listed.map((item) => item.relayUrl));
+      if (listed.length != 1) {
+        _set(HostedFlowStage.chooseCommunities);
+        return;
+      }
+      _addingCommunities = true;
+    }
+    for (final community in communities) {
+      if (!current()) return;
+      if (!selectedRelays.contains(community.relayUrl) ||
+          _addedRelays.contains(community.relayUrl)) {
+        continue;
+      }
+      addingCommunityName = community.name;
+      notifyListeners();
+      await enterCommunity(community, subject, pubkey, current);
+      if (!current()) return;
+      _addedRelays.add(community.relayUrl);
+    }
+    if (!current()) return;
+    addingCommunityName = null;
+    await browser.clearIntent();
+    if (current()) _set(HostedFlowStage.complete);
   }
 
   bool _acceptTarget(BuzzDeepLink target) {
@@ -437,6 +552,12 @@ class HostedFlow extends ChangeNotifier {
     ++_generation;
     final generation = _generation;
     _target = null;
+    accountOnly = false;
+    communities = const [];
+    selectedRelays = const {};
+    _addedRelays.clear();
+    _addingCommunities = false;
+    addingCommunityName = null;
     try {
       await browser.cancel();
       if (_disposed || generation != _generation) return;
