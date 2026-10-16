@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import ImageIO
-import P256K
+@_implementationOnly import P256K
 import UniformTypeIdentifiers
 
 /// Fetches an avatar with the extension's private HTTP cache and bounded native decoding.

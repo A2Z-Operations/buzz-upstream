@@ -186,6 +186,8 @@ jobs:
       - name: Build
         if: matrix.lane == 'native'
         run: swift build --package-path mobile/ios/BuzzPushKit
+      - name: Test pinned Swift plugin approval
+        run: ruby scripts/test-swift-plugin-trust.rb
       - name: Build release
         if: matrix.lane == 'native'
         run: swift build -c release --package-path mobile/ios/BuzzPushKit
