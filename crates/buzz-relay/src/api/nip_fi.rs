@@ -3773,38 +3773,53 @@ mod route_integration_tests {
             pods.try_into().unwrap_or_else(|_| unreachable!())
         }
 
-        /// Whether `key`'s login is denied on `pod` at each admission site:
-        /// the root upgrade, the audio session's deny-set check (audio denies
-        /// after NIP-42, not at upgrade), and protected HTTP admission. A root
-        /// upgrade that clears NIP-FI ends at tenant binding.
-        #[allow(clippy::result_large_err)] // the NIP-98 closure returns the production `Response` error type
-        async fn denied_at_every_site(pod: &Arc<AppState>, key: &nostr::Keys) -> [bool; 3] {
+        /// A login assertion for `key`, minted once and replayed as the same
+        /// bytes: the retained pre-revocation assertion of criterion 10.
+        fn retained_assertion(key: &nostr::Keys) -> String {
             use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
             let now = chrono::Utc::now().timestamp();
             let claims = serde_json::json!({
                 "iss": TEST_ISS, "aud": TEST_AUD, "sub": "restart-test",
-                "iat": now, "exp": now + 300, "nostr_pubkey": key.public_key().to_hex(),
+                "iat": now, "exp": now + 600, "nostr_pubkey": key.public_key().to_hex(),
             });
             let mut header = Header::new(Algorithm::ES256);
             header.typ = Some("nip-fi+jwt".to_owned());
             header.kid = Some(TEST_KID.to_owned());
             let signing = EncodingKey::from_ec_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap();
-            let token = encode(&header, &claims, &signing).unwrap();
-            let raw_host = format!("restart-{}.example", uuid::Uuid::new_v4().simple());
-            let denied = |status: StatusCode, body: &[u8]| {
-                let cleared = status == StatusCode::NOT_FOUND;
-                assert!(
-                    cleared
-                        || (status, body)
-                            == (StatusCode::FORBIDDEN, &b"authorization denied\n"[..]),
-                    "unexpected outcome {status}: {}",
+            encode(&header, &claims, &signing).unwrap()
+        }
+
+        /// Whether `token` (a retained assertion for `key`) is denied at
+        /// `host` on `pod` at each admission site, each with a fresh proof of
+        /// possession of `key`:
+        /// - root: the WebSocket upgrade. A deny is the 403 deny body at
+        ///   upgrade, before any session. An upgrade that clears NIP-FI ends
+        ///   at tenant binding with 404 (this host has no community), so it
+        ///   counts as "not denied by NIP-FI", not as a completed session.
+        /// - audio: a completed NIP-42 session, denied or passed at its
+        ///   post-authentication deny-set check.
+        /// - HTTP: protected-route admission with a NIP-98 proof.
+        #[allow(clippy::result_large_err)] // the NIP-98 closure returns the production `Response` error type
+        async fn denied_at_every_site(
+            pod: &Arc<AppState>,
+            key: &nostr::Keys,
+            host: &str,
+            token: &str,
+        ) -> [bool; 3] {
+            let root_denied = |status: StatusCode, body: &[u8]| match status {
+                StatusCode::FORBIDDEN => {
+                    assert_eq!(body, b"authorization denied\n", "root deny body");
+                    true
+                }
+                StatusCode::NOT_FOUND => false,
+                other => panic!(
+                    "unexpected root upgrade outcome {other}: {}",
                     String::from_utf8_lossy(body)
-                );
-                !cleared
+                ),
             };
 
             let request = Request::get("/")
-                .header(axum::http::header::HOST, &raw_host)
+                .header(axum::http::header::HOST, host)
                 .header("Upgrade", "websocket")
                 .header("Connection", "Upgrade")
                 .header("Sec-WebSocket-Version", "13")
@@ -3820,20 +3835,15 @@ mod route_integration_tests {
             let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
                 .await
                 .unwrap();
-            let root = denied(status, &body);
+            let root = root_denied(status, &body);
 
-            let binding = pod
-                .config
-                .nip_fi
-                .communities
-                .resolve(&raw_host)
-                .expect("served");
+            let binding = pod.config.nip_fi.communities.resolve(host).expect("served");
             let assertion = pod
                 .nip_fi_verifier
                 .as_deref()
                 .expect("verifier")
-                .verify_assertion(&token, binding)
-                .expect("valid assertion");
+                .verify_assertion(token, binding)
+                .expect("the retained assertion is still valid");
             let audio = crate::audio::handler::test_support::deny_set_refuses(
                 Arc::clone(pod),
                 assertion,
@@ -3842,7 +3852,7 @@ mod route_integration_tests {
             .await;
 
             let mut headers = axum::http::HeaderMap::new();
-            headers.insert(axum::http::header::HOST, raw_host.parse().unwrap());
+            headers.insert(axum::http::header::HOST, host.parse().unwrap());
             headers.insert(
                 "Nostr-Federated-Identity",
                 format!("Bearer {token}").parse().unwrap(),
@@ -3857,49 +3867,80 @@ mod route_integration_tests {
                 Err(resp) => {
                     let status = resp.status();
                     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-                    assert!(denied(status, &body), "HTTP denial is the deny body");
+                    assert_eq!(
+                        (status, &body[..]),
+                        (StatusCode::FORBIDDEN, &b"authorization denied\n"[..]),
+                        "HTTP denial is the deny body"
+                    );
                     true
                 }
             };
             [root, audio, http]
         }
 
-        /// Asserts K's denial on every pod and site matches `key_denied`, and
-        /// that the control key is admitted everywhere.
+        /// A key with its retained assertion for each of the two communities.
+        struct Retained {
+            keys: nostr::Keys,
+            assertions: [(String, String); 2],
+        }
+
+        impl Retained {
+            fn mint(hosts: &[String; 2]) -> Self {
+                let keys = nostr::Keys::generate();
+                let assertions = hosts.clone().map(|host| {
+                    let token = retained_assertion(&keys);
+                    (host, token)
+                });
+                Self { keys, assertions }
+            }
+        }
+
+        /// Asserts K's retained assertions are denied on every pod, community
+        /// and site exactly when `key_denied`, and the control key's never.
         async fn check(
             pods: [&Arc<AppState>; 2],
-            [key, control]: [&nostr::Keys; 2],
+            [key, control]: [&Retained; 2],
             key_denied: bool,
             phase: &str,
         ) {
             for (n, pod) in pods.into_iter().enumerate() {
                 let pod_name = n + 1;
-                assert_eq!(
-                    denied_at_every_site(pod, key).await,
-                    [key_denied; 3],
-                    "{phase}: K on P{pod_name}"
-                );
-                assert_eq!(
-                    denied_at_every_site(pod, control).await,
-                    [false; 3],
-                    "{phase}: control on P{pod_name}"
-                );
+                for (who, retained, expected) in
+                    [("K", key, key_denied), ("control", control, false)]
+                {
+                    for (host, token) in &retained.assertions {
+                        assert_eq!(
+                            denied_at_every_site(pod, &retained.keys, host, token).await,
+                            [expected; 3],
+                            "{phase}: {who} at {host} on P{pod_name} [root, audio, HTTP]"
+                        );
+                    }
+                }
             }
         }
 
-        // Plan criterion 10: restart recovery across pods. A disconnect sent
-        // to P1 denies K's logins on P1 *and* P2 at every admission site
-        // (P1's reply alone proves only P1). Restarting both pods empties
-        // their deny maps, so K is admitted everywhere until the issuer
-        // re-sends; that gap is the exposure window, and it closes at the
-        // re-send: once one pod accepts it (fresh `jti`, same `until`), every
-        // pod denies K again at every site. A control key is never denied.
+        // Plan criterion 10: restart recovery across pods. Assertions for K
+        // and a control key in two fixed communities are minted before the
+        // revocation and replayed as the same bytes in every phase. A
+        // disconnect sent to P1 denies K's retained assertions on P1 *and*
+        // P2 at every site (P1's reply alone proves only P1). Restarting both
+        // pods empties their deny maps, so the retained assertions are
+        // accepted again until the issuer re-sends; that is the exposure
+        // window, recorded from restart to restored denial. Once one pod
+        // accepts the re-send (fresh `jti`, same `until`), every pod denies
+        // K again. The control key is never denied.
         #[tokio::test]
         #[ignore = "requires Redis"]
         async fn re_sent_disconnect_restores_the_deny_on_every_pod_after_restart() {
-            let key_keys = nostr::Keys::generate();
-            let control = nostr::Keys::generate();
-            let key = key_keys.public_key();
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let hosts = [
+                format!("restart-a-{tag}.example"),
+                format!("restart-b-{tag}.example"),
+            ];
+            let key_retained = Retained::mint(&hosts);
+            let control = Retained::mint(&hosts);
+            let both = [&key_retained, &control];
+            let key = key_retained.keys.public_key();
             let until = chrono::Utc::now().timestamp() + 300;
             let send = |pod: Arc<AppState>| async move {
                 let token = mint_token(&key.to_hex(), 0, serde_json::json!({ "until": until }));
@@ -3909,37 +3950,33 @@ mod route_integration_tests {
                 drain_publishes(&pod).await;
             };
             let [(p1, _), (p2, mut p2_seen)] = enforce_pair().await;
-            check(
-                [&p1, &p2],
-                [&key_keys, &control],
-                false,
-                "before the disconnect",
-            )
-            .await;
+            check([&p1, &p2], both, false, "before the disconnect").await;
             send(Arc::clone(&p1)).await;
             await_target(&mut p2_seen, &key).await;
-            check(
-                [&p1, &p2],
-                [&key_keys, &control],
-                true,
-                "after the disconnect",
-            )
-            .await;
+            check([&p1, &p2], both, true, "after the disconnect").await;
 
             // Restart: fresh pods, empty deny maps.
             let [(p1, mut p1_seen), (p2, mut p2_seen)] = enforce_pair().await;
-            check(
-                [&p1, &p2],
-                [&key_keys, &control],
-                false,
-                "restarted, before the re-send",
-            )
-            .await;
+            let restarted = std::time::Instant::now();
+            let (first_host, first_token) = &key_retained.assertions[0];
+            assert_eq!(
+                denied_at_every_site(&p1, &key_retained.keys, first_host, first_token).await,
+                [false; 3],
+                "restarted: K's retained assertion is admitted on P1"
+            );
+            let first_admitted = restarted.elapsed();
+            check([&p1, &p2], both, false, "restarted, before the re-send").await;
 
             send(Arc::clone(&p2)).await;
             await_target(&mut p1_seen, &key).await;
             await_target(&mut p2_seen, &key).await;
-            check([&p1, &p2], [&key_keys, &control], true, "after the re-send").await;
+            check([&p1, &p2], both, true, "after the re-send").await;
+            let restored = restarted.elapsed();
+            eprintln!(
+                "criterion 10 exposure: first retained admission {first_admitted:?} after \
+                 restart; denial restored on every pod {restored:?} after restart"
+            );
+            assert!(first_admitted < restored);
         }
 
         // Pins finding 1 (replay half): shadow and enforce share one Redis

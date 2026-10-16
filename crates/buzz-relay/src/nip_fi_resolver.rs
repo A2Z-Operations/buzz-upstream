@@ -359,7 +359,7 @@ impl DatabaseResolver {
             .filter(|issuer| self.registry.contains(issuer))
             .cloned()
             .collect();
-        let Some(binding) = self.binding_for(&host, issuers) else {
+        let Some(binding) = binding_for(&host, issuers) else {
             return;
         };
         let mut writable = self.lock();
@@ -416,7 +416,11 @@ impl DatabaseResolver {
                 .map_err(LoadFailure::Store)?
                 .map_err(|_| LoadFailure::OverCap)?;
             let rows = load.rows.len();
-            let map = self.build_map(load.rows);
+            // Up to the row cap of grouping and binding construction: run it
+            // off the runtime worker.
+            let map = tokio::task::spawn_blocking(move || build_map(load.rows))
+                .await
+                .map_err(|e| LoadFailure::Store(format!("map build failed: {e}")))?;
             #[cfg(test)]
             self.hooks.hit(hooks::REFRESH_BEFORE_PUBLISH).await;
             self.publish(map, load.snapshot, started, deadline)?;
@@ -533,29 +537,6 @@ impl DatabaseResolver {
         }
     }
 
-    fn binding_for(&self, host: &str, issuers: Vec<String>) -> Option<Arc<CommunityBinding>> {
-        CommunityBinding::new(format!("https://{host}"), issuers)
-            .ok()
-            .map(Arc::new)
-    }
-
-    fn build_map(&self, rows: Vec<(String, String)>) -> HashMap<String, Arc<CommunityBinding>> {
-        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
-        for (host, issuer) in rows {
-            grouped
-                .entry(normalize_host(&host))
-                .or_default()
-                .push(issuer);
-        }
-        grouped
-            .into_iter()
-            .filter_map(|(host, issuers)| {
-                let binding = self.binding_for(&host, issuers)?;
-                Some((host, binding))
-            })
-            .collect()
-    }
-
     fn publish(
         &self,
         map: HashMap<String, Arc<CommunityBinding>>,
@@ -564,11 +545,6 @@ impl DatabaseResolver {
         deadline: Duration,
     ) -> Result<(), LoadFailure> {
         let mut writable = self.lock();
-        // Checked under the lock: waiting for it must not let an expired
-        // attempt publish.
-        if self.clock.now() >= deadline {
-            return Err(LoadFailure::Timeout);
-        }
         if self
             .published
             .load()
@@ -584,6 +560,14 @@ impl DatabaseResolver {
             .filter(|(_, entry)| !snapshot.is_visible(entry.xid))
             .map(|(host, entry)| (host.clone(), entry.clone()))
             .collect();
+        #[cfg(test)]
+        self.hooks.hit_sync(hooks::PUBLISH_BEFORE_WRITE);
+        // Checked under the lock after all preparation, immediately before
+        // the first write: neither waiting for the lock nor preparing the
+        // overlay can let an expired attempt publish.
+        if self.clock.now() >= deadline {
+            return Err(LoadFailure::Timeout);
+        }
         metrics::gauge!("buzz_nip_fi_overlay_size").set(overlay.len() as f64);
         self.overlay.store(Arc::new(overlay));
         self.published.store(Some(Arc::new(Published {
@@ -675,7 +659,7 @@ impl DatabaseResolver {
             }
             Ok(Err(_)) | Ok(Ok(Err(RowCapExceeded(_)))) => Err(()),
             Ok(Ok(Ok(issuers))) if issuers.is_empty() => Ok(None),
-            Ok(Ok(Ok(issuers))) => Ok(self.binding_for(host, issuers)),
+            Ok(Ok(Ok(issuers))) => Ok(binding_for(host, issuers)),
         }
     }
 
@@ -749,6 +733,26 @@ impl Drop for WaiterSlot<'_> {
     }
 }
 
+fn binding_for(host: &str, issuers: Vec<String>) -> Option<Arc<CommunityBinding>> {
+    CommunityBinding::new(format!("https://{host}"), issuers)
+        .ok()
+        .map(Arc::new)
+}
+
+fn build_map(rows: Vec<(String, String)>) -> HashMap<String, Arc<CommunityBinding>> {
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for (host, issuer) in rows {
+        grouped
+            .entry(normalize_host(&host))
+            .or_default()
+            .push(issuer);
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(host, issuers)| binding_for(&host, issuers).map(|binding| (host, binding)))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod hooks {
     //! Per-resolver pause points for ordering tests.
@@ -761,6 +765,8 @@ pub(crate) mod hooks {
     pub(crate) const REFRESH_BEFORE_PUBLISH: &str = "refresh.before_publish";
     pub(crate) const MISS_AFTER_READ: &str = "miss.after_read";
     pub(crate) const CREATION_BEFORE_OVERLAY: &str = "creation.before_overlay";
+    /// Synchronous, under the publication lock: see [`Hooks::on_sync`].
+    pub(crate) const PUBLISH_BEFORE_WRITE: &str = "publish.before_write";
 
     /// An armed pause: production signals `reached`, then waits for `release`.
     pub(crate) struct Gate {
@@ -779,7 +785,12 @@ pub(crate) mod hooks {
     }
 
     #[derive(Default)]
-    pub(crate) struct Hooks(Mutex<HashMap<&'static str, Arc<Gate>>>);
+    pub(crate) struct Hooks(
+        Mutex<HashMap<&'static str, Arc<Gate>>>,
+        Mutex<HashMap<&'static str, SyncAction>>,
+    );
+
+    type SyncAction = Arc<dyn Fn() + Send + Sync>;
 
     impl Hooks {
         /// Pause every later hit of `point` until released, once per release.
@@ -794,6 +805,22 @@ pub(crate) mod hooks {
 
         pub(crate) fn disarm(&self, point: &'static str) {
             self.0.lock().unwrap().remove(point);
+        }
+
+        /// Run `action` at every later hit of the synchronous `point`.
+        pub(crate) fn on_sync(
+            &self,
+            point: &'static str,
+            action: impl Fn() + Send + Sync + 'static,
+        ) {
+            self.1.lock().unwrap().insert(point, Arc::new(action));
+        }
+
+        pub(crate) fn hit_sync(&self, point: &'static str) {
+            let action = self.1.lock().unwrap().get(point).cloned();
+            if let Some(action) = action {
+                action();
+            }
         }
 
         pub(crate) async fn hit(&self, point: &'static str) {

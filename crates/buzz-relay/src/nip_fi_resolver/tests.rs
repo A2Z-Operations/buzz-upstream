@@ -13,7 +13,8 @@ use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::StreamExt;
 
 use super::hooks::{
-    CREATION_BEFORE_OVERLAY, MISS_AFTER_READ, REFRESH_AFTER_SNAPSHOT, REFRESH_BEFORE_PUBLISH,
+    CREATION_BEFORE_OVERLAY, MISS_AFTER_READ, PUBLISH_BEFORE_WRITE, REFRESH_AFTER_SNAPSHOT,
+    REFRESH_BEFORE_PUBLISH,
 };
 use super::*;
 
@@ -61,6 +62,10 @@ struct FakeStore {
     /// Rows the last load pulled from its stream.
     rows_pulled: Arc<AtomicUsize>,
     lookups: Mutex<Vec<String>>,
+    /// Issuers every miss lookup streams instead of the stored binding.
+    lookup_issuers: Mutex<Option<Vec<String>>>,
+    /// Rows the last miss lookup pulled from its stream.
+    lookup_rows_pulled: AtomicUsize,
     lookup_delay: Mutex<Duration>,
     load_delay: Mutex<Duration>,
 }
@@ -75,6 +80,8 @@ impl FakeStore {
             loads: AtomicUsize::new(0),
             rows_pulled: Arc::default(),
             lookups: Mutex::new(Vec::new()),
+            lookup_issuers: Mutex::new(None),
+            lookup_rows_pulled: AtomicUsize::new(0),
             lookup_delay: Mutex::new(Duration::ZERO),
             load_delay: Mutex::new(Duration::ZERO),
         })
@@ -143,7 +150,7 @@ impl BindingSource for FakeStore {
     fn lookup<'a>(
         &'a self,
         host: &'a str,
-        _registry: &'a [String],
+        registry: &'a [String],
     ) -> BoxFuture<'a, Result<Result<Vec<String>, RowCapExceeded>, String>> {
         async move {
             self.lookups.lock().unwrap().push(host.to_owned());
@@ -155,11 +162,24 @@ impl BindingSource for FakeStore {
                 return Err("pool closed".into());
             }
             let found = self.hosts.lock().unwrap().iter().any(|h| h == host);
-            Ok(Ok(if found {
-                vec![ISS.to_owned()]
-            } else {
-                Vec::new()
-            }))
+            let issuers = self
+                .lookup_issuers
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(if found {
+                    vec![ISS.to_owned()]
+                } else {
+                    Vec::new()
+                });
+            // Streamed through the production cap (`registry.len()`, as the
+            // real store applies it), counting every pull.
+            self.lookup_rows_pulled.store(0, Ordering::SeqCst);
+            let stream = futures_util::stream::iter(issuers).map(|issuer| {
+                self.lookup_rows_pulled.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, String>(issuer)
+            });
+            buzz_db::collect_capped(stream, registry.len()).await
         }
         .boxed()
     }
@@ -320,6 +340,52 @@ async fn refresh_whose_deadline_passes_before_publication_publishes_nothing() {
     assert_eq!(f.resolve("a").await, Ok(()), "old map retained");
     f.clock.set(secs(120.0));
     assert_eq!(f.resolve("a").await, UNAVAILABLE, "old deadline retained");
+}
+
+// The deadline is rechecked after the overlay is prepared, under the lock,
+// immediately before the first write: an attempt that crosses it while
+// preparing publishes nothing. Mutation: checking before preparation (or not
+// at all) publishes the late snapshot.
+#[tokio::test]
+async fn refresh_crossing_its_deadline_while_preparing_publishes_nothing() {
+    let f = fixture(&["a"]);
+    f.resolver.refresh().await.unwrap();
+    f.store.set_snapshot("200:200:");
+    f.resolver
+        .record_creation(&host("new"), &[ISS.to_owned()], 150)
+        .await;
+    f.store.remove("a");
+    f.clock.set(secs(30.0));
+    let clock = Arc::clone(&f.clock);
+    f.resolver
+        .hooks
+        .on_sync(PUBLISH_BEFORE_WRITE, move || clock.set(secs(40.0)));
+    assert_eq!(f.resolver.refresh().await, Err(LoadFailure::Timeout));
+    assert_eq!(f.resolver.overlay_len(), 1, "overlay unchanged");
+    assert_eq!(f.resolve("a").await, Ok(()), "old map retained");
+    assert_eq!(f.store.lookups_for("a"), 0);
+    f.clock.set(secs(120.0));
+    assert_eq!(f.resolve("a").await, UNAVAILABLE, "old deadline retained");
+}
+
+// Criterion 17(a)(2): a miss lookup streaming N + 1 issuers (N = the registry
+// size) through the production cap is rejected after at most N + 1 pulls,
+// and caches nothing: the next admission looks up again. Mutation: treating
+// `RowCapExceeded` as "not found" caches a negative entry; as found, admits.
+#[tokio::test]
+async fn over_cap_miss_lookup_is_unavailable_and_caches_nothing() {
+    let f = fixture(&[]);
+    f.resolver.refresh().await.unwrap();
+    *f.store.lookup_issuers.lock().unwrap() = Some(vec![ISS.to_owned(); 3]);
+    assert_eq!(f.resolve("x").await, UNAVAILABLE);
+    assert_eq!(
+        f.store.lookup_rows_pulled.load(Ordering::SeqCst),
+        2,
+        "N + 1"
+    );
+    assert_eq!(f.resolver.negative_len(), 0, "no negative entry");
+    assert_eq!(f.resolve("x").await, UNAVAILABLE);
+    assert_eq!(f.store.lookups_for("x"), 2, "no entry of either kind");
 }
 
 // Criterion 17: the load streams through `collect_capped`, which stops at
