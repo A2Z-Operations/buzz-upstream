@@ -4868,14 +4868,14 @@ mod tests {
         PolicyRead,
     }
 
-    /// Run a real audio connection whose NIP-FI session ends at `deadline`,
-    /// park its login at `stage`, then end the connection: by an external
+    /// Run a real audio connection whose NIP-FI session ends at `deadline`
+    /// (no assertion, so no deadline, when `None`), park its login at `stage`, then end the connection: by an external
     /// cancel when `external_cancel`, otherwise by waiting for the deadline
     /// (the production expiry task cancels). Returns the login's `aborted`
     /// reason, asserting it wrote exactly one auth line.
     async fn audio_login_abort_reason(
         community_uuid: uuid::Uuid,
-        deadline: chrono::DateTime<chrono::Utc>,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
         stage: AbortStage,
         external_cancel: bool,
     ) -> String {
@@ -4883,8 +4883,9 @@ mod tests {
         use tokio_tungstenite::connect_async;
 
         let key = nostr::Keys::generate();
-        let assertion =
-            buzz_auth::VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+        let assertion = deadline.map(|deadline| {
+            buzz_auth::VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline])
+        });
         let state = audio_test_state().await;
         let community = buzz_core::tenant::CommunityId::from_uuid(community_uuid);
         let tenant =
@@ -4907,7 +4908,7 @@ mod tests {
                             tenant,
                             uuid::Uuid::new_v4(),
                             control,
-                            Some(assertion),
+                            assertion,
                             chrono::Utc::now(),
                             None,
                         )
@@ -4982,7 +4983,8 @@ mod tests {
     async fn audio_login_cancelled_with_live_session_logs_connection_closed() {
         let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0001);
         let live = chrono::Utc::now() + chrono::Duration::hours(1);
-        let reason = audio_login_abort_reason(community, live, AbortStage::Verify, true).await;
+        let reason =
+            audio_login_abort_reason(community, Some(live), AbortStage::Verify, true).await;
         assert_eq!(reason, "connection_closed");
     }
 
@@ -4990,7 +4992,8 @@ mod tests {
     async fn audio_login_past_its_deadline_logs_session_expired() {
         let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0002);
         let soon = chrono::Utc::now() + chrono::Duration::milliseconds(500);
-        let reason = audio_login_abort_reason(community, soon, AbortStage::Verify, false).await;
+        let reason =
+            audio_login_abort_reason(community, Some(soon), AbortStage::Verify, false).await;
         assert_eq!(reason, "session_expired");
     }
 
@@ -4998,7 +5001,8 @@ mod tests {
     async fn audio_login_expiring_during_the_policy_read_logs_session_expired() {
         let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0003);
         let soon = chrono::Utc::now() + chrono::Duration::milliseconds(500);
-        let reason = audio_login_abort_reason(community, soon, AbortStage::PolicyRead, false).await;
+        let reason =
+            audio_login_abort_reason(community, Some(soon), AbortStage::PolicyRead, false).await;
         assert_eq!(reason, "session_expired");
     }
 
@@ -5006,7 +5010,15 @@ mod tests {
     async fn audio_login_cancelled_during_the_policy_read_logs_connection_closed() {
         let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0004);
         let live = chrono::Utc::now() + chrono::Duration::hours(1);
-        let reason = audio_login_abort_reason(community, live, AbortStage::PolicyRead, true).await;
+        let reason =
+            audio_login_abort_reason(community, Some(live), AbortStage::PolicyRead, true).await;
+        assert_eq!(reason, "connection_closed");
+    }
+
+    #[tokio::test]
+    async fn audio_login_cancelled_without_a_deadline_logs_connection_closed() {
+        let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0005);
+        let reason = audio_login_abort_reason(community, None, AbortStage::Verify, true).await;
         assert_eq!(reason, "connection_closed");
     }
 
