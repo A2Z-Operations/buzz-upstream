@@ -7,6 +7,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/onboarding/hosted_connect_page.dart';
 import 'shared/auth/auth.dart';
+import 'shared/theme/grid.dart';
 import 'shared/deeplink/deep_link.dart';
 import 'shared/hosted/account_identity_store.dart';
 import 'shared/hosted/browser_auth.dart';
@@ -184,6 +185,30 @@ class HostedAppGate extends HookConsumerWidget {
         fit: StackFit.expand,
         children: [
           child,
+          if (flow.stage == HostedFlowStage.signIn)
+            Positioned(
+              left: Grid.sm,
+              right: Grid.sm,
+              bottom: 0,
+              child: SafeArea(
+                child: Material(
+                  color: Colors.transparent,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      TextButton(
+                        onPressed: flow.retry,
+                        child: const Text('Start login again'),
+                      ),
+                      TextButton(
+                        onPressed: flow.leave,
+                        child: const Text('Leave setup'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           if (visible &&
               !openingSignIn &&
               (!inlineEntry ||

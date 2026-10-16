@@ -50,8 +50,11 @@ void main() {
         expect(find.byType(HostedConnectPage), findsNothing);
         expect(find.text('Signing in…').hitTestable(), findsOneWidget);
         expect(find.text('Enter a community link'), findsOneWidget);
-        await f.flow.leave();
+        expect(find.text('Start login again').hitTestable(), findsOneWidget);
         f.expired = false;
+        await tester.tap(find.text('Leave setup').hitTestable());
+        await tester.pumpAndSettle();
+        expect(f.flow.stage, HostedFlowStage.idle);
         await tester.pumpAndSettle();
         expect(find.text('Continue with Builderlab'), findsOneWidget);
         expect(find.byType(HostedConnectPage), findsNothing);
