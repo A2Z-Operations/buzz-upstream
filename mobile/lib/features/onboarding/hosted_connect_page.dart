@@ -55,17 +55,14 @@ class HostedConnectPage extends HookConsumerWidget {
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) close();
       },
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Connect to Buzz'),
-          leading: BackButton(onPressed: close),
-        ),
-        body: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(Grid.sm),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 440),
+      child: Stack(
+        children: [
+          ModalBarrier(color: Colors.black54, dismissible: false),
+          AlertDialog(
+            title: const Text('Connect to Builderlab'),
+            content: SizedBox(
+              width: 440,
+              child: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -134,7 +131,7 @@ class HostedConnectPage extends HookConsumerWidget {
               ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }

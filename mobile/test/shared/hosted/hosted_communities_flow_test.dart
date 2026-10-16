@@ -154,19 +154,15 @@ void main() {
     expect(f.flow.selectedRelays, isEmpty);
   });
 
-  test(
-    'zero communities can open creation and refresh into single entry',
-    () async {
-      final f = await fixture();
-      await f.flow.signInAccount();
-      expect(f.flow.stage, HostedFlowStage.chooseCommunities);
-      await f.flow.openCommunityCreation();
-      expect(f.opened, Uri.parse('https://app.builderlab.xyz/buzz'));
-      f.rows = [f.row('created')];
-      await f.flow.refreshCommunities();
-      expect(f.admitted, ['created']);
-    },
-  );
+  test('zero communities return to welcome and allow reconnect', () async {
+    final f = await fixture();
+    await f.flow.signInAccount();
+    expect(f.flow.stage, HostedFlowStage.idle);
+    expect(f.account.account, isNotNull);
+    f.rows = [f.row('created')];
+    await f.flow.signInAccount();
+    expect(f.admitted, ['created']);
+  });
 
   test('identity mismatch blocks list and preserves saved key', () async {
     final f = await fixture();
@@ -283,23 +279,20 @@ void main() {
     },
   );
 
-  test(
-    'single conflicting community can be skipped then creation refreshed',
-    () async {
-      final f = await fixture();
-      f.rows = [f.row('conflict')];
-      f.beforeAdmission = (_) async =>
-          throw const SavedCommunityIdentityConflict();
-      await f.flow.signInAccount();
-      await f.flow.skipConflictingCommunity();
-      expect(f.flow.stage, HostedFlowStage.chooseCommunities);
-      expect(f.flow.communities, isEmpty);
-      f.rows = [f.row('created')];
-      f.beforeAdmission = null;
-      await f.flow.refreshCommunities();
-      expect(f.admitted, ['created']);
-    },
-  );
+  test('single conflicting community can be skipped back to welcome', () async {
+    final f = await fixture();
+    f.rows = [f.row('conflict')];
+    f.beforeAdmission = (_) async =>
+        throw const SavedCommunityIdentityConflict();
+    await f.flow.signInAccount();
+    await f.flow.skipConflictingCommunity();
+    expect(f.flow.stage, HostedFlowStage.idle);
+    expect(f.flow.communities, isEmpty);
+    f.rows = [f.row('created')];
+    f.beforeAdmission = null;
+    await f.flow.signInAccount();
+    expect(f.admitted, ['created']);
+  });
 
   test('unsupported rows are skipped and wss prefix canonicalized', () async {
     final f = await fixture();

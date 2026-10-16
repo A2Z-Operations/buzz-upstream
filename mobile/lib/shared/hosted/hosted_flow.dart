@@ -479,6 +479,10 @@ class HostedFlow extends ChangeNotifier {
       if (!current()) return;
       communities = listed;
       selectedRelays = Set.unmodifiable(listed.map((item) => item.relayUrl));
+      if (listed.isEmpty) {
+        await leave();
+        return;
+      }
       if (listed.length != 1) {
         _set(HostedFlowStage.chooseCommunities);
         return;
@@ -510,7 +514,7 @@ class HostedFlow extends ChangeNotifier {
       communities = List.unmodifiable(
         communities.where((item) => selectedRelays.contains(item.relayUrl)),
       );
-      _set(HostedFlowStage.chooseCommunities);
+      await leave();
       return;
     }
     await browser.clearIntent();

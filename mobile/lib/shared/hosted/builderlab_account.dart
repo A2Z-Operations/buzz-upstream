@@ -257,6 +257,11 @@ class BuilderlabAccountClient {
       final response = await _http
           .send(request)
           .timeout(const Duration(seconds: 30));
+      if (kDebugMode && response.statusCode >= 400) {
+        debugPrint(
+          'Builderlab ${request.method} $path: HTTP ${response.statusCode}',
+        );
+      }
       if (response.statusCode == 401) throw AccountFailure.signedOut;
       if (response.statusCode == 403) throw AccountFailure.denied;
       if (const {400, 404, 409, 422}.contains(response.statusCode)) {

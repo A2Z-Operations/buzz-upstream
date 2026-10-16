@@ -6,8 +6,6 @@ import 'package:buzz/shared/hosted/hosted_flow.dart';
 import 'package:buzz/shared/hosted/builderlab_account.dart';
 import 'package:buzz/shared/hosted/hosted_community_connection.dart';
 import 'package:flutter/material.dart';
-import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:buzz/shared/deeplink/deep_link.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -48,11 +46,10 @@ void main() {
         expect(f.flow.stage, HostedFlowStage.signIn);
         expect(f.browser.startedIntent, {'type': 'account'});
         expect(find.byType(HostedConnectPage), findsNothing);
-        expect(find.text('Signing in…').hitTestable(), findsOneWidget);
+        expect(find.text('Cancel sign-in').hitTestable(), findsOneWidget);
         expect(find.text('Enter a community link'), findsOneWidget);
-        expect(find.text('Start login again').hitTestable(), findsOneWidget);
         f.expired = false;
-        await tester.tap(find.text('Leave setup').hitTestable());
+        await tester.tap(find.text('Cancel sign-in').hitTestable());
         await tester.pumpAndSettle();
         expect(f.flow.stage, HostedFlowStage.idle);
         await tester.pumpAndSettle();
@@ -113,38 +110,33 @@ void main() {
           PendingDeepLinkNotifier.debugUriStreamOverride = null;
           await f.dispose();
         });
-        await f.flow.signInAccount();
         await tester.pumpWidget(
           WidgetHelpers.testable(
             disableAnimations: true,
-            child: HostedConnectPage(flow: f.flow, onClose: f.flow.leave),
+            child: const HostedAppGate(
+              authenticated: false,
+              child: OnboardingAppEntry(),
+            ),
+            overrides: [hostedFlowProvider.overrideWithValue(f.flow)],
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.text('Create a community in Builderlab'), findsOneWidget);
-        await tester.tap(find.text('Create a community in Builderlab'));
-        await tester.pumpAndSettle();
-        expect(f.opened?.path, '/buzz');
-        expect(find.text('Refresh communities'), findsOneWidget);
-        await tester.enterText(find.byType(TextField), 'not a valid url');
-        await tester.tap(find.text('Open community link'));
-        await tester.pumpAndSettle();
-        expect(
-          find.text('Enter a valid community address or invite link.'),
-          findsOneWidget,
-        );
-        await tester.enterText(
-          find.byType(TextField),
-          'https://one.communities.buzz.xyz/invite/code',
-        );
-        await tester.testTextInput.receiveAction(TextInputAction.go);
+        await tester.tap(find.text('Continue with Builderlab'));
         await tester.pumpAndSettle();
         expect(f.flow.stage, HostedFlowStage.idle);
-        final container = ProviderScope.containerOf(
-          tester.element(find.byType(HostedConnectPage)),
-          listen: false,
-        );
-        expect(container.read(pendingDeepLinkProvider), isA<InviteDeepLink>());
+        expect(find.byType(HostedConnectPage), findsNothing);
+        expect(find.text('Scan a QR code'), findsOneWidget);
+        expect(find.text('Use pairing code'), findsOneWidget);
+        f.rows = [f.row('denied')];
+        f.beforeAdmission = (_) async => throw AccountFailure.denied;
+        await tester.tap(find.text('Continue with Builderlab'));
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsOneWidget);
+        expect(find.text('Scan a QR code'), findsOneWidget);
+        await tester.tap(find.text('Leave setup').hitTestable());
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(find.text('Scan a QR code'), findsOneWidget);
       }
     },
   );

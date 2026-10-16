@@ -185,7 +185,9 @@ class HostedAppGate extends HookConsumerWidget {
         fit: StackFit.expand,
         children: [
           child,
-          if (flow.stage == HostedFlowStage.signIn)
+          if (flow.stage == HostedFlowStage.signIn &&
+              authenticated &&
+              !inlineEntry)
             Positioned(
               left: Grid.sm,
               right: Grid.sm,

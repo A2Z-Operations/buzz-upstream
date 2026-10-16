@@ -27,6 +27,7 @@ class OnboardingAppEntry extends HookConsumerWidget {
       unawaited(restore());
       return null;
     }, [flow]);
+    final signingIn = flow.stage == HostedFlowStage.signIn;
     final busy =
         flow.accountOnly &&
         (flow.stage == HostedFlowStage.working ||
@@ -63,9 +64,15 @@ class OnboardingAppEntry extends HookConsumerWidget {
         existingUser: existingUser.value,
         enteringCommunityLink: enteringCommunityLink.value,
         onCommunityLink: () => enteringCommunityLink.value = true,
-        onBuilderlab: busy ? null : () => unawaited(flow.signInAccount()),
+        onBuilderlab: signingIn
+            ? () => unawaited(flow.leave())
+            : busy
+            ? null
+            : () => unawaited(flow.signInAccount()),
         accountStatus: status,
-        builderlabLabel: connected
+        builderlabLabel: signingIn
+            ? 'Cancel sign-in'
+            : connected
             ? 'Continue with Builderlab'
             : busy
             ? 'Signing in…'
