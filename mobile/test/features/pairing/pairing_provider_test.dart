@@ -669,6 +669,10 @@ void main() {
         await Future<void>.delayed(Duration.zero);
 
         expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(
+          container.read(authProvider).value!.status,
+          AuthStatus.unauthenticated,
+        );
         expect(socket.isConnected, isFalse);
       });
 
@@ -1286,6 +1290,7 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
     lastCommunity = community;
     entered?.complete();
     await authentication?.future;
+    if (shouldContinue != null && !shouldContinue()) return;
     state = AsyncData(
       AuthState(status: AuthStatus.authenticated, community: community),
     );

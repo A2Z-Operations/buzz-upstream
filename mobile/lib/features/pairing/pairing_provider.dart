@@ -758,7 +758,13 @@ class PairingNotifier extends Notifier<PairingState> {
       );
       await ref
           .read(authProvider.notifier)
-          .authenticateWithCommunity(community);
+          .authenticateWithCommunity(
+            community,
+            shouldContinue: () =>
+                pairingGeneration == _pairingGeneration &&
+                state.status == PairingStatus.storing &&
+                !_sendIdentityToSource,
+          );
       if (pairingGeneration != _pairingGeneration ||
           state.status != PairingStatus.storing ||
           _sendIdentityToSource) {
@@ -869,7 +875,10 @@ class PairingNotifier extends Notifier<PairingState> {
       if (generation != _pairingGeneration) return;
       await ref
           .read(authProvider.notifier)
-          .authenticateWithCommunity(community);
+          .authenticateWithCommunity(
+            community,
+            shouldContinue: () => generation == _pairingGeneration,
+          );
       if (generation != _pairingGeneration) return;
       state = PairingState(
         status: PairingStatus.success,
