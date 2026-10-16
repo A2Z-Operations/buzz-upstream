@@ -3,6 +3,7 @@ import 'package:nostr/nostr.dart' as nostr;
 
 import '../community/community.dart';
 import '../community/community_provider.dart';
+import '../hosted/community_entry_requirements.dart';
 
 enum AuthStatus { unknown, unauthenticated, authenticated }
 
@@ -61,6 +62,8 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
     bool Function()? shouldContinue,
   }) {
     return ref.read(communityTransitionProvider).runExclusive(() async {
+      if (shouldContinue != null && !shouldContinue()) return;
+      await CommunityEntryRequirements.verify(community);
       if (shouldContinue != null && !shouldContinue()) return;
       await ref.read(communityTransitionProvider).run();
       if (shouldContinue != null && !shouldContinue()) return;

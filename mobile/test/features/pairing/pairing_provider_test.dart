@@ -528,6 +528,37 @@ void main() {
         },
       );
 
+      test('admission rejection never reports a successful transfer', () async {
+        importAuth.authentication = Completer<void>();
+        importAuth.entered = Completer<void>();
+        final finished = Completer<void>();
+        container.listen(pairingProvider, (_, next) {
+          if (next.status == PairingStatus.error && !finished.isCompleted) {
+            finished.complete();
+          }
+        });
+        await beginImport(protected: false);
+        validation.complete();
+        await importAuth.entered!.future;
+        expect(
+          socket
+              .decryptedPublishedMessages(sourceSecret)
+              .where((message) => message['type'] == 'complete'),
+          isEmpty,
+        );
+        importAuth.authentication!.completeError(
+          StateError('Admission refused'),
+        );
+        await finished.future;
+        final completions = socket
+            .decryptedPublishedMessages(sourceSecret)
+            .where((message) => message['type'] == 'complete')
+            .toList();
+        expect(completions, hasLength(1));
+        expect(completions.single['success'], isFalse);
+        expect(container.read(pairedCommunityLandingProvider), isNull);
+      });
+
       test('unchecked protection persists on a successful import', () async {
         await beginImport(protected: false);
 
@@ -1233,6 +1264,7 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
     implements AuthNotifier {
   Community? lastCommunity;
   Completer<void>? authentication;
+  Completer<void>? entered;
   bool signedOut = false;
 
   @override
@@ -1252,6 +1284,7 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
   }) async {
     if (shouldContinue != null && !shouldContinue()) return;
     lastCommunity = community;
+    entered?.complete();
     await authentication?.future;
     state = AsyncData(
       AuthState(status: AuthStatus.authenticated, community: community),

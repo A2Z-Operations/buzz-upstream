@@ -8,6 +8,7 @@ import '../relay/relay_session.dart';
 import '../relay/relay_socket.dart';
 import 'account_identity_store.dart';
 import 'builderlab_account.dart';
+import 'community_entry_requirements.dart';
 import 'hosted_environment.dart';
 
 /// Builds a community only after scoped backup evidence and current binding.
@@ -57,19 +58,13 @@ class HostedAdmission {
     if (account.account?.subject != subject) {
       throw AccountFailure.differentAccount;
     }
-    final snapshot = await store.read();
-    if (snapshot?.pubkey != pubkey ||
-        !snapshot!.hasBackupFor(
-          backend: BuilderlabAccountClient.origin.origin,
-          subject: subject,
-        )) {
-      throw AccountFailure.denied;
-    }
-    final binding = await account.currentIdentity();
-    final identity = binding['identity'];
-    if (identity is! Map || identity['pubkey_hex'] != pubkey) {
-      throw AccountFailure.denied;
-    }
+    await CommunityEntryRequirements.verifyHostedIdentity(
+      account: account,
+      store: store,
+      subject: subject,
+      pubkey: pubkey,
+    );
+    checkCurrent();
     if (link is InviteDeepLink) {
       final body = jsonEncode({
         'code': link.code,

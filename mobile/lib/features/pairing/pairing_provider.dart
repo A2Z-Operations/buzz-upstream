@@ -746,10 +746,7 @@ class PairingNotifier extends Notifier<PairingState> {
         return;
       }
 
-      // Send complete only after credentials are validated.
-      _sendComplete(true);
-
-      // Store as community and switch to it.
+      // Store only after the shared community-entry requirements pass.
       final community = Community.create(
         name: Community.nameFromUrl(relayUrl),
         relayUrl: relayUrl,
@@ -768,6 +765,8 @@ class PairingNotifier extends Notifier<PairingState> {
         return;
       }
 
+      // A validated transfer is not successful admission until storage succeeds.
+      _sendComplete(true);
       _cleanup();
       state = state.copyWith(status: PairingStatus.success);
       ref.read(pairedCommunityLandingProvider.notifier).request(community);

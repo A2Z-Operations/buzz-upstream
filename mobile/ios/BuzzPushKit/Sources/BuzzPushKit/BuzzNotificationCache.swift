@@ -1,6 +1,6 @@
 import CryptoKit
 import Foundation
-import P256K
+@_implementationOnly import P256K
 
 /// Account and relay identity for one local sign-in's notification cache.
 public struct BuzzNotificationCacheScope: Codable, Equatable, Sendable {

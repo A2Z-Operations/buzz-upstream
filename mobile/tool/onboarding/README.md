@@ -24,7 +24,12 @@ fixtures exercise navigation and coordinator behavior, not live service readines
 Production integration lives in `lib/shared/hosted/` and `lib/hosted_app_gate.dart`.
 Account sign-in uses production by default; public staging can be selected with
 `--dart-define=BUZZ_BUILDERLAB_URL=https://app.builderlabstaging.xyz`.
-Staging community routing and full community-entry acceptance remain incomplete.
+Hosted domain routing is defined in `HostedEnvironment`. `HostedFlow` owns
+account/identity setup; `CommunityEntryRequirements` checks account, binding,
+and backup before new communities are persisted, including pairing imports.
+The legacy invite path rejects hosted destinations before key generation/claim.
+Hosted pairing currently fails closed when requirements are missing; a guided
+handoff into account setup and full live community-entry acceptance remain pending.
 Android has no native HPKE implementation yet; iOS sealing requires iOS 17+.
 
 `hpke_interop.swift`, compiled with `ios/Runner/HostedHpkeBackup.swift`, checks
