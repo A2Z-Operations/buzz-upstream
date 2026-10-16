@@ -1,7 +1,7 @@
 //! Upgrade contracts for the event follow-up trigger retirements: push
 //! (0063), then channel TTL (0065).
 use super::postgres_tests::{connect_test_pool, reset_public_schema};
-use super::{run_migrations, run_migrations_through};
+use super::run_migrations_through;
 use sqlx::PgPool;
 
 async fn ttl_definitions(pool: &PgPool) -> Vec<(String, String)> {
@@ -19,6 +19,51 @@ async fn push_trigger_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count push triggers")
+}
+
+/// Insert a channel with an expired TTL deadline, then a raw `INSERT INTO
+/// events` on it that bypasses the application follow-up. Returns whether the
+/// database itself pushed the deadline forward.
+async fn raw_insert_refreshes_expired_ttl(pool: &PgPool, content: &str) -> bool {
+    let community = uuid::Uuid::new_v4();
+    let channel = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+        .bind(community)
+        .bind(format!("retirement-{community}.example"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO channels (id, community_id, name, created_by, ttl_seconds, ttl_deadline) \
+        VALUES ($1, $2, 'ttl', $3, 60, clock_timestamp() - interval '1 day')",
+    )
+    .bind(channel)
+    .bind(community)
+    .bind([11_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
+        VALUES ($1, $2, $3, now(), 9, '[]', $4, $5, $6)",
+    )
+    .bind(community)
+    .bind([12_u8; 32])
+    .bind([11_u8; 32])
+    .bind(content)
+    .bind([13_u8; 64])
+    .bind(channel)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query_scalar(
+        "SELECT ttl_deadline > clock_timestamp() FROM channels WHERE id=$1 AND community_id=$2",
+    )
+    .bind(channel)
+    .bind(community)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -80,38 +125,8 @@ async fn migration_schema_push_retirement_preserves_ttl_and_published_checksums(
 
     // A raw writer has no application TTL follow-up. The preserved deferred
     // trigger must still refresh its channel when the event commits.
-    let community = uuid::Uuid::new_v4();
-    let channel = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
-        .bind(community)
-        .bind(format!("retirement-{community}.example"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO channels (id, community_id, name, created_by, ttl_seconds, ttl_deadline) \
-        VALUES ($1, $2, 'ttl', $3, 60, clock_timestamp() - interval '1 day')",
-    )
-    .bind(channel)
-    .bind(community)
-    .bind([11_u8; 32])
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
-        VALUES ($1, $2, $3, now(), 9, '[]', 'TTL survives push retirement', $4, $5)")
-        .bind(community).bind([12_u8; 32]).bind([11_u8; 32]).bind([13_u8; 64]).bind(channel)
-        .execute(&pool).await.unwrap();
-    let refreshed: bool = sqlx::query_scalar(
-        "SELECT ttl_deadline > clock_timestamp() FROM channels WHERE id=$1 AND community_id=$2",
-    )
-    .bind(channel)
-    .bind(community)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     assert!(
-        refreshed,
+        raw_insert_refreshes_expired_ttl(&pool, "TTL survives push retirement").await,
         "raw inserts still refresh TTL after push retirement"
     );
     pool.close().await;
@@ -146,7 +161,9 @@ async fn migration_schema_ttl_retirement_drops_every_partition_trigger_and_keeps
     .await
     .unwrap();
 
-    run_migrations(&pool).await.expect("retire TTL trigger");
+    run_migrations_through(&pool, 65)
+        .await
+        .expect("retire TTL trigger");
     assert!(
         ttl_definitions(&pool).await.is_empty(),
         "retired on parent and every partition"
@@ -160,5 +177,12 @@ async fn migration_schema_ttl_retirement_drops_every_partition_trigger_and_keeps
     .await
     .unwrap();
     assert_eq!(checksums_after, checksums_before);
+
+    // With both triggers gone, a raw writer that skips the application
+    // follow-up no longer extends an ephemeral channel's deadline.
+    assert!(
+        !raw_insert_refreshes_expired_ttl(&pool, "TTL no longer refreshed by the database").await,
+        "raw inserts must not refresh TTL after 0065"
+    );
     pool.close().await;
 }

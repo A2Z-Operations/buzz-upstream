@@ -243,8 +243,9 @@ Migration 0065 then retires `events_refresh_channel_ttl` and
 writers no longer refresh ephemeral-channel deadlines. Verify application
 enqueueing and flag-only rollback on the exact deployed candidate. Legacy images and raw SQL
 writers without the application producer are unsupported after this point:
-their messages may commit without producing notifications. Do not restore the
-trigger or downgrade an image as an urgent rollback step. Reintroducing legacy
+their messages may commit without producing notifications or extending
+ephemeral-channel deadlines (so those channels can expire early). Do not restore
+either trigger or downgrade an image as an urgent rollback step. Reintroducing legacy
 writer support requires a separate reviewed forward migration and compatibility
 plan; never edit published migrations or their checksums.
 
