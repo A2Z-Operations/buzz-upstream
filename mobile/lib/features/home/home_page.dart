@@ -362,14 +362,26 @@ class _FloatingTabBar extends StatelessWidget {
               child: SizedBox(
                 width: destinationWidth,
                 height: double.infinity,
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: context.controlSurface,
-                    borderRadius: BorderRadius.circular(
-                      HomePage._selectedTabRadius,
-                    ),
-                  ),
-                ),
+                child: defaultTargetPlatform == TargetPlatform.iOS
+                    ? ConcentricSheetSurface(
+                        key: const ValueKey('home-ios-glass-selection'),
+                        enabled: true,
+                        usesGlass: true,
+                        color: Colors.transparent,
+                        providesSheetSurface: false,
+                        padding: EdgeInsets.zero,
+                        minimumRadius: HomePage._selectedTabRadius,
+                        contentClipRadius: HomePage._selectedTabRadius,
+                        child: const SizedBox.expand(),
+                      )
+                    : DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: context.controlSurface,
+                          borderRadius: BorderRadius.circular(
+                            HomePage._selectedTabRadius,
+                          ),
+                        ),
+                      ),
               ),
             ),
             Row(
@@ -395,6 +407,7 @@ class _FloatingTabBar extends StatelessWidget {
     final surface = defaultTargetPlatform == TargetPlatform.iOS
         ? ConcentricSheetSurface(
             key: const ValueKey('home-ios-glass-tabs'),
+            color: Colors.transparent,
             enabled: true,
             usesGlass: true,
             providesSheetSurface: false,
