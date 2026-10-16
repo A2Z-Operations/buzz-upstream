@@ -11,7 +11,16 @@ void main() {
       home: MediaQuery(
         data: MediaQueryData(disableAnimations: reduced),
         child: Center(
-          child: ComposeMorphIcon(compose: compose, color: Colors.black),
+          child: ComposeMorphIcon(
+            compose: compose,
+            color: Colors.black,
+            surfaceBuilder: (icon) => SizedBox(
+              key: const ValueKey('button-surface'),
+              width: 56,
+              height: 56,
+              child: Center(child: icon),
+            ),
+          ),
         ),
       ),
     );
@@ -30,6 +39,13 @@ void main() {
         .toList();
     expect(transforms.first.transform.entry(1, 0), greaterThan(0));
     expect(transforms.last.transform.entry(0, 0), greaterThan(1));
+    expect(
+      find.ancestor(
+        of: find.byKey(const ValueKey('button-surface')),
+        matching: find.byWidget(transforms.last),
+      ),
+      findsOneWidget,
+    );
     await tester.pumpWidget(app(false));
     await tester.pumpAndSettle();
     expect(find.byIcon(BuzzIcons.plus), findsOneWidget);

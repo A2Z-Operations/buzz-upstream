@@ -365,6 +365,7 @@ class _FloatingTabBar extends StatelessWidget {
                 child: defaultTargetPlatform == TargetPlatform.iOS
                     ? ConcentricSheetSurface(
                         key: const ValueKey('home-ios-glass-selection'),
+                        glassTintColor: context.controlSurface,
                         enabled: true,
                         usesGlass: true,
                         color: Colors.transparent,

@@ -8,43 +8,42 @@ class ComposeMorphIcon extends StatelessWidget {
     super.key,
     required this.compose,
     required this.color,
+    this.surfaceBuilder,
   });
   final bool compose;
   final Color color;
 
+  /// Includes the button surface in the same tilt and scale as its icon.
+  final Widget Function(Widget icon)? surfaceBuilder;
+
   @override
   Widget build(BuildContext context) {
-    if (MediaQuery.disableAnimationsOf(context)) {
-      return Icon(
-        compose ? BuzzIcons.edit : BuzzIcons.plus,
-        size: 24,
-        color: color,
-      );
-    }
+    final reduced = MediaQuery.disableAnimationsOf(context);
     return TweenAnimationBuilder<double>(
       tween: Tween(end: compose ? 1 : 0),
-      duration: const Duration(milliseconds: 240),
+      duration: reduced ? Duration.zero : const Duration(milliseconds: 240),
       curve: Curves.easeInOutCubic,
-      builder: (context, progress, _) {
-        if (progress == 0 || progress == 1) {
-          return Icon(
-            progress == 0 ? BuzzIcons.plus : BuzzIcons.edit,
-            size: 24,
-            color: color,
-          );
-        }
+      builder: (context, animatedProgress, _) {
+        final progress = reduced ? (compose ? 1.0 : 0.0) : animatedProgress;
         final lift = math.sin(progress * math.pi);
+        final Widget icon = progress == 0 || progress == 1
+            ? Icon(
+                progress == 0 ? BuzzIcons.plus : BuzzIcons.edit,
+                size: 24,
+                color: color,
+              )
+            : CustomPaint(
+                size: const Size.square(24),
+                painter: _ComposePainter(progress, color),
+              );
         return TweenAnimationBuilder<double>(
           tween: Tween(end: compose ? 1 : -1),
-          duration: const Duration(milliseconds: 80),
+          duration: reduced ? Duration.zero : const Duration(milliseconds: 80),
           builder: (context, direction, _) => Transform.rotate(
             angle: direction * lift * math.pi / 12,
             child: Transform.scale(
               scale: 1 + 0.08 * lift,
-              child: CustomPaint(
-                size: const Size.square(24),
-                painter: _ComposePainter(progress, color),
-              ),
+              child: surfaceBuilder?.call(icon) ?? icon,
             ),
           ),
         );
