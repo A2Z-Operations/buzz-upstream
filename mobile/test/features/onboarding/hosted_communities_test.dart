@@ -3,6 +3,8 @@ import 'package:buzz/hosted_app_gate.dart';
 import 'package:buzz/onboarding_app_entry.dart';
 import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
 import 'package:buzz/shared/hosted/hosted_flow.dart';
+import 'package:buzz/shared/hosted/builderlab_account.dart';
+import 'package:buzz/shared/hosted/hosted_community_connection.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/shared/deeplink/deep_link.dart';
@@ -56,6 +58,34 @@ void main() {
         await tester.pumpAndSettle();
         expect(f.admitted, ['two']);
         expect(find.byType(HostedConnectPage), findsNothing);
+        f.admitted.clear();
+        f.beforeAdmission = (name) async {
+          if (name == 'two') throw const SavedCommunityIdentityConflict();
+        };
+        await tester.tap(find.text('Continue with Builderlab'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Continue').hitTestable());
+        await tester.pumpAndSettle();
+        expect(find.text('Keep saved identity and skip'), findsOneWidget);
+        expect(find.text('1 community added and kept.'), findsOneWidget);
+        await tester.tap(find.text('Keep saved identity and skip'));
+        await tester.pumpAndSettle();
+        expect(f.admitted, ['one']);
+        expect(find.byType(HostedConnectPage), findsNothing);
+        f.admitted.clear();
+        f.beforeAdmission = (name) async {
+          if (name == 'two') throw AccountFailure.rejected;
+        };
+        await tester.tap(find.text('Continue with Builderlab'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Continue').hitTestable());
+        await tester.pumpAndSettle();
+        expect(find.text('1 community added and kept.'), findsOneWidget);
+        expect(find.text('Try again').hitTestable(), findsNothing);
+        await tester.tap(find.text('Back to choices'));
+        await tester.pumpAndSettle();
+        expect(find.byType(CheckboxListTile), findsOneWidget);
+        expect(find.text('two'), findsOneWidget);
       }
       await tester.pumpWidget(const SizedBox.shrink());
       {
@@ -92,7 +122,7 @@ void main() {
           find.byType(TextField),
           'https://one.communities.buzz.xyz/invite/code',
         );
-        await tester.tap(find.text('Open community link'));
+        await tester.testTextInput.receiveAction(TextInputAction.go);
         await tester.pumpAndSettle();
         expect(f.flow.stage, HostedFlowStage.idle);
         final container = ProviderScope.containerOf(

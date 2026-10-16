@@ -13,6 +13,12 @@ import 'package:nostr/nostr.dart' as nostr;
 
 class DiscoveryBrowser extends BrowserAuth {
   final callbacks = StreamController<BrowserAuthCode>.broadcast();
+  Map<String, String>? startedIntent;
+  @override
+  Future<void> start(Map<String, String> intent) async {
+    startedIntent = intent;
+  }
+
   @override
   Stream<BrowserAuthCode> get codes => callbacks.stream;
   @override
@@ -36,7 +42,7 @@ class WidgetDiscoveryAccount extends BuilderlabAccountClient {
   final HostedCommunitiesFixture fixture;
   @override
   BuilderlabAccount get account => BuilderlabAccount(
-    subject: 'owner',
+    subject: fixture.subject,
     expiresAt: DateTime.now().add(const Duration(hours: 1)),
   );
   @override
@@ -69,6 +75,8 @@ class HostedCommunitiesFixture {
   List<Map<String, dynamic>> rows = [];
   String? bound;
   bool rejectList = false;
+  bool expired = false;
+  String subject = 'owner';
   Future<void> Function(String)? beforeAdmission;
   Future<void> Function()? beforeList;
   Uri? opened;
@@ -97,8 +105,9 @@ class HostedCommunitiesFixture {
           );
         }
         if (path.endsWith('/me')) {
+          if (expired) return http.Response('{}', 401);
           return http.Response(
-            jsonEncode({'subject': 'owner', 'expires_at': expiry}),
+            jsonEncode({'subject': subject, 'expires_at': expiry}),
             200,
           );
         }

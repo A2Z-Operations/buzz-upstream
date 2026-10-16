@@ -24,19 +24,27 @@ Future<List<AddCommunityDeepLink>> loadHostedCommunities(
     }
     final host = row['normalized_host'];
     final name = row['name'];
-    if (host is! String ||
-        !RegExp(r'^[a-z0-9]+(?:[.-][a-z0-9]+)*$').hasMatch(host) ||
-        name is! String ||
-        name.trim().isEmpty) {
+    if (host is! String || name is! String || name.trim().isEmpty) {
       throw AccountFailure.invalidResponse;
     }
-    final relay = Uri(scheme: 'wss', host: host);
-    if (!HostedEnvironment.supportsRelay(relay)) {
+    final relay = Uri.tryParse(host.contains('://') ? host : 'wss://$host');
+    if (relay == null ||
+        relay.scheme != 'wss' ||
+        !RegExp(r'^[a-z0-9]+(?:[.-][a-z0-9]+)*$').hasMatch(relay.host) ||
+        relay.userInfo.isNotEmpty ||
+        relay.hasQuery ||
+        relay.hasFragment ||
+        (relay.path.isNotEmpty && relay.path != '/') ||
+        (relay.hasPort && relay.port != 443)) {
       throw AccountFailure.invalidResponse;
     }
+    // A hosted listing can contain communities this build cannot enter.
+    // Never redirect the account session or discard otherwise usable entries.
+    if (!HostedEnvironment.supportsRelay(relay)) continue;
+    final canonical = Uri(scheme: 'wss', host: relay.host);
     communities.putIfAbsent(
-      host,
-      () => AddCommunityDeepLink(relayUrl: relay.toString(), name: name),
+      canonical.host,
+      () => AddCommunityDeepLink(relayUrl: canonical.toString(), name: name),
     );
   }
   return List.unmodifiable(communities.values);

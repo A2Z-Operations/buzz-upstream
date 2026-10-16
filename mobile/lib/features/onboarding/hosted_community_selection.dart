@@ -17,6 +17,17 @@ class HostedCommunitySelection extends HookConsumerWidget {
     useListenable(flow);
     final invite = useTextEditingController();
     final error = useState<String?>(null);
+    Future<void> openLink() async {
+      final uri = parseCommunityLinkInput(invite.text);
+      if (uri == null) {
+        error.value = 'Enter a valid community address or invite link.';
+        return;
+      }
+      final pending = ref.read(pendingDeepLinkProvider.notifier);
+      await flow.leave();
+      if (flow.stage == HostedFlowStage.idle) pending.open(uri);
+    }
+
     if (flow.communities.isNotEmpty) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -55,6 +66,9 @@ class HostedCommunitySelection extends HookConsumerWidget {
         TextField(
           controller: invite,
           keyboardType: TextInputType.url,
+          textInputAction: TextInputAction.go,
+          onSubmitted: (_) => openLink(),
+          onChanged: (_) => error.value = null,
           autocorrect: false,
           enableSuggestions: false,
           decoration: InputDecoration(
@@ -63,17 +77,7 @@ class HostedCommunitySelection extends HookConsumerWidget {
           ),
         ),
         OutlinedButton(
-          onPressed: () async {
-            final uri = parseCommunityLinkInput(invite.text);
-            if (uri == null) {
-              error.value = 'Enter a valid community address or invite link.';
-              return;
-            }
-            // Hand off to the existing dispatcher, including self-hosted invites.
-            final pending = ref.read(pendingDeepLinkProvider.notifier);
-            await flow.leave();
-            if (flow.stage == HostedFlowStage.idle) pending.open(uri);
-          },
+          onPressed: openLink,
           child: const Text('Open community link'),
         ),
       ],

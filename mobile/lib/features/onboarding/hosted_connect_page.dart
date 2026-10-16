@@ -3,11 +3,11 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/hosted/hosted_flow.dart';
-import 'hosted_community_selection.dart';
 import '../../shared/hosted/hosted_flow_problem_message.dart';
 import '../../shared/utils/string_utils.dart';
 import '../../shared/theme/grid.dart';
 import '../../shared/theme/theme_extensions.dart';
+import 'hosted_community_selection.dart';
 
 /// Presents the app-scoped real flow without retaining credentials or keys.
 class HostedConnectPage extends HookConsumerWidget {
@@ -31,8 +31,11 @@ class HostedConnectPage extends HookConsumerWidget {
             : 'Adding ${flow.addingCommunityName}…',
       HostedFlowStage.chooseCommunities =>
         flow.communities.isEmpty
-            ? 'No active owned communities yet. Create one in Builderlab, then refresh, or enter a community link.'
+            ? 'No communities to add. Create one in Builderlab, then refresh, or enter a community link.'
             : 'Choose your communities',
+      HostedFlowStage.communityConflict =>
+        '${flow.addingCommunityName} is already saved with a different identity. '
+            'Keep that identity and skip this addition, or return to your choices?',
       HostedFlowStage.chooseIdentity =>
         flow.identityChoices.any((choice) => choice.fromCloud)
             ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
@@ -87,17 +90,30 @@ class HostedConnectPage extends HookConsumerWidget {
                       ),
                     if (flow.stage == HostedFlowStage.chooseCommunities)
                       HostedCommunitySelection(flow: flow),
-                    if (flow.stage == HostedFlowStage.blocked &&
+                    if (flow.stage == HostedFlowStage.communityConflict)
+                      FilledButton(
+                        onPressed: flow.skipConflictingCommunity,
+                        child: const Text('Keep saved identity and skip'),
+                      ),
+                    if (flow.canChangeCommunities)
+                      OutlinedButton(
+                        onPressed: flow.backToCommunityChoices,
+                        child: const Text('Back to choices'),
+                      ),
+                    if ((flow.stage == HostedFlowStage.blocked ||
+                            flow.stage == HostedFlowStage.communityConflict) &&
                         flow.addedCommunityCount > 0)
                       Text(
-                        '${flow.addedCommunityCount} communities added. '
-                        'They have been kept; retry continues the remaining additions.',
+                        '${flow.addedCommunityCount} '
+                        '${flow.addedCommunityCount == 1 ? "community" : "communities"} added and kept.'
+                        '${flow.canRetry && flow.stage == HostedFlowStage.blocked ? " Retry continues the remaining additions." : ""}',
                       ),
                     if (working)
                       const Center(child: CircularProgressIndicator()),
                     if (!working &&
                         flow.stage != HostedFlowStage.chooseIdentity &&
                         flow.stage != HostedFlowStage.chooseCommunities &&
+                        flow.stage != HostedFlowStage.communityConflict &&
                         flow.stage != HostedFlowStage.complete &&
                         flow.stage != HostedFlowStage.browserReturned &&
                         flow.canRetry)

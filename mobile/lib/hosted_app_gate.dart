@@ -12,6 +12,7 @@ import 'shared/hosted/account_identity_store.dart';
 import 'shared/hosted/browser_auth.dart';
 import 'shared/hosted/builderlab_account.dart';
 import 'shared/hosted/hosted_admission.dart';
+import 'shared/hosted/hosted_community_connection.dart';
 import 'shared/hosted/hosted_flow.dart';
 import 'shared/hosted/hosted_identity_service.dart';
 import 'shared/hosted/device_identity_source.dart';
@@ -44,36 +45,17 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
       deviceIdentities: DeviceIdentitySource(),
     ),
     enterCommunity: (link, subject, pubkey, isCurrent) async {
-      final relay = switch (link) {
-        InviteDeepLink(:final relayUrl) => relayUrl,
-        AddCommunityDeepLink(:final relayUrl) => relayUrl,
-        _ => throw AccountFailure.invalidResponse,
-      };
-      final communities = await ref.read(communityStorageProvider).loadAll();
-      final existing = communities
-          .where(
-            (item) =>
-                Uri.parse(item.relayUrl).replace(path: '').toString() ==
-                Uri.parse(relay).replace(path: '').toString(),
-          )
-          .firstOrNull;
-      if (existing != null && existing.pubkey != pubkey) {
-        throw AccountIdentityFailure.mismatch;
-      }
-      if (!isCurrent()) return;
-      final prepared = await admission.prepare(
-        link,
-        subject,
-        pubkey,
+      await connectHostedCommunity(
+        link: link,
+        subject: subject,
+        pubkey: pubkey,
         isCurrent: isCurrent,
+        storage: ref.read(communityStorageProvider),
+        admission: admission,
+        persist: (community, current) => ref
+            .read(authProvider.notifier)
+            .authenticateWithCommunity(community, shouldContinue: current),
       );
-      final community = existing == null
-          ? prepared
-          : existing.copyWith(nsec: prepared.nsec);
-      if (!isCurrent()) return;
-      await ref
-          .read(authProvider.notifier)
-          .authenticateWithCommunity(community, shouldContinue: isCurrent);
     },
   );
   ref.onDispose(() {
@@ -128,8 +110,7 @@ class HostedAppGate extends HookConsumerWidget {
               .loadAll();
           final existing = communities
               .where(
-                (item) =>
-                    _relayIdentity(item.relayUrl) == _relayIdentity(relay),
+                (item) => relayIdentity(item.relayUrl) == relayIdentity(relay),
               )
               .firstOrNull;
           if (existing != null) {
@@ -208,14 +189,4 @@ class HostedAppGate extends HookConsumerWidget {
       ),
     );
   }
-}
-
-({bool secure, String host, int port}) _relayIdentity(String value) {
-  final uri = Uri.parse(value);
-  final secure = uri.scheme == 'wss' || uri.scheme == 'https';
-  return (
-    secure: secure,
-    host: uri.host.toLowerCase(),
-    port: uri.hasPort ? uri.port : (secure ? 443 : 80),
-  );
 }

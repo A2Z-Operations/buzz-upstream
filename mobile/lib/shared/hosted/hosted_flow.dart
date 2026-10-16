@@ -13,6 +13,7 @@ import 'hosted_backup_service.dart';
 import 'hpke_backup.dart';
 import 'hosted_environment.dart';
 import 'hosted_communities.dart';
+import 'hosted_community_connection.dart';
 import 'web_connect_binding.dart';
 
 enum HostedFlowStage {
@@ -21,6 +22,7 @@ enum HostedFlowStage {
   signIn,
   chooseIdentity,
   chooseCommunities,
+  communityConflict,
   blocked,
   browserReturned,
   complete,
@@ -82,6 +84,14 @@ class HostedFlow extends ChangeNotifier {
   Set<String> selectedRelays = const {};
   final Set<String> _addedRelays = {};
   bool _addingCommunities = false;
+  String? _batchSubject;
+  String? _conflictingRelay;
+  bool get canChangeCommunities =>
+      accountOnly &&
+      account.account?.subject == _batchSubject &&
+      (stage == HostedFlowStage.blocked ||
+          stage == HostedFlowStage.communityConflict) &&
+      communities.isNotEmpty;
   String? addingCommunityName;
   int get addedCommunityCount => _addedRelays.length;
   Future<void> _tail = Future.value();
@@ -173,11 +183,7 @@ class HostedFlow extends ChangeNotifier {
     final generation = openBrowser ? ++_generation : _generation;
     if (openBrowser) {
       accountOnly = true;
-      communities = const [];
-      selectedRelays = const {};
-      _addedRelays.clear();
-      _addingCommunities = false;
-      addingCommunityName = null;
+      _clearCommunityBatch();
       _set(HostedFlowStage.working);
     }
     return _enqueue(() async {
@@ -206,6 +212,7 @@ class HostedFlow extends ChangeNotifier {
     }
     final generation = ++_generation;
     accountOnly = false;
+    _clearCommunityBatch();
     _target = target;
     _set(HostedFlowStage.working);
     return _enqueue(() async {
@@ -270,6 +277,10 @@ class HostedFlow extends ChangeNotifier {
       throw AccountFailure.signedOut;
     }
     if (target != null && !_acceptTarget(target)) return;
+    if (target == null && _batchSubject != session.subject) {
+      _clearCommunityBatch();
+      _batchSubject = session.subject;
+    }
     var resolved = await identity.resolve(
       isCurrent: () => !_disposed && generation == _generation,
       selectedPubkey: selectedPubkey,
@@ -405,10 +416,38 @@ class HostedFlow extends ChangeNotifier {
     return _enqueue(() => _continue(generation));
   }
 
+  /// Keep completed additions and let the user omit a failing target.
+  void backToCommunityChoices() {
+    if (!canChangeCommunities) return;
+    ++_generation;
+    communities = List.unmodifiable(
+      communities.where((item) => !_addedRelays.contains(item.relayUrl)),
+    );
+    selectedRelays = Set.unmodifiable(selectedRelays.difference(_addedRelays));
+    _conflictingRelay = null;
+    addingCommunityName = null;
+    _set(HostedFlowStage.chooseCommunities);
+  }
+
+  Future<void> skipConflictingCommunity() {
+    final relay = _conflictingRelay;
+    if (stage != HostedFlowStage.communityConflict || relay == null) {
+      return Future.value();
+    }
+    selectedRelays = Set.unmodifiable(
+      selectedRelays.where((item) => item != relay),
+    );
+    _conflictingRelay = null;
+    final generation = ++_generation;
+    _set(HostedFlowStage.working);
+    return _enqueue(() => _continue(generation));
+  }
+
   Future<void> refreshCommunities() {
     if (!accountOnly || stage != HostedFlowStage.chooseCommunities) {
       return Future.value();
     }
+    _addingCommunities = false;
     return retry();
   }
 
@@ -454,12 +493,26 @@ class HostedFlow extends ChangeNotifier {
       }
       addingCommunityName = community.name;
       notifyListeners();
-      await enterCommunity(community, subject, pubkey, current);
+      try {
+        await enterCommunity(community, subject, pubkey, current);
+      } on SavedCommunityIdentityConflict {
+        if (!current()) return;
+        _conflictingRelay = community.relayUrl;
+        _set(HostedFlowStage.communityConflict);
+        return;
+      }
       if (!current()) return;
       _addedRelays.add(community.relayUrl);
     }
     if (!current()) return;
     addingCommunityName = null;
+    if (_addedRelays.isEmpty) {
+      communities = List.unmodifiable(
+        communities.where((item) => selectedRelays.contains(item.relayUrl)),
+      );
+      _set(HostedFlowStage.chooseCommunities);
+      return;
+    }
     await browser.clearIntent();
     if (current()) _set(HostedFlowStage.complete);
   }
@@ -529,6 +582,7 @@ class HostedFlow extends ChangeNotifier {
     AccountIdentityFailure.invalidKey ||
     AccountFailure.storage ||
     HostedBackupFailure.storage => HostedFlowProblem.identityUnreadable,
+    SavedCommunityIdentityConflict() ||
     AccountIdentityFailure.mismatch ||
     AccountIdentityFailure.occupied ||
     HostedBackupFailure.identityMismatch ||
@@ -548,16 +602,22 @@ class HostedFlow extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _clearCommunityBatch() {
+    communities = const [];
+    selectedRelays = const {};
+    _addedRelays.clear();
+    _batchSubject = null;
+    _conflictingRelay = null;
+    _addingCommunities = false;
+    addingCommunityName = null;
+  }
+
   Future<void> leave() async {
     ++_generation;
     final generation = _generation;
     _target = null;
     accountOnly = false;
-    communities = const [];
-    selectedRelays = const {};
-    _addedRelays.clear();
-    _addingCommunities = false;
-    addingCommunityName = null;
+    _clearCommunityBatch();
     try {
       await browser.cancel();
       if (_disposed || generation != _generation) return;
