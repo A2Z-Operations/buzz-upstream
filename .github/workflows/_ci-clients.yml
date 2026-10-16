@@ -187,8 +187,8 @@ jobs:
         # Xcode requires explicit approval even though swift build runs this
         # plugin directly. Trust only the revision pinned by BuzzPushKit.
         run: |
-          mkdir -p "$HOME/.swiftpm/security"
-          cat > "$HOME/.swiftpm/security/plugins.json" <<'JSON'
+          mkdir -p "$HOME/Library/org.swift.swiftpm/security"
+          cat > "$HOME/Library/org.swift.swiftpm/security/plugins.json" <<'JSON'
           [{"fingerprint":"e70a10e036a55fffea31568f0af92d69b6d449cd","packageIdentity":"swift-secp256k1","targetName":"SharedSourcesPlugin"}]
           JSON
       - name: Build
