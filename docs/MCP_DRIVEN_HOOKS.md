@@ -50,7 +50,7 @@ history and before the first LLM call of that turn. It does not fire again on
 later tool-loop rounds of the same turn. Off unless
 `BUZZ_AGENT_PRETURN_HOOK=1` (or `true`) is set.
 
-**Input:** `{"prompt": "<first 500 characters of the incoming message>"}`.
+**Input:** `{"prompt": "<first 500 characters of the human's text — a leading <context>…</context> header is skipped>"}`.
 Hooks that do not need the prompt may ignore it.
 
 **Output:** Non-empty text = injected before the first LLM call as a

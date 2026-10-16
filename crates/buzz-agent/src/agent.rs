@@ -1248,8 +1248,24 @@ const PRETURN_PROMPT_CHARS: usize = 500;
 /// char-boundary-safe excerpt so a memory plugin can key its lookup on the
 /// incoming message without receiving an unbounded payload.
 fn preturn_hook_input(user_text: &str) -> serde_json::Value {
-    let prompt: String = user_text.chars().take(PRETURN_PROMPT_CHARS).collect();
+    let prompt: String = preturn_prompt_body(user_text)
+        .chars()
+        .take(PRETURN_PROMPT_CHARS)
+        .collect();
     json!({ "prompt": prompt })
+}
+
+/// Buzz prompts open with a `<context>…</context>` header (event metadata)
+/// before the human's text. The hook keys its lookup on what the human
+/// said, so a leading header is skipped; without one the text is used as is.
+fn preturn_prompt_body(user_text: &str) -> &str {
+    let trimmed = user_text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<context>") {
+        if let Some(end) = rest.find("</context>") {
+            return rest[end + "</context>".len()..].trim_start();
+        }
+    }
+    trimmed
 }
 
 /// Synthetic provider id for an injected hook tool-call/result pair. Must
@@ -1430,6 +1446,21 @@ mod tests {
     /// same fixture, budget set to the window instead) so that "evicted
     /// nothing" is a real observation about the unit mismatch rather than a
     /// blind probe that could never evict.
+    #[test]
+    fn preturn_hook_input_skips_the_context_header() {
+        let text = "<context>\nchannel=design event=abc\n</context>\n@CAD print DDK01 v9";
+        assert_eq!(
+            preturn_hook_input(text),
+            json!({ "prompt": "@CAD print DDK01 v9" })
+        );
+        // no header → unchanged; unterminated header → unchanged
+        assert_eq!(preturn_hook_input("plain"), json!({ "prompt": "plain" }));
+        assert_eq!(
+            preturn_hook_input("<context> open"),
+            json!({ "prompt": "<context> open" })
+        );
+    }
+
     #[test]
     fn preturn_hook_input_caps_prompt_on_char_boundary() {
         assert_eq!(preturn_hook_input("hi"), json!({ "prompt": "hi" }));
