@@ -30,8 +30,6 @@ class DiscoveryBrowser extends BrowserAuth {
   @override
   Future<void> initialize() async {}
   @override
-  Future<Map<String, String>?> retainedIntent() async => null;
-  @override
   Future<void> clearIntent() async {}
   @override
   Future<void> cancel() async {}
@@ -55,6 +53,7 @@ class WidgetDiscoveryAccount extends BuilderlabAccountClient {
     Map<String, dynamic> body,
   ) async {
     if (path.endsWith('/current')) {
+      if (fixture.rejectCurrent) throw AccountFailure.denied;
       return {
         'identity': {'pubkey_hex': fixture.bound},
       };
@@ -77,6 +76,7 @@ class HostedCommunitiesFixture {
   List<Map<String, dynamic>> rows = [];
   String? bound;
   bool rejectList = false;
+  bool rejectCurrent = false;
   bool expired = false;
   String subject = 'owner';
   Future<void> Function(String)? beforeAdmission;

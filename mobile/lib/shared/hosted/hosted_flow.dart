@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../deeplink/deep_link.dart';
+import '../community/community.dart';
 import 'account_identity_store.dart';
 import 'device_identity_source.dart';
 import 'browser_auth.dart';
@@ -31,6 +32,7 @@ enum HostedFlowStage {
 enum HostedFlowProblem {
   retry,
   denied,
+  accountSetupRequired,
   differentAccount,
   identityUnreadable,
   backupUnavailable,
@@ -80,6 +82,8 @@ class HostedFlow extends ChangeNotifier {
   List<DeviceIdentityChoice> identityChoices = const [];
   BuzzDeepLink? _target;
   bool accountOnly = false;
+  String? _pairedPubkey;
+  SensitiveActionPolicy? pairedSensitiveActionPolicy;
   List<AddCommunityDeepLink> communities = const [];
   Set<String> selectedRelays = const {};
   final Set<String> _addedRelays = {};
@@ -118,6 +122,7 @@ class HostedFlow extends ChangeNotifier {
           return;
         }
         accountOnly = false;
+        _restorePairing(code.intent);
         final target = _decode(code.intent);
         if (target == null) throw BrowserAuthFailure.restartLogin;
         _target = target;
@@ -162,6 +167,7 @@ class HostedFlow extends ChangeNotifier {
             accountOnly = true;
             _set(HostedFlowStage.idle);
           } else {
+            _restorePairing(retained);
             _target = _decode(retained);
           }
           if (_target != null && stage == HostedFlowStage.idle) {
@@ -204,7 +210,64 @@ class HostedFlow extends ChangeNotifier {
     });
   }
 
-  Future<void> start(BuzzDeepLink target) {
+  /// Securely retain the transferred identity before NIP-AB completion. Hosted
+  /// admission still waits for account, binding and backup in the normal flow.
+  Future<void> stagePairedCommunity(
+    Community community, {
+    required bool Function() isCurrent,
+  }) async {
+    final uri = Uri.parse(community.relayUrl);
+    if (!HostedEnvironment.supportsRelay(uri)) throw AccountFailure.denied;
+    final nsec = community.nsec;
+    if (nsec == null) throw AccountIdentityFailure.absent;
+    final pubkey = AccountIdentityStore.publicKeyForNsec(nsec);
+    if (community.pubkey != null && community.pubkey != pubkey) {
+      throw AccountIdentityFailure.mismatch;
+    }
+    final device = await DeviceIdentitySource().choices();
+    if (device.isNotEmpty && !device.any((item) => item.pubkey == pubkey)) {
+      throw AccountIdentityFailure.mismatch;
+    }
+    final generation = ++_generation;
+    void check() {
+      if (!isCurrent() || generation != _generation || _disposed) {
+        throw AccountFailure.unavailable;
+      }
+    }
+
+    check();
+    await store.create(nsec, checkCurrent: check);
+    check();
+    final relay = uri.replace(scheme: 'wss').toString();
+    final target = AddCommunityDeepLink(relayUrl: relay, name: community.name);
+    _pairedPubkey = pubkey;
+    pairedSensitiveActionPolicy = community.sensitiveActionPolicy;
+    await browser.retainIntent(_intent(target));
+    check();
+    _target = target;
+    accountOnly = false;
+    _set(HostedFlowStage.signIn);
+  }
+
+  void _restorePairing(Map<String, String> intent) {
+    _pairedPubkey = intent['paired_pubkey'];
+    pairedSensitiveActionPolicy = intent['paired_protection'] == 'enabled'
+        ? SensitiveActionPolicy.enabled
+        : null;
+  }
+
+  Map<String, String> _intent(BuzzDeepLink target) => {
+    ..._encode(target),
+    'paired_pubkey': ?_pairedPubkey,
+    if (pairedSensitiveActionPolicy == SensitiveActionPolicy.enabled)
+      'paired_protection': 'enabled',
+  };
+
+  Future<void> start(BuzzDeepLink target, {bool resumePairing = false}) {
+    if (!resumePairing) {
+      _pairedPubkey = null;
+      pairedSensitiveActionPolicy = null;
+    }
     if (target is! NostrBindDeepLink &&
         target is! AddCommunityDeepLink &&
         target is! InviteDeepLink) {
@@ -222,7 +285,7 @@ class HostedFlow extends ChangeNotifier {
       if (generation != _generation) return;
       if (restored == null) {
         _set(HostedFlowStage.signIn);
-        await browser.start(_encode(target));
+        await browser.start(_intent(target));
       } else {
         await _continue(generation);
       }
@@ -237,7 +300,7 @@ class HostedFlow extends ChangeNotifier {
       await browser.cancel();
       if (_disposed || generation != _generation) return;
       if (target != null) {
-        await start(target);
+        await start(target, resumePairing: _pairedPubkey != null);
       } else {
         _set(HostedFlowStage.working);
         await _enqueue(() async {
@@ -285,6 +348,10 @@ class HostedFlow extends ChangeNotifier {
       isCurrent: () => !_disposed && generation == _generation,
       selectedPubkey: selectedPubkey,
     );
+    if (_pairedPubkey != null && resolved.pubkey != _pairedPubkey) {
+      _set(HostedFlowStage.blocked, HostedFlowProblem.identityMismatch);
+      return;
+    }
     if (target is! NostrBindDeepLink) {
       for (var step = 0; step < 2; step++) {
         if (_disposed || generation != _generation) return;
@@ -556,6 +623,8 @@ class HostedFlow extends ChangeNotifier {
 
   static HostedFlowProblem _problemFor(Object error) => switch (error) {
     AccountFailure.denied => HostedFlowProblem.denied,
+    AccountFailure.accountSetupRequired =>
+      HostedFlowProblem.accountSetupRequired,
     AccountFailure.rejected ||
     HostedBackupFailure.rejected => HostedFlowProblem.requestRejected,
     HostedBackupFailure.unavailable => HostedFlowProblem.backupUnavailable,
@@ -601,6 +670,8 @@ class HostedFlow extends ChangeNotifier {
     ++_generation;
     final generation = _generation;
     _target = null;
+    _pairedPubkey = null;
+    pairedSensitiveActionPolicy = null;
     accountOnly = false;
     _clearCommunityBatch();
     noCommunitiesToAdd = noCommunities;
@@ -631,7 +702,10 @@ class HostedFlow extends ChangeNotifier {
   }
 
   static BuzzDeepLink? _decode(Map<String, String> intent) {
-    final fields = Map<String, String>.of(intent)..remove('type');
+    final fields = Map<String, String>.of(intent)
+      ..remove('type')
+      ..remove('paired_pubkey')
+      ..remove('paired_protection');
     final host = switch (intent['type']) {
       'bind' => 'nostr-bind',
       'add' => 'add-community',

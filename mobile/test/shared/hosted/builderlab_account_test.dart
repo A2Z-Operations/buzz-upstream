@@ -61,6 +61,76 @@ void main() {
     },
   );
 
+  for (final scenario in [
+    (
+      'ACCOUNT_DETAILS_STATUS_MISSING',
+      'ACCOUNT_SCREENING_STATUS_NOT_SCREENED',
+      true,
+    ),
+    (
+      'ACCOUNT_DETAILS_STATUS_COMPLETE',
+      'ACCOUNT_SCREENING_STATUS_NOT_SCREENED',
+      true,
+    ),
+    (
+      'ACCOUNT_DETAILS_STATUS_COMPLETE',
+      'ACCOUNT_SCREENING_STATUS_REJECTED',
+      false,
+    ),
+    (
+      'ACCOUNT_DETAILS_STATUS_COMPLETE',
+      'ACCOUNT_SCREENING_STATUS_PASSED',
+      false,
+    ),
+  ]) {
+    test(
+      'account screening ${scenario.$2} maps denial and preserves session',
+      () async {
+        final client = BuilderlabAccountClient(
+          httpClient: MockClient((request) async {
+            if (request.url.path.endsWith('/exchange')) {
+              return http.Response(
+                jsonEncode({
+                  'session_credential': 'fixture',
+                  'expires_at': expiry,
+                }),
+                200,
+              );
+            }
+            if (request.url.path.endsWith('/me')) {
+              return http.Response(
+                jsonEncode({
+                  'subject': 'fixture',
+                  'expires_at': expiry,
+                  'roles': ['ROLE_USER'],
+                  'enabled_products': [],
+                  'account_standing': {
+                    'details_status': scenario.$1,
+                    'screening_status': scenario.$2,
+                  },
+                }),
+                200,
+              );
+            }
+            return http.Response('forbidden', 403);
+          }),
+        );
+        addTearDown(client.dispose);
+        await client.exchange(code: 'fixture', verifier: verifier);
+        expect(client.account?.needsAccountSetup, scenario.$3);
+        await expectLater(
+          client.currentIdentity(),
+          throwsA(
+            scenario.$3
+                ? AccountFailure.accountSetupRequired
+                : AccountFailure.denied,
+          ),
+        );
+        expect(client.account, isNotNull);
+      },
+    );
+  }
+
   test('invalid verification cannot persist an exchanged credential', () async {
     final transport = MockClient(
       (request) async => http.Response(

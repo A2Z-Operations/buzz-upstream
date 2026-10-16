@@ -16,6 +16,7 @@ import 'hosted_environment.dart';
 enum AccountFailure {
   signedOut,
   denied,
+  accountSetupRequired,
   unavailable,
   invalidResponse,
   storage,
@@ -29,7 +30,12 @@ enum AccountFailure {
 }
 
 class BuilderlabAccount {
-  const BuilderlabAccount({required this.subject, required this.expiresAt});
+  const BuilderlabAccount({
+    required this.subject,
+    required this.expiresAt,
+    this.needsAccountSetup = false,
+  });
+  final bool needsAccountSetup;
   final String subject;
   final DateTime expiresAt;
 }
@@ -187,7 +193,17 @@ class BuilderlabAccountClient {
       throw AccountFailure.invalidResponse;
     }
     if (!parsed.isAfter(DateTime.now().toUtc())) throw AccountFailure.signedOut;
-    return BuilderlabAccount(subject: subject, expiresAt: parsed);
+    final standing = result['account_standing'];
+    final needsSetup =
+        standing is Map &&
+        (standing['details_status'] == 'ACCOUNT_DETAILS_STATUS_MISSING' ||
+            standing['screening_status'] ==
+                'ACCOUNT_SCREENING_STATUS_NOT_SCREENED');
+    return BuilderlabAccount(
+      subject: subject,
+      expiresAt: parsed,
+      needsAccountSetup: needsSetup,
+    );
   }
 
   /// Public identity metadata only. Private-key recovery belongs to the identity
@@ -208,6 +224,10 @@ class BuilderlabAccountClient {
       try {
         return await _request(path, credential: credential, body: body);
       } on AccountFailure catch (failure) {
+        if (failure == AccountFailure.denied &&
+            _account?.needsAccountSetup == true) {
+          throw AccountFailure.accountSetupRequired;
+        }
         if (failure != AccountFailure.signedOut) rethrow;
       }
       // Routes also answer 401 for authorization failures, so only a rejected
@@ -259,7 +279,7 @@ class BuilderlabAccountClient {
           .timeout(const Duration(seconds: 30));
       if (kDebugMode && response.statusCode >= 400) {
         debugPrint(
-          'Builderlab ${request.method} $path: HTTP ${response.statusCode}',
+          'Builderlab ${origin.host} ${request.method} $path: HTTP ${response.statusCode} contentType=${response.headers['content-type']?.split(';').first}',
         );
       }
       if (response.statusCode == 401) throw AccountFailure.signedOut;

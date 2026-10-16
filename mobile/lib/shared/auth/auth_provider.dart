@@ -60,25 +60,28 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
   Future<void> authenticateWithCommunity(
     Community community, {
     bool Function()? shouldContinue,
+    bool activate = true,
   }) {
     return ref.read(communityTransitionProvider).runExclusive(() async {
       if (shouldContinue != null && !shouldContinue()) return;
       await CommunityEntryRequirements.verify(community);
       if (shouldContinue != null && !shouldContinue()) return;
-      await ref.read(communityTransitionProvider).run();
+      if (activate) await ref.read(communityTransitionProvider).run();
       if (shouldContinue != null && !shouldContinue()) return;
       final storage = ref.read(communityStorageProvider);
       await storage.save(community);
-      await storage.saveActiveId(community.id);
+      if (activate) await storage.saveActiveId(community.id);
       await syncStoredCommunitySnapshot(ref);
 
       // Invalidate community providers so other consumers pick up the new data.
       ref.invalidate(communityListProvider);
       ref.invalidate(activeCommunityProvider);
 
-      state = AsyncData(
-        AuthState(status: AuthStatus.authenticated, community: community),
-      );
+      if (activate) {
+        state = AsyncData(
+          AuthState(status: AuthStatus.authenticated, community: community),
+        );
+      }
     });
   }
 

@@ -19,7 +19,7 @@ class _CommunityLinkForm extends HookConsumerWidget {
         !flow.accountOnly &&
         (flow.stage == HostedFlowStage.working ||
             flow.stage == HostedFlowStage.signIn);
-    final failed = ownsFlow && flow.problem != null;
+    final failed = ownsFlow && !flow.accountOnly && flow.problem != null;
 
     void submit() {
       if (busy || (failed && !flow.canRetry)) return;
@@ -80,7 +80,6 @@ class _CommunityLinkForm extends HookConsumerWidget {
           style: context._onboardingGhostButtonStyle,
           onPressed: () {
             unawaited(flow.leave());
-            ref.read(hostedInlineEntryProvider.notifier).setActive(false);
             onBack?.call();
           },
           child: const Text('Back'),

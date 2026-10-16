@@ -516,6 +516,7 @@ class _RecordingPairAuthNotifier extends _UnauthenticatedAuthNotifier {
   Future<void> authenticateWithCommunity(
     Community community, {
     bool Function()? shouldContinue,
+    bool activate = true,
   }) async {
     if (shouldContinue != null && !shouldContinue()) return;
     imports += 1;

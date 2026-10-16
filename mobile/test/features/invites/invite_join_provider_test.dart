@@ -790,6 +790,7 @@ class _RecordingAuthNotifier extends AuthNotifier {
   Future<void> authenticateWithCommunity(
     Community community, {
     bool Function()? shouldContinue,
+    bool activate = true,
   }) async {
     if (shouldContinue != null && !shouldContinue()) return;
     final storage = ref.read(communityStorageProvider);

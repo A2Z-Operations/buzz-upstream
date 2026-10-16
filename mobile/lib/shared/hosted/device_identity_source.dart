@@ -38,6 +38,16 @@ class DeviceIdentitySource {
     return store.create(candidate.nsec, checkCurrent: checkCurrent);
   }
 
+  /// Supplies a freshly validated saved identity only to an admission service.
+  Future<T> withIdentity<T>(
+    String pubkey,
+    Future<T> Function(String nsec) operation,
+  ) async {
+    final candidate = (await _read())[pubkey];
+    if (candidate == null) throw AccountIdentityFailure.absent;
+    return operation(candidate.nsec);
+  }
+
   Future<Map<String, ({String nsec, String label})>> _read() async {
     try {
       final result = <String, ({String nsec, String label})>{};

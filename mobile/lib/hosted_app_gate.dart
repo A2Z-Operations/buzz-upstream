@@ -6,6 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/onboarding/hosted_connect_page.dart';
+import 'features/onboarding/self_hosted_entry_sheet.dart';
 import 'shared/auth/auth.dart';
 import 'shared/theme/grid.dart';
 import 'shared/deeplink/deep_link.dart';
@@ -28,7 +29,24 @@ class HostedInlineEntry extends Notifier<bool> {
   @override
   bool build() => false;
 
-  void setActive(bool active) => state = active;
+  void setActive(bool active) {
+    if (ref.mounted) state = active;
+  }
+}
+
+/// Signals a completed local admission to the currently mounted Add route.
+final communityEntryCompletionProvider =
+    NotifierProvider<CommunityEntryCompletion, int>(
+      CommunityEntryCompletion.new,
+    );
+
+class CommunityEntryCompletion extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void complete() {
+    if (ref.mounted) state++;
+  }
 }
 
 final hostedFlowProvider = Provider<HostedFlow>((ref) {
@@ -36,7 +54,8 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
   final browser = BrowserAuth();
   final store = AccountIdentityStore();
   final admission = HostedAdmission(account: account, store: store);
-  final flow = HostedFlow(
+  late final HostedFlow flow;
+  flow = HostedFlow(
     account: account,
     browser: browser,
     store: store,
@@ -55,7 +74,15 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
         admission: admission,
         persist: (community, current) => ref
             .read(authProvider.notifier)
-            .authenticateWithCommunity(community, shouldContinue: current),
+            .authenticateWithCommunity(
+              flow.pairedSensitiveActionPolicy == null
+                  ? community
+                  : community.copyWith(
+                      sensitiveActionPolicy: flow.pairedSensitiveActionPolicy,
+                    ),
+              shouldContinue: current,
+              activate: flow.addedCommunityCount == 0,
+            ),
       );
     },
   );
@@ -104,6 +131,12 @@ class HostedAppGate extends HookConsumerWidget {
         (flow.accountOnly &&
             flow.stage == HostedFlowStage.working &&
             flow.account.account == null);
+    final inlineAccountStatus =
+        (!authenticated || inlineEntry) &&
+        flow.accountOnly &&
+        (flow.stage == HostedFlowStage.working ||
+            (flow.stage == HostedFlowStage.blocked &&
+                !flow.canChangeCommunities));
     return DeepLinkDispatcher(
       dispatchMessageLinks: authenticated && !visible,
       onboardingHandler: (routeContext, link) async {
@@ -125,29 +158,23 @@ class HostedAppGate extends HookConsumerWidget {
             await ref
                 .read(communityListProvider.notifier)
                 .switchCommunity(existing.id);
+            if (context.mounted) {
+              ref.read(communityEntryCompletionProvider.notifier).complete();
+            }
             return true;
           }
           final host = Uri.parse(relay).host.toLowerCase();
           final reserved = HostedEnvironment.isReservedHost(host);
           if (!reserved && link is AddCommunityDeepLink) {
             if (routeContext.mounted) {
-              await showDialog<void>(
-                context: routeContext,
-                builder: (context) => AlertDialog(
-                  title: const Text('An invite or pairing code is needed'),
-                  content: const Text(
-                    'To join this community in this build, enter an invite link '
-                    'or pair with your desktop. Setup using only an address '
-                    'is not available for this community yet.',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text('Back'),
-                    ),
-                  ],
-                ),
+              final joined = await showSelfHostedEntry(
+                routeContext,
+                relay: link.relayUrl,
+                name: link.name,
               );
+              if (joined && context.mounted) {
+                ref.read(communityEntryCompletionProvider.notifier).complete();
+              }
             }
             return true;
           }
@@ -195,8 +222,8 @@ class HostedAppGate extends HookConsumerWidget {
               child: SafeArea(
                 child: Material(
                   color: Colors.transparent,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
+                  child: Wrap(
+                    alignment: WrapAlignment.center,
                     children: [
                       TextButton(
                         onPressed: flow.retry,
@@ -213,9 +240,12 @@ class HostedAppGate extends HookConsumerWidget {
             ),
           if (visible &&
               !openingSignIn &&
+              !inlineAccountStatus &&
               (!inlineEntry ||
-                  flow.accountOnly ||
-                  flow.stage == HostedFlowStage.chooseIdentity))
+                  flow.stage == HostedFlowStage.chooseIdentity ||
+                  flow.stage == HostedFlowStage.chooseCommunities ||
+                  flow.stage == HostedFlowStage.communityConflict ||
+                  flow.canChangeCommunities))
             HostedConnectPage(
               flow: flow,
               onClose: () => unawaited(flow.leave()),

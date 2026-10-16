@@ -94,7 +94,16 @@ class HostedIdentityService {
     final statusKeys = listed.map(_pubkey).toSet();
     if (statusBound != bound) throw AccountFailure.invalidResponse;
     if (local != null) {
-      if (statusKeys.any((key) => key != local.pubkey)) {
+      // A previously chosen recovery key may still await binding after a
+      // restart. Its account-scoped receipt and current backup listing preserve
+      // that choice even when the account also retains older identities.
+      final confirmedSelection =
+          statusKeys.contains(local.pubkey) &&
+          local.hasBackupFor(
+            backend: BuilderlabAccountClient.origin.origin,
+            subject: subject,
+          );
+      if (statusKeys.any((key) => key != local.pubkey) && !confirmedSelection) {
         return const HostedIdentityResult(HostedIdentityState.mismatch);
       }
       return _result(local, bound, subject);
@@ -210,12 +219,29 @@ class HostedIdentityService {
     } catch (_) {
       throw AccountFailure.invalidResponse;
     }
-    if (candidates.length != 1) {
-      return const HostedIdentityResult(HostedIdentityState.recoveryBlocked);
-    }
-    final candidate = candidates.values.single;
-    if (bound != null && bound != candidate.keys.public) {
-      return const HostedIdentityResult(HostedIdentityState.mismatch);
+    // An account binding is authoritative even when older backups contain
+    // other keys. Without a binding, distinct keys require an explicit choice;
+    // never let response ordering choose the user's identity.
+    final chosen =
+        bound ??
+        selectedPubkey ??
+        (candidates.length == 1 ? candidates.keys.single : null);
+    final candidate = candidates[chosen];
+    if (candidate == null) {
+      if (bound != null) {
+        return const HostedIdentityResult(HostedIdentityState.mismatch);
+      }
+      return HostedIdentityResult(
+        HostedIdentityState.needsSelection,
+        choices: [
+          for (final pubkey in candidates.keys)
+            DeviceIdentityChoice(
+              pubkey,
+              'Use Builderlab identity',
+              fromCloud: true,
+            ),
+        ],
+      );
     }
     if (device.isNotEmpty &&
         !device.any((item) => item.pubkey == candidate.keys.public) &&

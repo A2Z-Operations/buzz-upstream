@@ -26,7 +26,7 @@ class _Flow extends HostedFlow {
   @override
   Future<void> initialize() async {}
   @override
-  Future<void> start(BuzzDeepLink target) async {
+  Future<void> start(BuzzDeepLink target, {bool resumePairing = false}) async {
     started = target;
   }
 }

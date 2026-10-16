@@ -29,7 +29,9 @@ class HostedConnectSheet extends HookConsumerWidget {
         '${flow.addingCommunityName} is already saved with a different identity. '
             'Keep that identity and skip this addition, or return to your choices?',
       HostedFlowStage.chooseIdentity =>
-        flow.identityChoices.any((choice) => choice.fromCloud)
+        flow.identityChoices.where((choice) => choice.fromCloud).length > 1
+            ? 'Choose a backed-up identity to connect to Builderlab. Your other backups and saved community keys will be kept. This app cannot change the selected Builderlab identity later.'
+            : flow.identityChoices.any((choice) => choice.fromCloud)
             ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
             : 'Choose the identity to connect to Builderlab. It will be bound to your account and backed up. Existing keys will be kept. This app cannot change the selected Builderlab identity later.',
       HostedFlowStage.signIn => 'Complete sign-in in your browser.',

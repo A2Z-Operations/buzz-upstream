@@ -5,6 +5,8 @@ String hostedFlowProblemMessage(
 ) => switch (problem) {
   HostedFlowProblem.unsupportedEnvironment =>
     'This community needs a different or unsupported Builderlab environment. Use an app build configured for this community.',
+  HostedFlowProblem.accountSetupRequired =>
+    'This account is not eligible for Buzz yet.',
   HostedFlowProblem.denied => 'This account does not have access.',
   HostedFlowProblem.differentAccount =>
     'Your browser signed in to a different account. Sign in to your original account on the web, then reopen setup. Your saved account and keys have been kept.',
@@ -19,7 +21,7 @@ String hostedFlowProblemMessage(
   HostedFlowProblem.identityMismatch =>
     'This account uses a different identity. Your saved identity has been kept.',
   HostedFlowProblem.backupRequired =>
-    'Your identity needs a confirmed backup before joining. Backup setup is not available in this build yet.',
+    'Your identity needs a confirmed cloud backup before joining. Your saved key has been kept.',
   HostedFlowProblem.bindingRequired =>
     'Connect your identity from the account setup page first.',
   HostedFlowProblem.identityUnavailable =>

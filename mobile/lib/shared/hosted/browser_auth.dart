@@ -97,6 +97,16 @@ class BrowserAuth {
     }
   });
 
+  /// Persist a verified pairing destination before acknowledging key transfer.
+  Future<void> retainIntent(Map<String, String> intent) => _serial(() async {
+    final raw = jsonEncode(intent);
+    if (raw.length > 16384) throw BrowserAuthFailure.storage;
+    await _storage.write(key: _intentKey, value: raw);
+    if (await _storage.read(key: _intentKey) != raw) {
+      throw BrowserAuthFailure.storage;
+    }
+  });
+
   Future<void> start(Map<String, String> intent) async {
     final generation = ++_generation;
     final uri = await _serial(() async {

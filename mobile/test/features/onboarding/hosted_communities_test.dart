@@ -17,6 +17,8 @@ void main() {
   testWidgets(
     'welcome discovery selection and empty-state handoff use the real flow',
     (tester) async {
+      await tester.binding.setSurfaceSize(const Size(440, 956));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
       // Keep the process-wide secure-store queue in one widget-test zone.
       {
         FlutterSecureStorage.setMockInitialValues({});
@@ -135,35 +137,21 @@ void main() {
           findsOneWidget,
         );
         f.rows = [f.row('denied')];
-        f.beforeAdmission = (_) async => throw AccountFailure.denied;
+        f.rejectCurrent = true;
         await tester.tap(find.text('Continue with Builderlab'));
         await tester.pumpAndSettle();
-        expect(find.byType(BuzzSheetHeader), findsOneWidget);
-        expect(
-          find.text(
-            'No communities available to add. Scan a QR code or use an invite link.',
-          ),
-          findsNothing,
-        );
-        final semantics = tester.ensureSemantics();
-        await tester.pumpAndSettle();
-        expect(
-          tester
-              .binding
-              .renderViews
-              .single
-              .owner!
-              .semanticsOwner!
-              .rootSemanticsNode!
-              .toStringDeep(),
-          isNot(contains('Scan a QR code')),
-        );
-        semantics.dispose();
-        expect(find.text('Scan a QR code'), findsOneWidget);
-        await tester.tap(find.byTooltip('Close sheet').hitTestable());
-        await tester.pumpAndSettle();
         expect(find.byType(BuzzSheetHeader), findsNothing);
-        expect(find.text('Scan a QR code'), findsOneWidget);
+        expect(find.text('This account does not have access.'), findsOneWidget);
+        await tester.ensureVisible(find.text('Scan a QR code'));
+        expect(find.text('Scan a QR code').hitTestable(), findsOneWidget);
+        await tester.ensureVisible(find.text('Use pairing code'));
+        expect(find.text('Use pairing code').hitTestable(), findsOneWidget);
+        await tester.ensureVisible(find.text('Continue with Builderlab'));
+        f.rejectCurrent = false;
+        await tester.tap(find.text('Continue with Builderlab'));
+        await tester.pumpAndSettle();
+        expect(f.admitted, ['denied']);
+        expect(find.text('This account does not have access.'), findsNothing);
       }
     },
   );

@@ -4,29 +4,76 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import 'features/pairing/pairing_page.dart';
+import 'features/onboarding/hosted_connect_sheet.dart';
 import 'features/pairing/pairing_provider.dart';
 import 'hosted_app_gate.dart';
 import 'shared/hosted/hosted_flow.dart';
+import 'shared/hosted/account_identity_store.dart';
+import 'shared/identity_transfer/nsec_import_sheet.dart';
+import 'shared/identity_transfer/nsec_transfer.dart';
+import 'shared/hosted/hosted_flow_problem_message.dart';
 
 /// Navigation over the existing branded welcome surface.
 class OnboardingAppEntry extends HookConsumerWidget {
-  const OnboardingAppEntry({super.key});
+  const OnboardingAppEntry({super.key, this.addingCommunity = false});
+  final bool addingCommunity;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final existingUser = useState(false);
+    final importedIdentity = useState(false);
     final enteringCommunityLink = useState(false);
     final flow = ref.watch(hostedFlowProvider);
     useListenable(flow);
     useEffect(() {
       Future<void> restore() async {
         await flow.initialize();
-        await flow.signInAccount(openBrowser: false);
+        if (context.mounted) await flow.signInAccount(openBrowser: false);
       }
 
       unawaited(restore());
       return null;
     }, [flow]);
+    void finishEntry() {
+      if (!addingCommunity) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!context.mounted) return;
+        final route = ModalRoute.of(context);
+        if (route != null && route.isActive) {
+          route.navigator?.removeRoute(route);
+        }
+      });
+    }
+
+    ref.listen(communityEntryCompletionProvider, (_, _) => finishEntry());
+    useEffect(() {
+      final presentation = ref.read(hostedInlineEntryProvider.notifier);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (context.mounted) presentation.setActive(true);
+      });
+      void completed() {
+        if (flow.stage == HostedFlowStage.complete) finishEntry();
+      }
+
+      flow.addListener(completed);
+      return () {
+        flow.removeListener(completed);
+        scheduleMicrotask(() {
+          presentation.setActive(false);
+          if (addingCommunity && flow.stage != HostedFlowStage.complete) {
+            unawaited(flow.leave());
+          }
+        });
+      };
+    }, [flow]);
+    final inlineSetup =
+        !flow.accountOnly &&
+        flow.stage != HostedFlowStage.idle &&
+        flow.stage != HostedFlowStage.complete &&
+        flow.stage != HostedFlowStage.chooseIdentity &&
+        flow.stage != HostedFlowStage.chooseCommunities &&
+        flow.stage != HostedFlowStage.communityConflict &&
+        !flow.canChangeCommunities;
     final signingIn = flow.stage == HostedFlowStage.signIn;
     final busy =
         flow.accountOnly &&
@@ -34,21 +81,18 @@ class OnboardingAppEntry extends HookConsumerWidget {
             flow.stage == HostedFlowStage.signIn);
     final connected = flow.account.account != null;
     final problem = flow.accountOnly ? flow.problem : null;
-    final status = flow.noCommunitiesToAdd
+    final status = problem != null
+        ? hostedFlowProblemMessage(problem)
+        : busy
+        ? 'Connecting to Builderlab…'
+        : flow.noCommunitiesToAdd
         ? 'No communities available to add. Scan a QR code or use an invite link.'
+        : importedIdentity.value
+        ? 'Identity saved. Continue with Builderlab to back it up and find your communities.'
         : connected
-        ? 'Connected to Builderlab. Your session is saved securely on this device.'
-        : problem != null
-        ? switch (problem) {
-            HostedFlowProblem.differentAccount =>
-              'A different account is already saved on this device. Sign in with that account.',
-            HostedFlowProblem.identityUnreadable =>
-              'Unable to read or save your secure session. Your existing data has been kept.',
-            _ => 'Could not finish signing in. Please try again.',
-          }
+        ? 'Connected to Builderlab.'
         : null;
     void back() {
-      ref.read(hostedInlineEntryProvider.notifier).setActive(false);
       unawaited(flow.leave());
       existingUser.value = false;
       enteringCommunityLink.value = false;
@@ -57,12 +101,29 @@ class OnboardingAppEntry extends HookConsumerWidget {
     }
 
     return PopScope(
-      canPop: !existingUser.value && !enteringCommunityLink.value,
+      canPop:
+          !existingUser.value && !enteringCommunityLink.value && !inlineSetup,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) back();
       },
       child: PairingPage(
         connectionLanding: true,
+        addingCommunity: addingCommunity,
+        onImportKey: () async {
+          final imported = await showNsecImportSheet(
+            context,
+            onImport: (nsec) async {
+              await NsecTransfer.importAccount(
+                nsec,
+                AccountIdentityStore(),
+                checkCurrent: () {
+                  if (!context.mounted) throw StateError('Import cancelled');
+                },
+              );
+            },
+          );
+          if (context.mounted && imported) importedIdentity.value = true;
+        },
         existingUser: existingUser.value,
         enteringCommunityLink: enteringCommunityLink.value,
         onCommunityLink: () => enteringCommunityLink.value = true,
@@ -72,12 +133,21 @@ class OnboardingAppEntry extends HookConsumerWidget {
             ? null
             : () => unawaited(flow.signInAccount()),
         accountStatus: status,
+        setupContent: inlineSetup
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  HostedConnectSheet(flow: flow),
+                  TextButton(onPressed: back, child: const Text('Leave setup')),
+                ],
+              )
+            : null,
         builderlabLabel: signingIn
             ? 'Cancel sign-in'
+            : busy
+            ? 'Connecting…'
             : connected
             ? 'Continue with Builderlab'
-            : busy
-            ? 'Signing in…'
             : 'Connect to Builderlab',
         onWelcomeBack: back,
         onAlreadyUseBuzz: () => existingUser.value = true,

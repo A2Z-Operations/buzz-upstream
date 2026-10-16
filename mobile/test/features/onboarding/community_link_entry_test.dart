@@ -36,6 +36,8 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
     expect(tester.getTopLeft(logo), position);
+    await tester.ensureVisible(find.text('Continue'));
+    await tester.pump();
     await tester.tap(find.text('Continue').hitTestable());
     await tester.pump();
     expect(
@@ -46,6 +48,8 @@ void main() {
       find.byKey(const Key('community-link-input')),
       'https://team.example.com/invite/abc123',
     );
+    await tester.ensureVisible(find.text('Continue'));
+    await tester.pump();
     await tester.tap(find.text('Continue').hitTestable());
     await tester.pump();
     final container = ProviderScope.containerOf(

@@ -247,7 +247,7 @@ class _CommunitySwitcherPage extends HookConsumerWidget {
       unawaited(
         navigator.push(
           MaterialPageRoute<void>(
-            builder: (_) => const PairingPage(addingCommunity: true),
+            builder: (_) => const OnboardingAppEntry(addingCommunity: true),
           ),
         ),
       );

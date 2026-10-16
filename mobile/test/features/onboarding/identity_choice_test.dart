@@ -146,8 +146,8 @@ void main() {
           expect(find.text('Second community'), findsOneWidget);
         }
         expect(await store.read(), isNull);
-        await tester.ensureVisible(find.text('Leave setup'));
-        await tester.tap(find.text('Leave setup'));
+        // Choice sheets use the shared close control to leave setup.
+        await tester.tap(find.byTooltip('Close sheet').hitTestable());
         await tester.pumpAndSettle();
         expect(flow.stage, HostedFlowStage.idle);
         expect(flow.identityChoices, isEmpty);

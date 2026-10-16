@@ -139,7 +139,7 @@ void main() {
     );
     expect(await AccountIdentityStore().read(), isNull);
   });
-  test('distinct recovered keys block even if one matches binding', () async {
+  test('distinct recovered keys select the matching account binding', () async {
     (recovery['backups'] as List).add({
       'backup_id': 'two',
       'nostr_pubkey': other.public,
@@ -151,11 +151,8 @@ void main() {
       account: await client(),
       store: AccountIdentityStore(),
     );
-    expect(
-      (await service.resolve()).state,
-      HostedIdentityState.recoveryBlocked,
-    );
-    expect(await AccountIdentityStore().read(), isNull);
+    expect((await service.resolve()).state, HostedIdentityState.ready);
+    expect((await AccountIdentityStore().read())!.pubkey, key.public);
   });
 
   test('empty recovery and unbound does not generate', () async {
