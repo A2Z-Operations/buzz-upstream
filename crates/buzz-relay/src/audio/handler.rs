@@ -593,13 +593,23 @@ pub(crate) async fn handle_active_audio_connection(
         pubkey: Some(auth_msg.event.pubkey),
         pubkey_verified: false,
     });
+    // Why a login cut off before its decision ended, read when the cut-off
+    // is seen: the session deadline passed, or the connection was cancelled
+    // for any other reason (the gate reports both as `SessionExpired`).
+    let abort_cause = || {
+        if audio_session_deadline.is_some_and(|deadline| chrono::Utc::now() >= deadline) {
+            "session_expired"
+        } else {
+            "connection_closed"
+        }
+    };
 
     let auth_ctx = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             // Expiry fired while waiting for verify_auth_event. Drain the
             // terminal channel so the denial frame reaches the client.
-            auth_line.abort_reason("session_expired");
+            auth_line.abort_reason(abort_cause());
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
@@ -791,7 +801,8 @@ pub(crate) async fn handle_active_audio_connection(
         .await;
         return;
     }
-    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send,
+        cleanup: auth_line.abort_reason(abort_cause()));
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
     let membership_admission = match check_membership_for_admission(
@@ -828,7 +839,8 @@ pub(crate) async fn handle_active_audio_connection(
             parent_channel_id, ..
         } => *parent_channel_id,
     };
-    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send,
+        cleanup: auth_line.abort_reason(abort_cause()));
 
     // Record a delegated agent's owner link before admission, as root AUTH
     // does: revoking the owner finds the agent's sockets through it, so an
@@ -841,7 +853,7 @@ pub(crate) async fn handle_active_audio_connection(
             let _owner_permit = match audio_gate.acquire_effect().await {
                 Ok(permit) => permit,
                 Err(crate::nip_fi_gate::SessionExpired) => {
-                    auth_line.abort_reason("session_expired");
+                    auth_line.abort_reason(abort_cause());
                     cancel.cancel();
                     if let Some(t) = _nip_fi_admission_expiry.take() {
                         let _ = t.await;
@@ -918,7 +930,8 @@ pub(crate) async fn handle_active_audio_connection(
         .await;
         return;
     }
-    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send,
+        cleanup: auth_line.abort_reason(abort_cause()));
 
     // Every auth and admission check passed; what follows is room joining.
     auth_line.finish(AuthResult::Success);
@@ -4842,6 +4855,159 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    // ── Access line: why an audio login cut off before its decision ended ──────
+
+    /// Where [`audio_login_abort_reason`] parks the login.
+    #[derive(Clone, Copy)]
+    enum AbortStage {
+        /// Before `verify_auth_event`.
+        Verify,
+        /// After the deny-set check, before the relay-membership policy read.
+        PolicyRead,
+    }
+
+    /// Run a real audio connection whose NIP-FI session ends at `deadline`,
+    /// park its login at `stage`, then end the connection: by an external
+    /// cancel when `external_cancel`, otherwise by waiting for the deadline
+    /// (the production expiry task cancels). Returns the login's `aborted`
+    /// reason, asserting it wrote exactly one auth line.
+    async fn audio_login_abort_reason(
+        community_uuid: uuid::Uuid,
+        deadline: chrono::DateTime<chrono::Utc>,
+        stage: AbortStage,
+        external_cancel: bool,
+    ) -> String {
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let key = nostr::Keys::generate();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+        let state = audio_test_state().await;
+        let community = buzz_core::tenant::CommunityId::from_uuid(community_uuid);
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string());
+        let conn_cancel = CancellationToken::new();
+        let cancel = conn_cancel.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let (state, tenant, assertion) =
+                    (Arc::clone(&state), tenant.clone(), assertion.clone());
+                let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        handle_active_audio_connection(
+                            socket,
+                            state,
+                            tenant,
+                            uuid::Uuid::new_v4(),
+                            control,
+                            Some(assertion),
+                            chrono::Utc::now(),
+                            None,
+                        )
+                        .await
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (guard, out) = crate::access::tests::capture_scoped();
+        let (arrived, release) = match stage {
+            AbortStage::Verify => crate::nip_fi_test_hooks::audio_auth_verify_hook::arm(community),
+            AbortStage::PolicyRead => {
+                crate::nip_fi_test_hooks::audio_after_deny_check_passed_hook::arm(community)
+            }
+        };
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect");
+        let challenge = match client.next().await.expect("challenge").expect("frame") {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                serde_json::from_str::<serde_json::Value>(&t).expect("json")["challenge"]
+                    .as_str()
+                    .expect("challenge")
+                    .to_owned()
+            }
+            other => panic!("expected a challenge, got {other:?}"),
+        };
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(auth.into()))
+            .await
+            .expect("send auth");
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived)
+            .await
+            .expect("login reaches the hook")
+            .expect("hook channel");
+
+        if external_cancel {
+            cancel.cancel();
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+                .await
+                .expect("the expiry task cancels at the deadline");
+        }
+        release.notify_one();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while client.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        drop(guard);
+
+        let lines: Vec<_> = out
+            .lines()
+            .into_iter()
+            .filter(|l| l["event"] == "auth")
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one auth line: {lines:?}");
+        assert_eq!(lines[0]["outcome"], "aborted", "{}", lines[0]);
+        lines[0]["reason"].as_str().expect("reason").to_owned()
+    }
+
+    #[tokio::test]
+    async fn audio_login_cancelled_with_live_session_logs_connection_closed() {
+        let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0001);
+        let live = chrono::Utc::now() + chrono::Duration::hours(1);
+        let reason = audio_login_abort_reason(community, live, AbortStage::Verify, true).await;
+        assert_eq!(reason, "connection_closed");
+    }
+
+    #[tokio::test]
+    async fn audio_login_past_its_deadline_logs_session_expired() {
+        let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0002);
+        let soon = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+        let reason = audio_login_abort_reason(community, soon, AbortStage::Verify, false).await;
+        assert_eq!(reason, "session_expired");
+    }
+
+    #[tokio::test]
+    async fn audio_login_expiring_during_the_policy_read_logs_session_expired() {
+        let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0003);
+        let soon = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+        let reason = audio_login_abort_reason(community, soon, AbortStage::PolicyRead, false).await;
+        assert_eq!(reason, "session_expired");
+    }
+
+    #[tokio::test]
+    async fn audio_login_cancelled_during_the_policy_read_logs_connection_closed() {
+        let community = uuid::Uuid::from_u128(0x0000_0000_0A81_0000_0000_0000_0000_0004);
+        let live = chrono::Utc::now() + chrono::Duration::hours(1);
+        let reason = audio_login_abort_reason(community, live, AbortStage::PolicyRead, true).await;
+        assert_eq!(reason, "connection_closed");
     }
 
     // ── W6 (B1 audio mid-admission): cancellation before room.add_peer ─────────

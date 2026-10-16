@@ -6115,13 +6115,17 @@ pub(crate) mod postgres_tests {
         let body = nostr::JsonUtil::as_json(&event).into_bytes();
         let headers = make_nip98_headers(&keys, &format!("https://{host}/events"), "POST", &body);
         let (guard, out) = crate::access::tests::capture_scoped();
-        let status =
-            oneshot_request(Arc::clone(&state), "POST", "/events", &host, headers, &body).await;
+        // Catch a panic in the request so the shared trigger is removed first.
+        let status = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            oneshot_request(Arc::clone(&state), "POST", "/events", &host, headers, &body),
+        ))
+        .await;
         drop(guard);
-        sqlx::query("DROP TRIGGER access_log_test_fail ON events")
+        sqlx::query("DROP TRIGGER IF EXISTS access_log_test_fail ON events")
             .execute(state.db.pool())
             .await
             .expect("remove trigger");
+        let status = status.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
         assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         let raw = out.raw();

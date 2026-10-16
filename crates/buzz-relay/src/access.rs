@@ -5,6 +5,13 @@
 //! `audit_log` table) and carries an `event` field to filter on. Search text,
 //! event content, tokens, and assertions are never recorded: filters are
 //! reduced to a [`FilterSummary`], and failures to fixed reason codes.
+//!
+//! `event=auth` lines cover every Nostr-key login: WebSocket AUTH (root and
+//! audio), NIP-98 signed HTTP requests, enterprise assertions, and Blossom
+//! uploads. Each attempt writes exactly one line. Three machine-to-machine
+//! checks are not Nostr-key logins and write no auth line: the command-token
+//! disconnect endpoint (`/api/nip-fi/disconnect`), the workflow webhook
+//! secret, and the git server's internal signed callback.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -311,6 +318,8 @@ pub(crate) enum AuthMethod {
     Nip98,
     /// Enterprise identity assertion (NIP-FI).
     NipFi,
+    /// Blossom upload authorization (kind 24242).
+    Blossom,
 }
 
 impl AuthMethod {
@@ -319,6 +328,7 @@ impl AuthMethod {
             Self::Nip42 => "nip42",
             Self::Nip98 => "nip98",
             Self::NipFi => "nip_fi",
+            Self::Blossom => "blossom",
         }
     }
 }
@@ -770,6 +780,47 @@ pub(crate) mod tests {
     pub(crate) fn capture_scoped() -> (tracing::subscriber::DefaultGuard, Captured) {
         let out = Captured::default();
         (tracing::subscriber::set_default(json_subscriber(&out)), out)
+    }
+
+    /// A replay guard whose check never finishes, so a request parks in its
+    /// replay wait; `arrived` fires once a request reaches it.
+    #[derive(Default)]
+    pub(crate) struct StallingReplayGuard {
+        pub(crate) arrived: tokio::sync::Notify,
+    }
+
+    impl buzz_auth::Nip98ReplayGuard for StallingReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            self.arrived.notify_one();
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Assert `out` holds exactly one auth line, the `aborted` line of a
+    /// request by `pubkey` dropped before its decision, and return it.
+    pub(crate) fn assert_one_aborted_auth_line(
+        out: &Captured,
+        pubkey: &PublicKey,
+    ) -> serde_json::Value {
+        let lines: Vec<_> = out
+            .lines()
+            .into_iter()
+            .filter(|l| l["event"] == "auth")
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one auth line: {lines:?}");
+        let line = lines[0].clone();
+        assert_eq!(line["outcome"], "aborted", "{line}");
+        assert_eq!(line["reason"], "request_ended", "{line}");
+        assert_eq!(line["pubkey"], pubkey.to_hex(), "{line}");
+        assert_eq!(line["pubkey_verified"], true, "{line}");
+        line
     }
 
     fn filter(json: serde_json::Value) -> Filter {

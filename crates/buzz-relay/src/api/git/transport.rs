@@ -8,7 +8,7 @@
 //! Auth: NIP-98 on all routes (clone + push). No public repos for v1.
 //! Transport: shells out to `git --stateless-rpc` with `env_clear()`.
 
-use crate::access::{auth_error_code, AuthAttempt, AuthMethod, AuthResult};
+use crate::access::{auth_error_code, AuthAttempt, AuthLine, AuthMethod, AuthResult};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -164,10 +164,13 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let pubkey = *admission.proven_pubkey();
         // Git reuses one signed token per session, so there is no replay
         // step: the membership and ban gates below make the final decision.
-        let attempt = AuthAttempt {
-            community: Some(tenant.community()),
-            ..admission.auth_attempt(&route)
-        };
+        // `aborted` if the request is dropped during a membership or ban wait.
+        let mut line = AuthLine::new(
+            admission
+                .auth_attempt(&route)
+                .in_community(tenant.community()),
+        );
+        line.abort_reason("request_ended");
         let (event, signed_auth_created_at) = admission.into_extra();
 
         // Relay membership gate (NIP-43). Git cannot carry a standalone
@@ -199,7 +202,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         {
             Ok(crate::api::relay_members::MembershipDecision::Denied) => {
                 warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
-                attempt.log(AuthResult::Denied("not_relay_member"));
+                line.finish(AuthResult::Denied("not_relay_member"));
                 return Err(
                     (StatusCode::FORBIDDEN, "restricted: not a relay member").into_response()
                 );
@@ -207,7 +210,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             Ok(_) => {}
             Err(e) => {
                 warn!(pubkey = %pubkey.to_hex(), error = %e, "git: relay membership lookup failed");
-                attempt.log(AuthResult::Denied("membership_unavailable"));
+                line.finish(AuthResult::Denied("membership_unavailable"));
                 return Err(unavailable(
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -228,15 +231,15 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         .await
         .map_err(|denial| {
             if denial.status() == StatusCode::SERVICE_UNAVAILABLE {
-                attempt.log(AuthResult::Denied("ban_check_unavailable"));
+                line.finish(AuthResult::Denied("ban_check_unavailable"));
                 unavailable(denial)
             } else {
-                attempt.log(AuthResult::Denied("banned"));
+                line.finish(AuthResult::Denied("banned"));
                 denial
             }
         })?;
 
-        attempt.log(AuthResult::Success);
+        line.finish(AuthResult::Success);
         Ok(GitAuth { pubkey, tenant })
     }
 }
@@ -4269,6 +4272,57 @@ mod off_mode_precedence_tests {
                     .execute(&admin)
                     .await;
             }
+        }
+
+        /// A Git request dropped while its relay-membership lookup is in
+        /// flight still writes one `aborted` line.
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires Postgres"]
+        async fn git_request_dropped_during_membership_logs_one_aborted_line() {
+            use base64::Engine as _;
+            let state = off_mode_state().await.expect("local Postgres");
+            let host = format!("git-drop-{}.test", uuid::Uuid::new_v4().simple());
+            let tenant = {
+                state
+                    .db
+                    .ensure_configured_community(&host)
+                    .await
+                    .expect("ensure community");
+                crate::tenant::bind_community(&state.db, &host)
+                    .await
+                    .expect("bind community")
+            };
+            let keys = nostr::Keys::generate();
+            let scheme = if state.config.relay_url.starts_with("wss://") {
+                "https"
+            } else {
+                "http"
+            };
+            let signed_url = format!("{scheme}://{host}/git/{OWNER_HEX}/myrepo");
+            let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+                .tags([
+                    nostr::Tag::parse(["u", signed_url.as_str()]).expect("u tag"),
+                    nostr::Tag::parse(["method", "GET"]).expect("method tag"),
+                ])
+                .sign_with_keys(&keys)
+                .expect("sign NIP-98 event");
+            let auth = format!(
+                "Nostr {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_string(&event).expect("serialize"))
+            );
+            // The hook parks the request right before the membership lookup.
+            let (arrived, _release) =
+                crate::nip_fi_test_hooks::git_membership_hook::arm(tenant.community());
+            let (guard, out) = crate::access::tests::capture_scoped();
+            tokio::select! {
+                _ = git_request(state, &host, Some(&auth)) => {
+                    panic!("the membership wait must stall");
+                }
+                arrived = arrived => arrived.expect("request reached the membership wait"),
+            }
+            drop(guard);
+            crate::access::tests::assert_one_aborted_auth_line(&out, &keys.public_key());
         }
 
         async fn git_request(

@@ -236,9 +236,19 @@ impl<X> NipFiAdmission<X> {
     /// caller logs it once the request's auth decision is final (after the
     /// replay check, where there is one).
     pub(crate) fn auth_attempt<'a>(&self, route: &'a str) -> AuthAttempt<'a> {
+        self.auth_attempt_as(route, AuthMethod::Nip98)
+    }
+
+    /// [`Self::auth_attempt`] for a route whose proof is `proof_method`
+    /// rather than NIP-98 (a Blossom upload).
+    pub(crate) fn auth_attempt_as<'a>(
+        &self,
+        route: &'a str,
+        proof_method: AuthMethod,
+    ) -> AuthAttempt<'a> {
         let method = match self.assertion {
             Some(_) => AuthMethod::NipFi,
-            None => AuthMethod::Nip98,
+            None => proof_method,
         };
         AuthAttempt::http(method, route, Some(self.proven_pubkey), true)
     }

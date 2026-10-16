@@ -4,7 +4,7 @@
 //! request signing and replay protection, but they do not run through event
 //! ingest, relay membership, channel scoping, storage, or fan-out.
 
-use crate::access::{AuthAttempt, AuthMethod, AuthResult};
+use crate::access::{AuthAttempt, AuthLine, AuthMethod, AuthResult};
 use std::sync::Arc;
 
 use axum::{
@@ -210,8 +210,8 @@ async fn authorize_operator_request(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_operator(headers, method, &url, body)?;
-    let auth = AuthAttempt::http(AuthMethod::Nip98, path, Some(pubkey), true);
-    check_operator_replay(state, event_id_bytes, &auth).await?;
+    let mut line = operator_auth_line(path, pubkey);
+    check_operator_replay(state, event_id_bytes, &mut line).await?;
 
     let pubkey_hex = pubkey.to_hex();
     if !state
@@ -220,13 +220,13 @@ async fn authorize_operator_request(
         .iter()
         .any(|pk| pk == &pubkey_hex)
     {
-        auth.log(AuthResult::Denied("not_operator"));
+        line.finish(AuthResult::Denied("not_operator"));
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "actor not authorized: not a relay operator",
         ));
     }
-    auth.log(AuthResult::Success);
+    line.finish(AuthResult::Success);
     Ok(pubkey)
 }
 
@@ -250,20 +250,20 @@ async fn authorize_operator_listener_request(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_operator(headers, method, &url, Some(body))?;
-    let auth = AuthAttempt::http(AuthMethod::Nip98, path, Some(pubkey), true);
-    check_operator_replay(state, event_id_bytes, &auth).await?;
+    let mut line = operator_auth_line(path, pubkey);
+    check_operator_replay(state, event_id_bytes, &mut line).await?;
     if !state
         .config
         .operator_listener_delivery_urls
         .contains_key(&pubkey.to_hex())
     {
-        auth.log(AuthResult::Denied("not_operator_listener"));
+        line.finish(AuthResult::Denied("not_operator_listener"));
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "actor not authorized: not a configured operator listener",
         ));
     }
-    auth.log(AuthResult::Success);
+    line.finish(AuthResult::Success);
     Ok(pubkey)
 }
 
@@ -318,10 +318,24 @@ pub async fn remove_listener_pubkeys(
     Ok(Json(serde_json::json!({})))
 }
 
+/// The access line for an operator request whose signature proved `pubkey`:
+/// it logs the final decision once, or `aborted` if the request is dropped
+/// during the replay wait.
+fn operator_auth_line(path: &str, pubkey: nostr::PublicKey) -> AuthLine<'_> {
+    let mut line = AuthLine::new(AuthAttempt::http(
+        AuthMethod::Nip98,
+        path,
+        Some(pubkey),
+        true,
+    ));
+    line.abort_reason("request_ended");
+    line
+}
+
 async fn check_operator_replay(
     state: &AppState,
     event_id_bytes: [u8; 32],
-    auth: &AuthAttempt<'_>,
+    line: &mut AuthLine<'_>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let event_id = nostr::EventId::from_byte_array(event_id_bytes);
     match state
@@ -335,14 +349,14 @@ async fn check_operator_replay(
     {
         Ok(true) => Ok(()),
         Ok(false) => {
-            auth.log(AuthResult::Failed("nip98_replay"));
+            line.finish(AuthResult::Failed("nip98_replay"));
             Err(api_error(
                 StatusCode::UNAUTHORIZED,
                 "NIP-98: replay detected",
             ))
         }
         Err(error) => {
-            auth.log(AuthResult::Denied("replay_check_unavailable"));
+            line.finish(AuthResult::Denied("replay_check_unavailable"));
             tracing::warn!(
                 scope = OPERATOR_REPLAY_SCOPE,
                 error = %error,
@@ -1329,6 +1343,35 @@ mod postgres_tests {
                 "missing {role} snapshot tag for {pubkey}"
             );
         }
+    }
+
+    /// An operator request dropped while its replay check is in flight
+    /// still writes one `aborted` line.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn operator_request_dropped_during_replay_logs_one_aborted_line() {
+        let operator = Keys::generate();
+        let state = operator_test_state(std::slice::from_ref(&operator))
+            .await
+            .expect("local Postgres");
+        let mut state = (*state).clone();
+        let replay = Arc::new(crate::access::tests::StallingReplayGuard::default());
+        state.nip98_replay = replay.clone();
+        // The query string is required, or extraction refuses before auth.
+        let path = format!(
+            "/operator/communities?owner_pubkey={}",
+            operator.public_key().to_hex()
+        );
+        let (guard, out) = crate::access::tests::capture_scoped();
+        tokio::select! {
+            _ = signed_operator_request(Arc::new(state), &operator, "GET", &path, None) => {
+                panic!("the replay check must stall");
+            }
+            () = replay.arrived.notified() => {}
+        }
+        drop(guard);
+        let line = crate::access::tests::assert_one_aborted_auth_line(&out, &operator.public_key());
+        assert_eq!(line["route"], "/operator/communities");
     }
 
     #[tokio::test]

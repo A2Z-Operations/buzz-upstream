@@ -26,6 +26,7 @@ use buzz_media::{
     BlobDescriptor, BlossomDenialKind, MediaError, UploadAttribution, UploadNetworkInfo,
 };
 
+use crate::access::{AuthAttempt, AuthLine, AuthMethod, AuthResult};
 use crate::state::AppState;
 
 /// Lightweight pre-auth upload context: tenant + route mode only.
@@ -339,19 +340,39 @@ pub(crate) async fn upload_blob(
         buzz_media::auth::verify_blossom_auth_event(&event, Some(&tenant_host), strict)
             .map_err(drop)
     });
+    let route = match ctx.route_mode {
+        UploadRouteMode::Upload => "/upload",
+        UploadRouteMode::LegacyMedia => "/media/upload",
+    };
     let headers_clone = headers.clone();
+    // The closure logs its own rejected proof; the helper logs only its
+    // enterprise-assertion refusals, so exactly one of them writes the line.
     let admission = match admit_nip_fi_http_on_state(&state, &headers, move || {
-        let auth_event = extract_blossom_auth(&headers_clone).map_err(|e| e.into_response())?;
+        let reject = |e: MediaError, claimed: Option<nostr::PublicKey>| {
+            AuthAttempt::http(AuthMethod::Blossom, route, claimed, false)
+                .log(AuthResult::Failed(blossom_proof_code(&e)));
+            e.into_response()
+        };
+        let auth_event = extract_blossom_auth(&headers_clone).map_err(|e| reject(e, None))?;
         // Pre-body check: freshness, cardinality, and server tag. The x-tag
         // hash binding is checked after body completion.
         buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(&tenant_host), strictness)
-            .map_err(|e| e.into_response())?;
+            .map_err(|e| reject(e, Some(auth_event.pubkey)))?;
         let pubkey = auth_event.pubkey;
         Ok(Nip98Proof::new(pubkey, auth_event))
     }) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // One line from here on: a refusal at any admission step below, success
+    // once the concurrency permit is held, or `aborted` if the request ends
+    // before either.
+    let mut line = AuthLine::new(
+        admission
+            .auth_attempt_as(route, AuthMethod::Blossom)
+            .in_community(ctx.tenant.community()),
+    );
+    line.abort_reason("request_ended");
     let auth_event = admission.into_extra();
 
     // Post-admission: validate X-SHA-256 header and hash binding.
@@ -360,44 +381,42 @@ pub(crate) async fn upload_blob(
     let claimed_hash = match headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
         Some(h) => h.to_owned(),
         None => {
-            return media_denial(MediaError::MissingTag("x-sha-256"), strictness).into_response()
+            line.finish(AuthResult::Failed("missing_hash"));
+            return media_denial(MediaError::MissingTag("x-sha-256"), strictness).into_response();
         }
     };
-    if claimed_hash.len() != 64
-        || !claimed_hash
+    let hash_bound = claimed_hash.len() == 64
+        && claimed_hash
             .chars()
             .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-    {
-        return media_denial(MediaError::HashMismatch, strictness).into_response();
-    }
-    let has_matching_x = auth_event
-        .tags
-        .iter()
-        .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(&claimed_hash)));
-    if !has_matching_x {
+        && auth_event
+            .tags
+            .iter()
+            .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(&claimed_hash)));
+    if !hash_bound {
+        line.finish(AuthResult::Failed("hash_mismatch"));
         return media_denial(MediaError::HashMismatch, strictness).into_response();
     }
 
     // Post-admission: relay membership gate (NIP-43).
     let auth_tag = crate::api::relay_members::extract_auth_tag_header(&headers);
-    if let Err(e) = crate::api::relay_members::enforce_relay_membership(
+    let membership = crate::api::relay_members::enforce_relay_membership(
         &state,
         ctx.tenant.community(),
         auth_event.pubkey.as_bytes(),
         auth_tag,
         Some(auth_event.created_at.as_secs()),
     )
-    .await
-    .map(|_| ())
-    .map_err(|e| membership_denial(e, strictness))
-    {
-        return e.into_response();
+    .await;
+    if let Err(e) = line.gate(membership, crate::api::relay_members::membership_refusal) {
+        return membership_denial(e, strictness).into_response();
     }
 
     // Post-admission: rate limit and concurrency permit.
     if upload_rate_limited(&state, ctx.tenant.community(), &auth_event.pubkey) {
         metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
             .increment(1);
+        line.finish(AuthResult::Denied("quota_exceeded"));
         return MediaError::UploadRateLimitExceeded.into_response();
     }
     let upload_permit = match acquire_upload_permit(
@@ -410,8 +429,12 @@ pub(crate) async fn upload_blob(
             .increment(1);
     }) {
         Ok(p) => p,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            line.finish(AuthResult::Denied("concurrency_limit"));
+            return e.into_response();
+        }
     };
+    line.finish(AuthResult::Success);
 
     let auth = AuthenticatedUpload {
         auth_event,
@@ -1206,6 +1229,20 @@ async fn resolve_s3_key(
 /// Takes the first `Authorization` value. Repeated `Authorization` fields are
 /// rejected in Enforce by the cardinality gate in `admit_nip_fi_http`; Off keeps
 /// the legacy first-value behavior [FI-INV-15].
+/// A fixed access-log code for a rejected Blossom proof.
+fn blossom_proof_code(e: &MediaError) -> &'static str {
+    match e {
+        MediaError::MissingAuth => "missing_auth",
+        MediaError::InvalidAuthScheme
+        | MediaError::InvalidBase64
+        | MediaError::InvalidAuthEvent => "malformed_auth",
+        MediaError::InvalidSignature => "invalid_signature",
+        MediaError::TokenExpired | MediaError::TimestampOutOfWindow => "event_expired",
+        MediaError::ServerMismatch => "server_mismatch",
+        _ => "blossom_invalid",
+    }
+}
+
 fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
@@ -2629,6 +2666,115 @@ mod tests {
                     &format!("{route}: same-key admission"),
                 );
             }
+        }
+
+        /// Run an upload with access lines captured; return the response and
+        /// the `event=auth` lines.
+        fn upload_auth_lines(
+            rt: &tokio::runtime::Runtime,
+            state: &Arc<AppState>,
+            host: &str,
+            authorization: &str,
+            assertion: Option<&str>,
+        ) -> (StatusCode, Vec<serde_json::Value>) {
+            let ((status, _, _), out) = crate::access::tests::capture(|| {
+                upload_request(rt, state, "/upload", host, &[authorization], assertion)
+            });
+            let lines = out
+                .lines()
+                .into_iter()
+                .filter(|l| l["event"] == "auth")
+                .collect();
+            (status, lines)
+        }
+
+        fn assert_one_upload_line(
+            lines: &[serde_json::Value],
+            method: &str,
+            outcome: &str,
+            reason: Option<&str>,
+        ) {
+            assert_eq!(lines.len(), 1, "exactly one auth line: {lines:?}");
+            let line = &lines[0];
+            assert_eq!(line["method"], method, "{line}");
+            assert_eq!(line["outcome"], outcome, "{line}");
+            assert_eq!(line["route"], "/upload", "{line}");
+            match reason {
+                Some(reason) => assert_eq!(line["reason"], reason, "{line}"),
+                None => assert!(line.get("reason").is_none(), "{line}"),
+            }
+        }
+
+        /// A banned caller's valid signed upload is refused at the membership
+        /// step: one `denied` line and no `success`.
+        #[test]
+        #[ignore = "requires Postgres"]
+        fn banned_upload_logs_one_denied_line() {
+            let (rt, state, host) = media_fixture(media_off_test_state());
+            let tenant = rt
+                .block_on(crate::tenant::bind_community(&state.db, &host))
+                .expect("bind community");
+            let keys = Keys::generate();
+            rt.block_on(
+                sqlx::query(
+                    "INSERT INTO community_bans (community_id, pubkey, banned, actor_pubkey) \
+                     VALUES ($1, $2, true, $2)",
+                )
+                .bind(tenant.community().as_uuid())
+                .bind(keys.public_key().to_bytes().as_slice())
+                .execute(state.db.pool()),
+            )
+            .expect("ban");
+            let proof = blossom_upload_auth_value(&keys, &host, &sha256_hex(AUDIO_BODY));
+            let (status, lines) = upload_auth_lines(&rt, &state, &host, &proof, None);
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_one_upload_line(&lines, "blossom", "denied", Some("banned"));
+        }
+
+        /// A malformed proof alongside a valid enterprise assertion: the proof
+        /// closure writes one `failed` line and the enterprise helper adds none.
+        /// Off mode, where the helper is bypassed, also writes exactly one.
+        #[test]
+        #[ignore = "requires Postgres"]
+        fn bad_upload_proof_logs_one_failed_line() {
+            let (rt, state, host) = media_fixture(media_enforce_test_state());
+            let assertion = signed_assertion(&Keys::generate().public_key().to_hex());
+            let (status, lines) = upload_auth_lines(
+                &rt,
+                &state,
+                &host,
+                "Nostr !!!not-base64!!!",
+                Some(&assertion),
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_one_upload_line(&lines, "blossom", "failed", Some("malformed_auth"));
+
+            let (rt, state, host) = media_fixture(media_off_test_state());
+            let (status, lines) =
+                upload_auth_lines(&rt, &state, &host, "Nostr !!!not-base64!!!", None);
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_one_upload_line(&lines, "blossom", "failed", Some("malformed_auth"));
+        }
+
+        /// An admitted upload logs one `success` once the concurrency permit
+        /// is held, in both modes; the later content rejection adds nothing.
+        #[test]
+        #[ignore = "requires Postgres"]
+        fn admitted_upload_logs_one_success_line() {
+            let (rt, state, host) = media_fixture(media_off_test_state());
+            let keys = Keys::generate();
+            let proof = blossom_upload_auth_value(&keys, &host, &sha256_hex(AUDIO_BODY));
+            let (status, lines) = upload_auth_lines(&rt, &state, &host, &proof, None);
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_one_upload_line(&lines, "blossom", "success", None);
+
+            let (rt, state, host) = media_fixture(media_enforce_test_state());
+            let keys = Keys::generate();
+            let assertion = signed_assertion(&keys.public_key().to_hex());
+            let proof = blossom_upload_auth_value(&keys, &host, &sha256_hex(AUDIO_BODY));
+            let (status, lines) = upload_auth_lines(&rt, &state, &host, &proof, Some(&assertion));
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_one_upload_line(&lines, "nip_fi", "success", None);
         }
 
         /// Off mode skips the cardinality gate and `HeaderMap::get` takes the
