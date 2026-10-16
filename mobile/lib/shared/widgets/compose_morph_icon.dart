@@ -13,26 +13,44 @@ class ComposeMorphIcon extends StatelessWidget {
   final Color color;
 
   @override
-  Widget build(BuildContext context) => TweenAnimationBuilder<double>(
-    tween: Tween(end: compose ? 1 : 0),
-    duration: MediaQuery.disableAnimationsOf(context)
-        ? Duration.zero
-        : const Duration(milliseconds: 240),
-    curve: Curves.easeInOutCubic,
-    builder: (context, progress, _) {
-      if (progress == 0 || progress == 1) {
-        return Icon(
-          progress == 0 ? BuzzIcons.plus : BuzzIcons.edit,
-          size: 24,
-          color: color,
-        );
-      }
-      return CustomPaint(
-        size: const Size.square(24),
-        painter: _ComposePainter(progress, color),
+  Widget build(BuildContext context) {
+    if (MediaQuery.disableAnimationsOf(context)) {
+      return Icon(
+        compose ? BuzzIcons.edit : BuzzIcons.plus,
+        size: 24,
+        color: color,
       );
-    },
-  );
+    }
+    return TweenAnimationBuilder<double>(
+      tween: Tween(end: compose ? 1 : 0),
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeInOutCubic,
+      builder: (context, progress, _) {
+        if (progress == 0 || progress == 1) {
+          return Icon(
+            progress == 0 ? BuzzIcons.plus : BuzzIcons.edit,
+            size: 24,
+            color: color,
+          );
+        }
+        final lift = math.sin(progress * math.pi);
+        return TweenAnimationBuilder<double>(
+          tween: Tween(end: compose ? 1 : -1),
+          duration: const Duration(milliseconds: 80),
+          builder: (context, direction, _) => Transform.rotate(
+            angle: direction * lift * math.pi / 12,
+            child: Transform.scale(
+              scale: 1 + 0.08 * lift,
+              child: CustomPaint(
+                size: const Size.square(24),
+                painter: _ComposePainter(progress, color),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
 
 class _ComposePainter extends CustomPainter {

@@ -273,7 +273,7 @@ class _QuickActionsSurface extends StatelessWidget {
               key: const ValueKey('quick-actions-ios-glass'),
               enabled: true,
               usesGlass: true,
-              color: context.controlSurface,
+              color: Colors.transparent,
               providesSheetSurface: false,
               padding: EdgeInsets.zero,
               minimumRadius: radius,

@@ -20,12 +20,33 @@ void main() {
     await tester.pumpWidget(app(true));
     await tester.pump(const Duration(milliseconds: 100));
     expect(find.byIcon(BuzzIcons.edit), findsNothing);
+    final transforms = tester
+        .widgetList<Transform>(
+          find.descendant(
+            of: find.byType(ComposeMorphIcon),
+            matching: find.byType(Transform),
+          ),
+        )
+        .toList();
+    expect(transforms.first.transform.entry(1, 0), greaterThan(0));
+    expect(transforms.last.transform.entry(0, 0), greaterThan(1));
     await tester.pumpWidget(app(false));
     await tester.pumpAndSettle();
     expect(find.byIcon(BuzzIcons.plus), findsOneWidget);
     await tester.pumpWidget(app(true));
     await tester.pumpAndSettle();
     expect(find.byIcon(BuzzIcons.edit), findsOneWidget);
+    await tester.pumpWidget(app(false));
+    await tester.pump(const Duration(milliseconds: 100));
+    final reverse = tester.widget<Transform>(
+      find
+          .descendant(
+            of: find.byType(ComposeMorphIcon),
+            matching: find.byType(Transform),
+          )
+          .first,
+    );
+    expect(reverse.transform.entry(1, 0), lessThan(0));
     await tester.pumpWidget(app(false, reduced: true));
     await tester.pump();
     expect(find.byIcon(BuzzIcons.plus), findsOneWidget);
