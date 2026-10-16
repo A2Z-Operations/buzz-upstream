@@ -23,18 +23,32 @@ class HostedConnectPage extends HookConsumerWidget {
       ModalRoute<dynamic>? sheetRoute;
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!active || !context.mounted) return;
-        await showBuzzModalBottomSheet<void>(
-          context: context,
-          title: 'Connect to Builderlab',
-          useRootNavigator: true,
-          isScrollControlled: true,
-          useSafeArea: true,
-          builder: (sheetContext) {
-            sheetRoute = ModalRoute.of(sheetContext);
-            return HostedConnectSheet(flow: flow);
-          },
-        );
-        if (active) onClose();
+        while (active &&
+            context.mounted &&
+            flow.stage != HostedFlowStage.complete &&
+            flow.stage != HostedFlowStage.idle) {
+          if (!context.mounted) return;
+          await showBuzzModalBottomSheet<void>(
+            context: context,
+            title: 'Connect to Builderlab',
+            useRootNavigator: true,
+            isScrollControlled: true,
+            useSafeArea: true,
+            builder: (sheetContext) {
+              sheetRoute = ModalRoute.of(sheetContext);
+              return HostedConnectSheet(flow: flow);
+            },
+          );
+          if (!active || !context.mounted) return;
+          if (flow.stage != HostedFlowStage.profile) {
+            onClose();
+            return;
+          }
+          // Dismissing an optional profile is a skip. Re-present the continuing
+          // batch so a later error or choice never ends up behind a closed sheet.
+          flow.finishProfile();
+          await WidgetsBinding.instance.endOfFrame;
+        }
       });
       return () {
         active = false;

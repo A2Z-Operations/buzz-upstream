@@ -60,13 +60,13 @@ void main() {
           backupId: 'receipt',
         ),
       );
-      final claims = <Uri>[];
+      final requests = <http.Request>[];
       final admission = HostedAdmission(
         account: account,
         store: store,
         probe: (_) async {},
         client: MockClient((request) async {
-          claims.add(request.url);
+          requests.add(request);
           return http.Response('{}', 200);
         }),
       );
@@ -95,7 +95,7 @@ void main() {
       );
       expect(flow.problem, HostedFlowProblem.unsupportedEnvironment);
       expect(account.reads, 0);
-      expect(claims, isEmpty);
+      expect(requests, isEmpty);
       // Admission independently enforces the boundary, even without the UI/flow.
       await expectLater(
         admission.prepare(
@@ -111,7 +111,12 @@ void main() {
       );
       expect(flow.stage, HostedFlowStage.complete);
       expect(entered, 1);
-      expect(claims.single.host, matching);
+      expect(requests.map((request) => request.url.host), [matching, matching]);
+      expect(requests.map((request) => request.method), ['GET', 'POST']);
+      expect(requests.map((request) => request.url.path), [
+        '/api/join-policy',
+        '/api/invites/claim',
+      ]);
     },
   );
 }

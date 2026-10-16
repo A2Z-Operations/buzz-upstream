@@ -8,6 +8,8 @@ import '../../shared/utils/string_utils.dart';
 import '../../shared/theme/grid.dart';
 import '../../shared/theme/theme_extensions.dart';
 import 'hosted_community_selection.dart';
+import 'hosted_join_policy_view.dart';
+import 'hosted_profile_setup.dart';
 
 /// Presents the app-scoped real flow without retaining credentials or keys.
 class HostedConnectSheet extends HookConsumerWidget {
@@ -34,6 +36,10 @@ class HostedConnectSheet extends HookConsumerWidget {
             : flow.identityChoices.any((choice) => choice.fromCloud)
             ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
             : 'Choose the identity to connect to Builderlab. It will be bound to your account and backed up. Existing keys will be kept. This app cannot change the selected Builderlab identity later.',
+      HostedFlowStage.profile =>
+        'What should people in this community call you? You can add a photo in Settings.',
+      HostedFlowStage.acceptPolicy =>
+        'Review this community’s terms and privacy policy before joining.',
       HostedFlowStage.signIn => 'Complete sign-in in your browser.',
       HostedFlowStage.browserReturned =>
         'Continue setup in your browser. Open your community in Buzz when it is ready.',
@@ -70,6 +76,19 @@ class HostedConnectSheet extends HookConsumerWidget {
                   ),
                 ),
               ),
+            if (flow.stage == HostedFlowStage.profile &&
+                flow.saveProfile != null)
+              HostedProfileSetup(
+                save: flow.saveProfile!,
+                skip: flow.finishProfile,
+              ),
+            if (flow.stage == HostedFlowStage.acceptPolicy &&
+                flow.joinPolicy != null)
+              HostedJoinPolicyView(
+                key: ValueKey(flow.joinPolicy!.version),
+                policy: flow.joinPolicy!,
+                onAccept: flow.acceptJoinPolicy,
+              ),
             if (flow.stage == HostedFlowStage.chooseCommunities)
               HostedCommunitySelection(flow: flow),
             if (flow.stage == HostedFlowStage.communityConflict)
@@ -92,6 +111,8 @@ class HostedConnectSheet extends HookConsumerWidget {
               ),
             if (working) const Center(child: CircularProgressIndicator()),
             if (!working &&
+                flow.stage != HostedFlowStage.profile &&
+                flow.stage != HostedFlowStage.acceptPolicy &&
                 flow.stage != HostedFlowStage.chooseIdentity &&
                 flow.stage != HostedFlowStage.chooseCommunities &&
                 flow.stage != HostedFlowStage.communityConflict &&

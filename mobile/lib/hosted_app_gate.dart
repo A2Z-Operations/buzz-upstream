@@ -5,6 +5,9 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import 'features/channels/deep_link_dispatcher.dart';
+import 'features/invites/invite_join_provider.dart';
+import 'features/profile/profile_provider.dart';
+import 'shared/relay/relay_provider.dart';
 import 'features/onboarding/hosted_connect_page.dart';
 import 'features/onboarding/self_hosted_entry_sheet.dart';
 import 'shared/auth/auth.dart';
@@ -53,8 +56,12 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
   final account = BuilderlabAccountClient();
   final browser = BrowserAuth();
   final store = AccountIdentityStore();
-  final admission = HostedAdmission(account: account, store: store);
   late final HostedFlow flow;
+  final admission = HostedAdmission(
+    account: account,
+    store: store,
+    confirmPolicy: (policy) => flow.confirmJoinPolicy(policy),
+  );
   flow = HostedFlow(
     account: account,
     browser: browser,
@@ -69,7 +76,7 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
         link: link,
         subject: subject,
         pubkey: pubkey,
-        isCurrent: isCurrent,
+        isCurrent: () => isCurrent() && account.account?.subject == subject,
         storage: ref.read(communityStorageProvider),
         admission: admission,
         persist: (community, current) => ref
@@ -81,9 +88,22 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
                       sensitiveActionPolicy: flow.pairedSensitiveActionPolicy,
                     ),
               shouldContinue: current,
-              activate: flow.addedCommunityCount == 0,
+              activate:
+                  community.starterSetupIncomplete ||
+                  flow.addedCommunityCount == 0,
             ),
+        recoverStarterChannels: (community, current) =>
+            finishHostedStarterSetup(ref, community, current),
       );
+      if (flow.addedCommunityCount == 0 && isCurrent()) {
+        await offerHostedProfile(
+          ref,
+          flow,
+          link,
+          pubkey,
+          () => isCurrent() && account.account?.subject == subject,
+        );
+      }
     },
   );
   ref.onDispose(() {
@@ -94,6 +114,100 @@ final hostedFlowProvider = Provider<HostedFlow>((ref) {
   });
   return flow;
 });
+
+/// Optional and scoped to the first activated community. A failed read is not
+/// proof that no profile exists; leave it to Settings in that case.
+Future<void> offerHostedProfile(
+  Ref ref,
+  HostedFlow flow,
+  BuzzDeepLink link,
+  String pubkey,
+  bool Function() isCurrent,
+) async {
+  final relay = switch (link) {
+    InviteDeepLink(:final relayUrl) => relayUrl,
+    AddCommunityDeepLink(:final relayUrl) => relayUrl,
+    _ => null,
+  };
+  if (relay == null || !ref.mounted || !isCurrent()) return;
+  final active = await ref.read(activeCommunityProvider.future);
+  bool current() {
+    if (!ref.mounted || !isCurrent()) return false;
+    final now = ref.read(activeCommunityProvider).asData?.value;
+    return now != null &&
+        now.id == active?.id &&
+        now.pubkey == pubkey &&
+        relayIdentity(now.relayUrl) == relayIdentity(relay);
+  }
+
+  if (!current()) return;
+  // Keep the provider hydrated throughout the optional sheet.
+  final subscription = ref.listen(profileProvider, (_, _) {});
+  try {
+    try {
+      final profile = await ref.read(profileProvider.future);
+      if (profile != null || !current()) return;
+    } catch (_) {
+      return;
+    }
+    await flow.requestProfile((name) async {
+      if (!current()) throw AccountFailure.unavailable;
+      await ref.read(profileProvider.notifier).updateDisplayName(name);
+    });
+  } finally {
+    subscription.close();
+  }
+}
+
+/// Completes the existing scoped invite recovery only after activation. The
+/// pending flag remains durable on failure, cancellation or a community switch.
+Future<void> finishHostedStarterSetup(
+  Ref ref,
+  Community community,
+  bool Function() isCurrent,
+) async {
+  void checkCurrent() {
+    if (!ref.mounted || !isCurrent()) throw AccountFailure.unavailable;
+  }
+
+  bool matches(Community? candidate) =>
+      candidate?.id == community.id &&
+      candidate?.relayUrl == community.relayUrl &&
+      candidate?.pubkey == community.pubkey &&
+      candidate?.nsec == community.nsec;
+
+  checkCurrent();
+  final active = await ref.read(activeCommunityProvider.future);
+  checkCurrent();
+  if (!matches(active)) throw AccountFailure.unavailable;
+  final config = RelayConfig(baseUrl: community.relayUrl, nsec: community.nsec);
+  await ref
+      .read(inviteJoinRecoveryProvider)(
+        InviteJoinRecoveryScope(
+          relayHttpOrigin: config.baseUrl,
+          nsec: config.nsec,
+        ),
+      )
+      .ensureStarterChannels();
+  checkCurrent();
+  await ref.read(communityTransitionProvider).runExclusive(() async {
+    checkCurrent();
+    final storage = ref.read(communityStorageProvider);
+    final saved = (await storage.loadAll())
+        .where((item) => item.id == community.id)
+        .firstOrNull;
+    final activeId = await storage.loadActiveId();
+    checkCurrent();
+    if (!matches(saved) || activeId != community.id) {
+      throw AccountFailure.unavailable;
+    }
+    await storage.save(saved!.copyWith(starterSetupIncomplete: false));
+    await syncStoredCommunitySnapshot(ref);
+    ref.invalidate(communityListProvider);
+    ref.invalidate(activeCommunityProvider);
+    ref.invalidate(authProvider);
+  });
+}
 
 /// Composition seam shared by signed-in and signed-out application states.
 class HostedAppGate extends HookConsumerWidget {
@@ -154,7 +268,9 @@ class HostedAppGate extends HookConsumerWidget {
                 (item) => relayIdentity(item.relayUrl) == relayIdentity(relay),
               )
               .firstOrNull;
-          if (existing != null) {
+          if (existing != null &&
+              !(existing.starterSetupIncomplete &&
+                  HostedEnvironment.isReservedHost(Uri.parse(relay).host))) {
             await ref
                 .read(communityListProvider.notifier)
                 .switchCommunity(existing.id);
@@ -242,6 +358,7 @@ class HostedAppGate extends HookConsumerWidget {
               !openingSignIn &&
               !inlineAccountStatus &&
               (!inlineEntry ||
+                  (flow.accountOnly && flow.stage == HostedFlowStage.profile) ||
                   flow.stage == HostedFlowStage.chooseIdentity ||
                   flow.stage == HostedFlowStage.chooseCommunities ||
                   flow.stage == HostedFlowStage.communityConflict ||

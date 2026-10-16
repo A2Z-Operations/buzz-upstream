@@ -10,6 +10,7 @@ final class IdentityFilePlugin: NSObject, UIDocumentPickerDelegate,
   private let channel: FlutterMethodChannel
   private var pending: FlutterResult?
   private var requestID: UUID?
+  private weak var activePicker: UIDocumentPickerViewController?
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "buzz/identity_file", binaryMessenger: messenger)
@@ -61,11 +62,13 @@ final class IdentityFilePlugin: NSObject, UIDocumentPickerDelegate,
     picker.delegate = self
     pending = result
     requestID = UUID()
+    activePicker = picker
     top.present(picker, animated: true)
     picker.presentationController?.delegate = self
   }
 
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    guard controller === activePicker else { return }
     guard let url = urls.first, urls.count == 1 else {
       finish(FlutterError(code: "import_failed", message: nil, details: nil))
       return
@@ -112,13 +115,21 @@ final class IdentityFilePlugin: NSObject, UIDocumentPickerDelegate,
     return String(bytes: bytes.prefix(count), encoding: .utf8)
   }
 
-  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finish(nil) }
-  func presentationControllerDidDismiss(_ presentationController: UIPresentationController) { finish(nil) }
+  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    guard controller === activePicker else { return }
+    finish(nil)
+  }
+
+  func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    guard presentationController.presentedViewController === activePicker else { return }
+    finish(nil)
+  }
 
   private func finish(_ value: Any?) {
     let result = pending
     pending = nil
     requestID = nil
+    activePicker = nil
     result?(value)
   }
 }

@@ -10,6 +10,7 @@ import 'account_identity_store.dart';
 import 'builderlab_account.dart';
 import 'community_entry_requirements.dart';
 import 'hosted_environment.dart';
+import 'hosted_join_policy.dart';
 
 /// Builds a community only after scoped backup evidence and current binding.
 /// The caller persists it through the existing community transition owner.
@@ -18,12 +19,15 @@ class HostedAdmission {
     required this.account,
     required this.store,
     http.Client? client,
+    Future<bool> Function(HostedJoinPolicy)? confirmPolicy,
     Future<void> Function(Community)? probe,
-  }) : _http = client ?? http.Client(),
+  }) : _confirmPolicy = confirmPolicy ?? ((_) async => false),
+       _http = client ?? http.Client(),
        _probe = probe ?? _authenticateRelay;
   final BuilderlabAccountClient account;
   final AccountIdentityStore store;
   final http.Client _http;
+  final Future<bool> Function(HostedJoinPolicy) _confirmPolicy;
   final Future<void> Function(Community) _probe;
 
   Future<Community> prepare(
@@ -66,10 +70,14 @@ class HostedAdmission {
     );
     checkCurrent();
     if (link is InviteDeepLink) {
-      final body = jsonEncode({
-        'code': link.code,
-        if (link.policyReceipt != null) 'policy_receipt': link.policyReceipt,
-      });
+      final receipt = await freshJoinPolicyReceipt(
+        client: _http,
+        origin: uri,
+        code: link.code,
+        confirm: _confirmPolicy,
+        checkCurrent: checkCurrent,
+      );
+      final body = jsonEncode({'code': link.code, 'policy_receipt': ?receipt});
       final url = uri.replace(scheme: 'https', path: '/api/invites/claim');
       final header = await store.withKeys(
         (keys) async => buildNip98AuthHeader(
@@ -90,11 +98,8 @@ class HostedAdmission {
       final response = await _http
           .send(request)
           .timeout(const Duration(seconds: 30));
-      // Never render or log server response bodies.
-      await response.stream.drain<void>().timeout(const Duration(seconds: 30));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw AccountFailure.denied;
-      }
+      await readJoinResponse(response);
+      checkCurrent();
     }
     if (account.account?.subject != subject) {
       throw AccountFailure.differentAccount;

@@ -7,6 +7,14 @@ String hostedFlowProblemMessage(
     'This community needs a different or unsupported Builderlab environment. Use an app build configured for this community.',
   HostedFlowProblem.accountSetupRequired =>
     'This account is not eligible for Buzz yet.',
+  HostedFlowProblem.invitePolicyRequired =>
+    'The community policy needs to be accepted again. Try again to review it.',
+  HostedFlowProblem.inviteExpired =>
+    'This invite has expired. Ask for a new invite link.',
+  HostedFlowProblem.inviteExhausted =>
+    'This invite has no uses left. Ask for a new invite link.',
+  HostedFlowProblem.inviteInvalid =>
+    'This invite is not valid. Ask for a new invite link.',
   HostedFlowProblem.denied => 'This account does not have access.',
   HostedFlowProblem.differentAccount =>
     'Your browser signed in to a different account. Sign in to your original account on the web, then reopen setup. Your saved account and keys have been kept.',

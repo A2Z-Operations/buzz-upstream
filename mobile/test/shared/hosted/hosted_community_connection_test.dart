@@ -57,6 +57,8 @@ void main() {
           isCurrent: () => true,
           storage: storage,
           admission: admission,
+          recoverStarterChannels: (_, _) async =>
+              fail('Saved non-invite community needs no starter repair'),
           persist: (community, current) async {
             if (current()) await storage.save(community);
           },

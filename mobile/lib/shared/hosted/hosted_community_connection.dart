@@ -30,6 +30,8 @@ Future<void> connectHostedCommunity({
   required CommunityStorage storage,
   required HostedAdmission admission,
   required Future<void> Function(Community, bool Function()) persist,
+  required Future<void> Function(Community, bool Function())
+  recoverStarterChannels,
 }) async {
   final relay = switch (link) {
     InviteDeepLink(:final relayUrl) => relayUrl,
@@ -44,15 +46,24 @@ Future<void> connectHostedCommunity({
     throw const SavedCommunityIdentityConflict();
   }
   if (!isCurrent()) return;
+  // Saved membership survives a partially completed invite setup. Revalidate
+  // identity and probe the relay, but never reclaim its consumed invite.
+  final admissionLink = existing != null && link is InviteDeepLink
+      ? AddCommunityDeepLink(relayUrl: relay, name: existing.name)
+      : link;
   final prepared = await admission.prepare(
-    link,
+    admissionLink,
     subject,
     pubkey,
     isCurrent: isCurrent,
   );
   final community = existing == null
-      ? prepared
+      ? prepared.copyWith(starterSetupIncomplete: link is InviteDeepLink)
       : existing.copyWith(nsec: prepared.nsec);
   if (!isCurrent()) return;
   await persist(community, isCurrent);
+  if (!isCurrent()) return;
+  if (community.starterSetupIncomplete) {
+    await recoverStarterChannels(community, isCurrent);
+  }
 }

@@ -16,6 +16,7 @@ import 'hosted_environment.dart';
 import 'hosted_communities.dart';
 import 'hosted_community_connection.dart';
 import 'web_connect_binding.dart';
+import 'hosted_join_policy.dart';
 
 enum HostedFlowStage {
   idle,
@@ -24,6 +25,8 @@ enum HostedFlowStage {
   chooseIdentity,
   chooseCommunities,
   communityConflict,
+  acceptPolicy,
+  profile,
   blocked,
   browserReturned,
   complete,
@@ -43,6 +46,10 @@ enum HostedFlowProblem {
   backupRequired,
   bindingRequired,
   unsupportedEnvironment,
+  invitePolicyRequired,
+  inviteExpired,
+  inviteExhausted,
+  inviteInvalid,
 }
 
 /// Resolves only after relay admission is proven and local persistence completes.
@@ -75,7 +82,10 @@ class HostedFlow extends ChangeNotifier {
   final HostedIdentityService identity;
   final HostedCommunityAdmission enterCommunity;
   final HpkeBackup? hpke;
-  bool get canRetry => problem == null || problem == HostedFlowProblem.retry;
+  bool get canRetry =>
+      problem == null ||
+      problem == HostedFlowProblem.retry ||
+      problem == HostedFlowProblem.invitePolicyRequired;
   final Future<bool> Function(Uri) _openWeb;
   HostedFlowStage stage = HostedFlowStage.idle;
   HostedFlowProblem? problem;
@@ -103,6 +113,78 @@ class HostedFlow extends ChangeNotifier {
   StreamSubscription<BrowserAuthFailure>? _failures;
   bool _disposed = false;
   int _generation = 0;
+
+  int _nextGeneration() {
+    _cancelPolicy();
+    _cancelProfile();
+    return ++_generation;
+  }
+
+  Completer<void>? _profileCompletion;
+  Future<void> Function(String)? saveProfile;
+
+  Future<void> requestProfile(Future<void> Function(String) save) async {
+    if (_disposed) return;
+    final completion = Completer<void>();
+    _profileCompletion = completion;
+    saveProfile = (name) async {
+      if (!identical(_profileCompletion, completion) ||
+          completion.isCompleted) {
+        throw AccountFailure.unavailable;
+      }
+      await save(name);
+      if (identical(_profileCompletion, completion)) finishProfile();
+    };
+    _set(HostedFlowStage.profile);
+    await completion.future;
+    if (identical(_profileCompletion, completion)) {
+      _profileCompletion = null;
+      saveProfile = null;
+      _set(HostedFlowStage.working);
+    }
+  }
+
+  void finishProfile() {
+    final completion = _profileCompletion;
+    if (completion != null && !completion.isCompleted) completion.complete();
+  }
+
+  void _cancelProfile() {
+    final completion = _profileCompletion;
+    _profileCompletion = null;
+    saveProfile = null;
+    if (completion != null && !completion.isCompleted) completion.complete();
+  }
+
+  HostedJoinPolicy? joinPolicy;
+  Completer<bool>? _policyConsent;
+
+  Future<bool> confirmJoinPolicy(HostedJoinPolicy policy) async {
+    if (_disposed) return false;
+    joinPolicy = policy;
+    final consent = Completer<bool>();
+    _policyConsent = consent;
+    _set(HostedFlowStage.acceptPolicy);
+    final accepted = await consent.future;
+    if (identical(_policyConsent, consent)) {
+      _policyConsent = null;
+      joinPolicy = null;
+      if (accepted) _set(HostedFlowStage.working);
+    }
+    return accepted;
+  }
+
+  void acceptJoinPolicy() {
+    final consent = _policyConsent;
+    if (consent != null && !consent.isCompleted) consent.complete(true);
+  }
+
+  void _cancelPolicy() {
+    final consent = _policyConsent;
+    _policyConsent = null;
+    joinPolicy = null;
+    if (consent != null && !consent.isCompleted) consent.complete(false);
+  }
 
   Future<void>? _initialization;
   Future<void> initialize() => _initialization ??= _initialize();
@@ -186,7 +268,7 @@ class HostedFlow extends ChangeNotifier {
         stage == HostedFlowStage.signIn) {
       return Future.value();
     }
-    final generation = openBrowser ? ++_generation : _generation;
+    final generation = openBrowser ? _nextGeneration() : _generation;
     if (openBrowser) {
       accountOnly = true;
       _clearCommunityBatch();
@@ -228,7 +310,7 @@ class HostedFlow extends ChangeNotifier {
     if (device.isNotEmpty && !device.any((item) => item.pubkey == pubkey)) {
       throw AccountIdentityFailure.mismatch;
     }
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     void check() {
       if (!isCurrent() || generation != _generation || _disposed) {
         throw AccountFailure.unavailable;
@@ -273,7 +355,7 @@ class HostedFlow extends ChangeNotifier {
         target is! InviteDeepLink) {
       throw ArgumentError('Unsupported hosted target');
     }
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     accountOnly = false;
     _clearCommunityBatch();
     _target = target;
@@ -295,7 +377,7 @@ class HostedFlow extends ChangeNotifier {
   Future<void> retry() async {
     final target = _target;
     if (target == null && !accountOnly) return;
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     try {
       await browser.cancel();
       if (_disposed || generation != _generation) return;
@@ -328,7 +410,7 @@ class HostedFlow extends ChangeNotifier {
         !identityChoices.any((item) => item.pubkey == pubkey)) {
       return Future.value();
     }
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     _set(HostedFlowStage.working);
     return _enqueue(() => _continue(generation, selectedPubkey: pubkey));
   }
@@ -478,7 +560,7 @@ class HostedFlow extends ChangeNotifier {
       return Future.value();
     }
     _addingCommunities = true;
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     _set(HostedFlowStage.working);
     return _enqueue(() => _continue(generation));
   }
@@ -486,7 +568,7 @@ class HostedFlow extends ChangeNotifier {
   /// Keep completed additions and let the user omit a failing target.
   void backToCommunityChoices() {
     if (!canChangeCommunities) return;
-    ++_generation;
+    _nextGeneration();
     communities = List.unmodifiable(
       communities.where((item) => !_addedRelays.contains(item.relayUrl)),
     );
@@ -505,7 +587,7 @@ class HostedFlow extends ChangeNotifier {
       selectedRelays.where((item) => item != relay),
     );
     _conflictingRelay = null;
-    final generation = ++_generation;
+    final generation = _nextGeneration();
     _set(HostedFlowStage.working);
     return _enqueue(() => _continue(generation));
   }
@@ -622,6 +704,11 @@ class HostedFlow extends ChangeNotifier {
   }
 
   static HostedFlowProblem _problemFor(Object error) => switch (error) {
+    HostedInviteFailure.policyRequired =>
+      HostedFlowProblem.invitePolicyRequired,
+    HostedInviteFailure.expired => HostedFlowProblem.inviteExpired,
+    HostedInviteFailure.exhausted => HostedFlowProblem.inviteExhausted,
+    HostedInviteFailure.invalid => HostedFlowProblem.inviteInvalid,
     AccountFailure.denied => HostedFlowProblem.denied,
     AccountFailure.accountSetupRequired =>
       HostedFlowProblem.accountSetupRequired,
@@ -667,7 +754,9 @@ class HostedFlow extends ChangeNotifier {
   }
 
   Future<void> leave({bool noCommunities = false}) async {
-    ++_generation;
+    _nextGeneration();
+    _cancelPolicy();
+    _cancelProfile();
     final generation = _generation;
     _target = null;
     _pairedPubkey = null;
@@ -720,7 +809,9 @@ class HostedFlow extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    ++_generation;
+    _cancelPolicy();
+    _cancelProfile();
+    _nextGeneration();
     unawaited(_codes?.cancel());
     unawaited(_failures?.cancel());
     super.dispose();
