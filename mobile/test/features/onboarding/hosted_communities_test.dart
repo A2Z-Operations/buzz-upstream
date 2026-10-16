@@ -41,6 +41,18 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
+        f.expired = true;
+        await tester.tap(find.text('Continue with Builderlab'));
+        await tester.pump();
+        await tester.pumpAndSettle();
+        expect(f.flow.stage, HostedFlowStage.signIn);
+        expect(f.browser.startedIntent, {'type': 'account'});
+        expect(find.byType(HostedConnectPage), findsNothing);
+        expect(find.text('Signing in…').hitTestable(), findsOneWidget);
+        expect(find.text('Enter a community link'), findsOneWidget);
+        await f.flow.leave();
+        f.expired = false;
+        await tester.pumpAndSettle();
         expect(find.text('Continue with Builderlab'), findsOneWidget);
         expect(find.byType(HostedConnectPage), findsNothing);
         await tester.tap(find.text('Continue with Builderlab'));

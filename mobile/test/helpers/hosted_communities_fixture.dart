@@ -41,10 +41,12 @@ class WidgetDiscoveryAccount extends BuilderlabAccountClient {
   WidgetDiscoveryAccount(this.fixture);
   final HostedCommunitiesFixture fixture;
   @override
-  BuilderlabAccount get account => BuilderlabAccount(
-    subject: fixture.subject,
-    expiresAt: DateTime.now().add(const Duration(hours: 1)),
-  );
+  BuilderlabAccount? get account => fixture.expired
+      ? null
+      : BuilderlabAccount(
+          subject: fixture.subject,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        );
   @override
   Future<BuilderlabAccount?> restore() async => account;
   @override

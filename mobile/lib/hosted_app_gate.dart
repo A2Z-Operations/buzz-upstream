@@ -96,6 +96,13 @@ class HostedAppGate extends HookConsumerWidget {
     final visible =
         flow.stage != HostedFlowStage.idle &&
         flow.stage != HostedFlowStage.complete;
+    // Native browser authentication presents its own alert over the current
+    // screen. Keep that screen in place while checking the session/opening it.
+    final openingSignIn =
+        flow.stage == HostedFlowStage.signIn ||
+        (flow.accountOnly &&
+            flow.stage == HostedFlowStage.working &&
+            flow.account.account == null);
     return DeepLinkDispatcher(
       dispatchMessageLinks: authenticated && !visible,
       onboardingHandler: (routeContext, link) async {
@@ -178,6 +185,7 @@ class HostedAppGate extends HookConsumerWidget {
         children: [
           child,
           if (visible &&
+              !openingSignIn &&
               (!inlineEntry ||
                   flow.accountOnly ||
                   flow.stage == HostedFlowStage.chooseIdentity))
