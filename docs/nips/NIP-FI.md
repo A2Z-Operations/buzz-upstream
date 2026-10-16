@@ -127,6 +127,29 @@ authority.  Signature verification remains mandatory before acceptance.
 `VerifyAssertion` MUST compare `aud` with the resolved community's expected
 audience; issuer policy selection by `iss` MUST NOT broaden either binding.
 
+### Agent keys
+
+An issuer MAY issue an assertion whose `nostr_pubkey` names an agent key
+acting for an owner key.  Such an assertion MUST carry `nostr_owner_pubkey`:
+the lowercase hexadecimal encoding of one 32-byte public key, distinct from
+`nostr_pubkey`.  An issuer MUST NOT issue an assertion without
+`nostr_owner_pubkey` for a key it has issued an agent assertion for, and MUST
+NOT issue an agent assertion while the owner is not authorized by the issuer.
+
+A relay advertising `agent_assertions: true` MUST verify `nostr_owner_pubkey`
+as part of the assertion.  A malformed value, or one equal to `nostr_pubkey`,
+MUST deny `evidence_rejected`.  The relay MUST record the value as the
+session's owner.  If the relay already associates a different owner with the
+asserted key in the resolved community, it MUST deny `authorization_denied`.
+For every agent assertion, regardless of whether the asserted key is itself
+authorized in the community, the relay MUST deny when the community bans the
+asserted key or the owner, or when the issuer has denied either key.  Only
+then, when the asserted key is not itself authorized in the community, the
+relay MUST authorize it if and only if the issuer is trusted for the community
+and the owner is authorized in the community when access is decided.  A relay
+not advertising `agent_assertions: true` MUST deny an assertion carrying
+`nostr_owner_pubkey` `evidence_rejected`.
+
 ### Unverified claims
 
 Relays MUST ignore claims they do not verify.  An unverified claim — including
@@ -275,6 +298,7 @@ On WebSocket upgrade:
    [FI-TRACE-ASSERTION-KEY-MISMATCH]
 6. Register the session's proven `k` and admitting issuer `iss` in the
    relay's session table, making it visible to the disconnect close scan.
+   Registration includes the session's owner, if any.
    Registration MUST occur before the deny-set check in step 7.  This ordering
    ensures any connection that straddles a concurrent disconnect is caught by
    one side or the other: either the close scan sees the registered session, or
@@ -282,8 +306,9 @@ On WebSocket upgrade:
    same `(iss, k)` key.  A concurrent disconnect close scan MAY cancel this
    registered connection before step 8; cancellation is terminal, so a
    cancelled connection MUST NOT be admitted.
-7. Check deny set for `(iss, k)`; active entry (`now < until`) → deny
-   `authorization_denied`.  [FI-TRACE-DENY-SET]
+7. Check the deny set for `(iss, k)` and, if the session has an owner `o`,
+   for `(iss, o)`.  Either active entry denies `authorization_denied`.
+   [FI-TRACE-DENY-SET]
 8. Admit the connection only if it remains live and uncancelled.  The session's
    authority deadline is the minimum of all `authority_deadlines`; see Session
    policy.
@@ -517,8 +542,9 @@ performs all pure authorization checks and then, as its single atomic admission
 mutation (step 7), simultaneously reserves the `(iss, jti)` replay identity and
 inserts the deny entry — both or neither.  A capacity failure at that step rejects
 `503`; neither the jti nor the deny entry is recorded, and the caller may safely
-retry the same signed command.  On success, the relay closes all live connections
-registered under the command's issuer (`claims.iss`) whose proven `k` equals
+retry the same signed command.  On success, the relay MUST close every live connection
+registered under the command's issuer (`claims.iss`) whose proven key equals
+`CommandResult.target_pubkey` or whose recorded owner equals
 `CommandResult.target_pubkey`, whether or not admission has completed.
 Disconnect cancellation is terminal: a cancelled in-progress connection MUST NOT
 be subsequently admitted.  This close scan matches the same
@@ -743,8 +769,9 @@ On each protected HTTP request:
    `evidence_rejected`.  [FI-TRACE-HTTP-INGRESS]
 5. Assert `verified.asserted_key == k`; mismatch → deny `authorization_denied`.
    [FI-TRACE-ASSERTION-KEY-MISMATCH]
-6. Check deny set for `(iss, k)`; active entry (`now < until`) → deny
-   `authorization_denied`.  [FI-TRACE-DENY-SET]
+6. Check the deny set for `(iss, k)` and, if the session has an owner `o`,
+   for `(iss, o)`.  Either active entry denies `authorization_denied`.
+   [FI-TRACE-DENY-SET]
 7. Admit the request.
 
 A body is **authorization-relevant** whenever any body byte influences the
@@ -809,14 +836,16 @@ normative behavior for them:
 - Per-session (`sid`-level) revocation: issuer-side.  The relay's revocation
   primitive is pubkey-scoped and community-wide, keyed `(iss, target_pubkey)`
   (see Admin disconnect API).  If an issuer revokes an entire identity, it
-  enumerates and disconnects each key it has asserted for that identity.
+  disconnects each key it has asserted for that identity.  A disconnect of an
+  owner key also covers that owner's agent keys at relays advertising
+  `agent_assertions: true`.
   Individual session/device logout is handled by assertion expiry within the
   configured TTL window.
 - Revocation signaling to the issuer/IdP: issuer-side; the issuer stops
   issuing assertions, which closes the relay window within assertion TTL.
 - Directory integration and account-offboarding automation: issuer-side.
 - Audit logging beyond what the relay operator chooses to retain: issuer-side.
-- Delegation: out of scope.
+- Delegation other than "Agent keys": out of scope.
 
 ## Discovery
 
@@ -847,6 +876,11 @@ issuer stops issuance after a successful deny, the residual ceiling is
 `max(0, min(exp, iat + maximum_assertion_age) - now)` — but this is an
 issuer-operational property, not a protocol invariant this field can
 advertise unconditionally.
+
+`agent_assertions` (boolean, optional).  `true` means the relay admits agent
+assertions as defined in "Agent keys".  Absent or `false` means it does not.
+An issuer MUST NOT issue an agent assertion for a community whose relay does
+not advertise `agent_assertions: true`.
 
 Discovery MUST NOT state issuer URLs, audiences, claim names, tenant IDs, or
 deployment-local identifiers.  [FI-TRACE-DISCOVERY-PRIVATE]
