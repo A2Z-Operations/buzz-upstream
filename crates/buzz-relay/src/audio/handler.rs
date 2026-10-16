@@ -599,6 +599,7 @@ pub(crate) async fn handle_active_audio_connection(
         _ = cancel.cancelled() => {
             // Expiry fired while waiting for verify_auth_event. Drain the
             // terminal channel so the denial frame reaches the client.
+            auth_line.abort_reason("session_expired");
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
@@ -840,6 +841,7 @@ pub(crate) async fn handle_active_audio_connection(
             let _owner_permit = match audio_gate.acquire_effect().await {
                 Ok(permit) => permit,
                 Err(crate::nip_fi_gate::SessionExpired) => {
+                    auth_line.abort_reason("session_expired");
                     cancel.cancel();
                     if let Some(t) = _nip_fi_admission_expiry.take() {
                         let _ = t.await;

@@ -351,16 +351,19 @@ impl AuthResult {
 
 /// One auth attempt whose exits are spread across a long handler: it logs
 /// exactly once, at [`AuthLine::finish`], or on drop as `aborted` if the
-/// handler returned (cancellation, teardown) before deciding.
-pub(crate) struct AuthLine {
-    attempt: AuthAttempt<'static>,
+/// handler returned (cancellation, teardown, a request error before the
+/// decision) without deciding.
+pub(crate) struct AuthLine<'a> {
+    attempt: AuthAttempt<'a>,
+    abort_reason: &'static str,
     done: bool,
 }
 
-impl AuthLine {
-    pub(crate) fn new(attempt: AuthAttempt<'static>) -> Self {
+impl<'a> AuthLine<'a> {
+    pub(crate) fn new(attempt: AuthAttempt<'a>) -> Self {
         Self {
             attempt,
+            abort_reason: "connection_closed",
             done: false,
         }
     }
@@ -371,17 +374,35 @@ impl AuthLine {
         self.attempt.pubkey_verified = true;
     }
 
+    /// The `aborted` reason logged if the line is dropped undecided.
+    pub(crate) fn abort_reason(&mut self, reason: &'static str) {
+        self.abort_reason = reason;
+    }
+
     /// Log the final decision; later calls are no-ops.
     pub(crate) fn finish(&mut self, result: AuthResult) {
         if !std::mem::replace(&mut self.done, true) {
             self.attempt.log(result);
         }
     }
+
+    /// Pass `checked` through, finishing the line with `refusal`'s result
+    /// when it is an error. An admission step's refusal is final.
+    pub(crate) fn gate<T, E>(
+        &mut self,
+        checked: Result<T, E>,
+        refusal: impl FnOnce(&E) -> AuthResult,
+    ) -> Result<T, E> {
+        if let Err(e) = &checked {
+            self.finish(refusal(e));
+        }
+        checked
+    }
 }
 
-impl Drop for AuthLine {
+impl Drop for AuthLine<'_> {
     fn drop(&mut self) {
-        self.finish(AuthResult::Aborted("connection_closed"));
+        self.finish(AuthResult::Aborted(self.abort_reason));
     }
 }
 
@@ -461,6 +482,14 @@ impl AuthAttempt<'_> {
         }
     }
 
+    /// This attempt, bound to `community`.
+    pub(crate) fn in_community(self, community: CommunityId) -> Self {
+        Self {
+            community: Some(community),
+            ..self
+        }
+    }
+
     /// Finish the WebSocket login with `outcome`, logging it only if this
     /// call won the connection's single auth terminal.
     pub(crate) fn reject(
@@ -476,6 +505,7 @@ impl AuthAttempt<'_> {
     }
 
     pub(crate) fn log(&self, result: AuthResult) {
+        crate::connection::note_auth_line_written();
         let (level, outcome, reason) = match result {
             AuthResult::Success => (Level::INFO, "success", None),
             AuthResult::Denied(r) => (Level::WARN, "denied", Some(r)),

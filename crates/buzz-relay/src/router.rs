@@ -19,6 +19,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::{HttpMakeClassifier, TraceLayer};
 
+use crate::access::{AuthAttempt, AuthMethod, AuthResult};
 use crate::api;
 use crate::audio;
 use crate::connection::handle_connection;
@@ -185,7 +186,10 @@ async fn nip_fi_assertion_guard(
 
     // DenyProtected: unconditional 503 regardless of assertion presence.
     // (`admit_nip_fi_http_on_state` also does this; the guard is the backstop.)
+    // Refusals here end the request before any handler, so the guard logs
+    // them; shadow mode refuses nothing and logs nothing.
     if mode.denies_unconditionally() {
+        guard_attempt(&request).log(AuthResult::Denied("authorization_unavailable"));
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
@@ -194,13 +198,23 @@ async fn nip_fi_assertion_guard(
     // order, ahead of any handler step.
     if mode.observes_only() {
         let headers = request.headers().clone();
+        let verdict = verdict.map_err(|(would_deny, _)| would_deny);
         return crate::nip_fi_shadow::observe_guard(&state, &headers, verdict, next.run(request))
             .await;
     }
     match verdict {
         Ok(()) => next.run(request).await,
-        Err((_, class)) => http_denial(class),
+        Err(((_, class), result)) => {
+            guard_attempt(&request).log(result);
+            http_denial(class)
+        }
     }
+}
+
+/// The access-log attempt for a request the assertion guard refuses: no
+/// proof has been checked yet, so it carries the route and no key.
+fn guard_attempt(request: &Request<Body>) -> AuthAttempt<'_> {
+    AuthAttempt::http(AuthMethod::NipFi, request.uri().path(), None, false)
 }
 
 /// The guard's enforce steps: the Host must map to a configured community,
@@ -213,10 +227,16 @@ async fn nip_fi_assertion_guard(
 fn nip_fi_guard_steps(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-) -> Result<(), crate::nip_fi_shadow::WouldDeny> {
+) -> Result<(), (crate::nip_fi_shadow::WouldDeny, AuthResult)> {
     let community =
-        crate::nip_fi_core::resolve_community(headers, &state.config.nip_fi.communities)
-            .map_err(|class| (crate::nip_fi_shadow::Stage::Community, class))?;
+        crate::nip_fi_core::resolve_community(headers, &state.config.nip_fi.communities).map_err(
+            |class| {
+                (
+                    (crate::nip_fi_shadow::Stage::Community, class),
+                    AuthResult::Failed("community_unresolved"),
+                )
+            },
+        )?;
     crate::nip_fi_core::evaluate_attached_assertion(
         headers,
         community,
@@ -225,8 +245,11 @@ fn nip_fi_guard_steps(
     .map(drop)
     .map_err(|rejection| {
         (
-            crate::nip_fi_shadow::Stage::Assertion,
-            rejection.denial_class(),
+            (
+                crate::nip_fi_shadow::Stage::Assertion,
+                rejection.denial_class(),
+            ),
+            rejection.auth_result(),
         )
     })
 }

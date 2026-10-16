@@ -65,7 +65,6 @@ use crate::access::{AuthAttempt, AuthMethod, AuthResult};
 use crate::nip_fi_config::NipFiCommunities;
 use crate::nip_fi_core::{
     asserted_key_matches, evaluate_attached_assertion, http_denial, resolve_community,
-    AssertionRejection,
 };
 use crate::nip_fi_shadow::Stage;
 
@@ -488,15 +487,11 @@ where
     // Steps 4–5: extract and verify the assertion.
     let assertion =
         evaluate_attached_assertion(headers, community, verifier).map_err(|rejection| {
-            let result = match rejection {
-                AssertionRejection::VerifierUnavailable => AuthResult::Denied(rejection.code()),
-                _ => AuthResult::Failed(rejection.code()),
-            };
             EnforceDenial::new(
                 Stage::Assertion,
                 rejection.denial_class(),
                 key,
-                Some(result),
+                Some(rejection.auth_result()),
             )
         })?;
 

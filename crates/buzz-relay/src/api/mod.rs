@@ -283,6 +283,20 @@ pub mod relay_members {
         .await
     }
 
+    /// The access-log result for a refusal from [`enforce_relay_membership`].
+    pub(crate) fn membership_refusal(
+        e: &(StatusCode, Json<serde_json::Value>),
+    ) -> crate::access::AuthResult {
+        crate::access::AuthResult::Denied(match e.0 {
+            StatusCode::FORBIDDEN if e.1["error"] == "relay_membership_required" => {
+                "not_relay_member"
+            }
+            StatusCode::FORBIDDEN => "banned",
+            StatusCode::SERVICE_UNAVAILABLE => "ban_check_unavailable",
+            _ => "membership_unavailable",
+        })
+    }
+
     async fn enforce_membership(
         state: &AppState,
         community: CommunityId,

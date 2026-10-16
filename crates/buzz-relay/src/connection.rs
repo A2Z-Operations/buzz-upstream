@@ -1,5 +1,6 @@
 //! WebSocket connection lifecycle: semaphore → challenge → recv/send/heartbeat loops → cleanup.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -1221,15 +1222,9 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
     match msg {
         ClientMessage::Auth(event) => {
             // AUTH remains inline so only one frame can race the connection's
-            // pending lifecycle, but cancellation can preempt dependency waits.
-            let span = tracing::info_span!("ws.auth", conn_id = %conn.conn_id);
-            let claimed = event.pubkey;
-            tokio::select! {
-                biased;
-                _ = conn.cancel.cancelled() => log_aborted_auth(&conn, claimed),
-                _ = handlers::auth::handle_auth(event, Arc::clone(&conn), Arc::clone(&state))
-                    .instrument(span) => {}
-            }
+            // pending lifecycle. Boxed: the handler's future is deep enough
+            // to overflow the layout depth limit when nested here.
+            Box::pin(handle_auth_frame(event, &conn, &state)).await;
         }
         ClientMessage::Event(event) => {
             let conn = Arc::clone(&conn);
@@ -1330,12 +1325,45 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
     }
 }
 
-/// Log an AUTH cut off by cancellation, unless its handler already reached
-/// the connection's single auth terminal.
+/// One AUTH frame: cancellation can preempt the handler's dependency waits,
+/// and a frame that ends without logging a decision logs `aborted`.
+async fn handle_auth_frame(
+    event: nostr::Event,
+    conn: &Arc<ConnectionState>,
+    state: &Arc<AppState>,
+) {
+    let span = tracing::info_span!("ws.auth", conn_id = %conn.conn_id);
+    let claimed = event.pubkey;
+    AUTH_LINE_WRITTEN
+        .scope(Cell::new(false), async {
+            tokio::select! {
+                biased;
+                _ = conn.cancel.cancelled() => {}
+                _ = handlers::auth::handle_auth(event, Arc::clone(conn), Arc::clone(state))
+                    .instrument(span) => {}
+            }
+            if !AUTH_LINE_WRITTEN.with(Cell::get) {
+                log_aborted_auth(conn, claimed);
+            }
+        })
+        .await;
+}
+
+tokio::task_local! {
+    /// Whether the AUTH frame being handled has logged its access line. The
+    /// connection's auth state cannot answer this: the cancellation watcher
+    /// and the auth timeout end a pending attempt without logging it.
+    static AUTH_LINE_WRITTEN: Cell<bool>;
+}
+
+/// Record that the current AUTH frame logged its line (no-op elsewhere).
+pub(crate) fn note_auth_line_written() {
+    let _ = AUTH_LINE_WRITTEN.try_with(|written| written.set(true));
+}
+
+/// Log an AUTH frame that ended without a decision of its own: cut off by
+/// cancellation, or finished after the watcher or timeout ended its attempt.
 fn log_aborted_auth(conn: &ConnectionState, claimed: nostr::PublicKey) {
-    if !matches!(conn.auth_state_snapshot(), AuthState::Pending { .. }) {
-        return;
-    }
     let reason = if conn.nip_fi_gate.deadline_passed() {
         "session_expired"
     } else {
@@ -2009,6 +2037,7 @@ pub(crate) mod tests {
         flush_count: usize,
         fail_after_flushes: Option<usize>,
         reject_sends: bool,
+        pending_flushes: usize,
     }
 
     #[derive(Debug, Clone)]
@@ -2059,6 +2088,10 @@ pub(crate) mod tests {
         ) -> std::task::Poll<Result<(), Self::Error>> {
             let mut state = self.state.lock().expect("mock sink poisoned");
             state.flush_count += 1;
+            if state.pending_flushes > 0 {
+                state.pending_flushes -= 1;
+                return std::task::Poll::Pending;
+            }
             if state
                 .fail_after_flushes
                 .is_some_and(|limit| state.flush_count >= limit)
@@ -2180,6 +2213,18 @@ pub(crate) mod tests {
         assert_eq!((totals.events(), totals.bytes()), (0, 0));
     }
 
+    /// Cancellation lands while the batch's flush is still pending; the
+    /// terminal drain then flushes it, so the batch counts once.
+    #[tokio::test]
+    async fn close_totals_count_a_batch_flushed_by_the_drain_after_cancellation() {
+        let (sink, state) = MockSink::new(None);
+        state.lock().expect("mock sink poisoned").pending_flushes = 1;
+        let totals = queued_totals(sink, &state, &[EVENT_FRAME, EVENT_FRAME]).await;
+        assert!(state.lock().expect("mock sink poisoned").flush_count >= 2);
+        assert_eq!(totals.events(), 2);
+        assert!(totals.bytes() >= (EVENT_FRAME.len() * 2) as u64);
+    }
+
     /// Feed `frame` through the production frame dispatcher and return the
     /// read access lines it produced once every spawned handler finished.
     async fn read_lines_for(
@@ -2257,31 +2302,133 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn auth_cut_off_by_cancellation_logs_one_aborted_line() {
-        let state = crate::state::tests::test_state().await;
-        let (conn, _rx) = test_conn_with_auth(pending_state());
-        // A valid AUTH reaches the handler's policy lookups, which wait; the
-        // connection closes while they do.
-        let event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
-            .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
-            .tag(nostr::Tag::parse(["challenge", "test-challenge"]).unwrap())
-            .sign_with_keys(&Keys::generate())
-            .expect("sign auth");
-        let frame = serde_json::json!(["AUTH", event]).to_string();
-        let (guard, out) = crate::access::tests::capture_scoped();
-        let cancel = conn.cancel.clone();
-        tokio::spawn(async move { cancel.cancel() });
-        handle_text_message(frame, conn, state).await;
-        drop(guard);
-        let lines: Vec<_> = out
-            .lines()
-            .into_iter()
-            .filter(|l| l["event"] == "auth")
-            .collect();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["outcome"], "aborted");
-        assert_eq!(lines[0]["reason"], "connection_closed");
+    /// Root AUTH cut off mid-check, through the real connection lifecycle.
+    mod postgres_tests {
+        use super::*;
+
+        /// Drive a real upgraded root connection (watcher, timeout and expiry
+        /// tasks included) through an AUTH that stalls after its policy reads,
+        /// end the connection with `end` while it waits, and return the captured
+        /// access lines once the connection has logged its close.
+        async fn stalled_auth_lines(
+            deadline: Option<chrono::DateTime<chrono::Utc>>,
+            end: impl FnOnce(&CancellationToken),
+        ) -> Vec<serde_json::Value> {
+            use futures_util::{SinkExt as _, StreamExt as _};
+
+            let state = crate::api::bridge::postgres_tests::bridge_handler_test_state()
+                .await
+                .expect("local Postgres");
+            let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+            let tenant = TenantContext::resolved(community, "test.local".to_string());
+            let relay_url =
+                crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
+            let keys = Keys::generate();
+            let assertion = deadline
+                .map(|d| buzz_auth::VerifiedAssertion::for_test(Some(keys.public_key()), vec![d]));
+            let cancel = CancellationToken::new();
+            let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+
+            let (guard, out) = crate::access::tests::capture_scoped();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let server = tokio::spawn(async move {
+                let upgrade = move |ws: WebSocketUpgrade| {
+                    let (state, tenant) = (Arc::clone(&state), tenant.clone());
+                    let (control, assertion) = (control.clone(), assertion.clone());
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            handle_active_connection(
+                                socket,
+                                state,
+                                "127.0.0.1:9999".parse().unwrap(),
+                                tenant,
+                                Uuid::new_v4(),
+                                control,
+                                assertion,
+                                chrono::Utc::now(),
+                                None,
+                            )
+                            .await
+                        })
+                    }
+                };
+                let app = Router::new().route("/", get(upgrade));
+                axum::serve(listener, app).await.expect("test server");
+            });
+
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+            let challenge = loop {
+                let Some(Ok(Message::Text(text))) = client.next().await else {
+                    panic!("socket ended before the AUTH challenge");
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame[0] == "AUTH" {
+                    break frame[1].as_str().unwrap().to_owned();
+                }
+            };
+            let event = EventBuilder::new(Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&keys)
+                .expect("sign auth");
+            let (arrived, _release) = crate::nip_fi_test_hooks::auth_commit_hook::arm(community);
+            client
+                .send(Message::Text(
+                    serde_json::json!(["AUTH", event]).to_string().into(),
+                ))
+                .await
+                .expect("send AUTH");
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .expect("AUTH must stall at the commit hook")
+                .expect("hook dropped");
+            end(&cancel);
+
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if out.lines().iter().any(|l| l["event"] == "close") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            drop(guard);
+            server.abort();
+            closed.expect("connection must log its close");
+            out.lines()
+                .into_iter()
+                .filter(|l| l["event"] == "auth")
+                .collect()
+        }
+
+        fn assert_one_aborted(lines: &[serde_json::Value], reason: &str) {
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["outcome"], "aborted");
+            assert_eq!(lines[0]["reason"], reason);
+            assert_eq!(lines[0]["pubkey_verified"], false);
+        }
+
+        /// The cancellation watcher ends the pending attempt as the connection
+        /// closes; the AUTH frame still logs exactly one `aborted` line.
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn auth_cut_off_by_a_closing_connection_logs_one_aborted_line() {
+            let lines = stalled_auth_lines(None, CancellationToken::cancel).await;
+            assert_one_aborted(&lines, "connection_closed");
+        }
+
+        /// The enterprise session lease expires while AUTH waits.
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn auth_cut_off_by_session_expiry_logs_one_aborted_line() {
+            let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(1500);
+            let lines = stalled_auth_lines(Some(deadline), |_| {}).await;
+            assert_one_aborted(&lines, "session_expired");
+        }
     }
 
     fn ordinary_disconnect_reason() -> watch::Receiver<Option<CommunityDisconnectReason>> {

@@ -2435,14 +2435,22 @@ pub(crate) async fn persist_workflow_deletion(
         .ok_or_else(|| anyhow::anyhow!("missing workflow coordinate"))?;
     let mut parts = coordinate.splitn(3, ':');
     let _kind = parts.next();
-    let owner = hex::decode(parts.next().unwrap_or_default())?;
+    let owner = hex::decode(parts.next().unwrap_or_default())
+        .map_err(|_| anyhow::anyhow!("invalid workflow coordinate"))?;
     let d_tag = parts
         .next()
         .ok_or_else(|| anyhow::anyhow!("invalid workflow coordinate"))?;
     let (stored, dispatch, channel_id) = state
         .db
         .insert_workflow_deletion(tenant.community(), event, &owner, d_tag)
-        .await?;
+        .await
+        .map_err(|e| {
+            // The write carries the whole event: log only a fixed kind.
+            anyhow::anyhow!(
+                "workflow deletion write failed: {}",
+                crate::access::db_error_kind(&e)
+            )
+        })?;
     if let Some(channel_id) = channel_id {
         state
             .workflow_engine

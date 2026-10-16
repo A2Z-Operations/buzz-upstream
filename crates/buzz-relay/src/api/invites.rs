@@ -253,13 +253,23 @@ async fn authenticate(
         event_id_bytes,
         ..
     } = bridge::verify_nip98_exempt_invite_claim(headers, "POST", &url, Some(body))?;
-    let auth = crate::access::AuthAttempt::http(
-        crate::access::AuthMethod::Nip98,
-        path,
-        Some(pubkey),
-        true,
+    // Claiming an invite is how a non-member joins: replay is the last
+    // admission step, so this line logs the final decision.
+    let mut line = crate::access::AuthLine::new(
+        crate::access::AuthAttempt::http(
+            crate::access::AuthMethod::Nip98,
+            path,
+            Some(pubkey),
+            true,
+        )
+        .in_community(tenant.community()),
     );
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes, auth).await?;
+    line.abort_reason("request_ended");
+    line.gate(
+        bridge::check_nip98_replay(state, &tenant, event_id_bytes).await,
+        bridge::ReplayRejection::auth_result,
+    )?;
+    line.finish(crate::access::AuthResult::Success);
 
     Ok((tenant, pubkey))
 }
@@ -327,25 +337,24 @@ async fn mint_invite_checked(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt("/api/invites");
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
+    let mut caller = bridge::ProvenCaller::new(admission, "/api/invites", &tenant);
+    let pubkey = caller.pubkey;
 
     // Replay detection runs after NIP-98+assertion admission (both proofs verified).
-    if let Err(e) = bridge::check_nip98_replay(&state, &tenant, event_id_bytes, auth).await {
+    if let Err(e) = caller.replay(&state, &tenant).await {
         return e.into_response();
     }
 
     // Membership and community ban, same step as the other NIP-98 routes.
-    if let Err(e) = super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         &state,
         tenant.community(),
         pubkey.as_bytes(),
         super::relay_members::extract_auth_tag_header(&headers),
-        signed_created_at,
+        caller.signed_at,
     )
-    .await
-    {
+    .await;
+    if let Err(e) = caller.admit_member(membership) {
         return e.into_response();
     }
 

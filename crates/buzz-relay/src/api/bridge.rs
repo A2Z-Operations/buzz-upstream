@@ -18,6 +18,7 @@ use serde_json::Value;
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
+use crate::access::{AuthLine, AuthResult};
 use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
 use crate::state::AppState;
@@ -64,27 +65,134 @@ pub(crate) async fn authenticate_member_post(
             true,
         ),
     )?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(path);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
-
-    enforce_http_admission(state, &tenant, &pubkey)
+    let mut caller = ProvenCaller::new(admission, path, &tenant);
+    caller
+        .rate_limit_and_replay(state, &tenant)
         .await
-        .map_err(|e| e.into_response())?;
-    check_nip98_replay(state, &tenant, event_id_bytes, auth)
-        .await
-        .map_err(|e| e.into_response())?;
-    super::relay_members::enforce_relay_membership(
+        .map_err(IntoResponse::into_response)?;
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
-        &pubkey.to_bytes(),
+        &caller.pubkey.to_bytes(),
         super::relay_members::extract_auth_tag_header(headers),
-        signed_created_at,
+        caller.signed_at,
     )
-    .await
-    .map_err(|e| e.into_response())?;
+    .await;
+    caller
+        .admit_member(membership)
+        .map_err(IntoResponse::into_response)?;
+    let pubkey = caller.pubkey;
 
     Ok((tenant, pubkey))
+}
+
+/// A caller whose NIP-98 proof (and enterprise assertion, when enforced)
+/// passed, before the shared rate limit, replay guard and relay membership
+/// decide whether it is admitted. `line` logs that decision exactly once.
+pub(crate) struct ProvenCaller<'a> {
+    pub(crate) pubkey: nostr::PublicKey,
+    event_id_bytes: [u8; 32],
+    pub(crate) signed_at: Option<u64>,
+    line: AuthLine<'a>,
+}
+
+/// The NIP-98 side-data a route's admission closure returns: the proof's
+/// event id, and its `created_at` when the route needs it.
+pub(crate) trait Nip98Extra {
+    fn split(self) -> ([u8; 32], Option<u64>);
+}
+
+impl Nip98Extra for [u8; 32] {
+    fn split(self) -> ([u8; 32], Option<u64>) {
+        (self, None)
+    }
+}
+
+impl Nip98Extra for ([u8; 32], Option<u64>) {
+    fn split(self) -> ([u8; 32], Option<u64>) {
+        self
+    }
+}
+
+impl<'a> ProvenCaller<'a> {
+    pub(crate) fn new(
+        admission: crate::nip_fi_http::NipFiAdmission<impl Nip98Extra>,
+        route: &'a str,
+        tenant: &TenantContext,
+    ) -> Self {
+        let pubkey = *admission.proven_pubkey();
+        let mut line = AuthLine::new(
+            admission
+                .auth_attempt(route)
+                .in_community(tenant.community()),
+        );
+        // A request that ends before admission decides (a malformed body,
+        // a client disconnect) is still one line.
+        line.abort_reason("request_ended");
+        let (event_id_bytes, signed_at) = admission.into_extra().split();
+        Self {
+            pubkey,
+            event_id_bytes,
+            signed_at,
+            line,
+        }
+    }
+
+    /// The shared API rate limit, then the replay guard. A refusal is logged.
+    pub(crate) async fn rate_limit_and_replay(
+        &mut self,
+        state: &AppState,
+        tenant: &TenantContext,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        self.line.gate(
+            enforce_http_admission(state, tenant, &self.pubkey).await,
+            admission_refusal,
+        )?;
+        self.replay(state, tenant).await
+    }
+
+    /// The replay guard alone, for routes outside the shared rate limit.
+    pub(crate) async fn replay(
+        &mut self,
+        state: &AppState,
+        tenant: &TenantContext,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        self.line
+            .gate(
+                check_nip98_replay(state, tenant, self.event_id_bytes).await,
+                ReplayRejection::auth_result,
+            )
+            .map_err(Into::into)
+    }
+
+    /// The result of an intermediate admission step: logs only a refusal.
+    pub(crate) fn check<T, E>(
+        &mut self,
+        step: Result<T, E>,
+        refusal: impl FnOnce(&E) -> AuthResult,
+    ) -> Result<T, E> {
+        self.line.gate(step, refusal)
+    }
+
+    /// The result of the route's last admission step (relay membership and
+    /// ban): logs the request's final auth decision either way.
+    pub(crate) fn admit<T, E>(
+        &mut self,
+        last_step: Result<T, E>,
+        refusal: impl FnOnce(&E) -> AuthResult,
+    ) -> Result<T, E> {
+        let admitted = self.line.gate(last_step, refusal)?;
+        self.line.finish(AuthResult::Success);
+        Ok(admitted)
+    }
+
+    /// [`Self::admit`] for the relay membership and ban check.
+    pub(crate) fn admit_member<T>(
+        &mut self,
+        membership: Result<T, (StatusCode, Json<Value>)>,
+    ) -> Result<T, (StatusCode, Json<Value>)> {
+        self.admit(membership, super::relay_members::membership_refusal)
+    }
 }
 
 pub(crate) async fn enforce_http_admission(
@@ -399,9 +507,9 @@ pub(crate) fn verify_nip98_exempt_operator(
     )
 }
 
-/// Check NIP-98 replay and record the event ID atomically, then log `auth`'s
-/// final decision: this check is the last auth step on every surface that
-/// calls it, so it owns the single access line for the attempt.
+/// Check NIP-98 replay and record the event ID atomically. Logs nothing:
+/// replay is never the last admission step on its own, so the caller's
+/// [`AuthLine`](crate::access::AuthLine) logs the request's final decision.
 ///
 /// The correctness boundary is the shared, community-scoped Redis seen-set on
 /// `AppState`, not process-local memory. Any Redis/guard error fails closed:
@@ -411,49 +519,49 @@ pub(crate) async fn check_nip98_replay(
     state: &AppState,
     tenant: &TenantContext,
     event_id_bytes: [u8; 32],
-    auth: crate::access::AuthAttempt<'_>,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    check_and_log_replay(state.nip98_replay.as_ref(), tenant, event_id_bytes, auth).await
-}
-
-async fn check_and_log_replay(
-    replay_guard: &dyn Nip98ReplayGuard,
-    tenant: &TenantContext,
-    event_id_bytes: [u8; 32],
-    auth: crate::access::AuthAttempt<'_>,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    let checked = check_nip98_replay_with_guard(replay_guard, tenant, event_id_bytes).await;
-    let auth = crate::access::AuthAttempt {
-        community: Some(tenant.community()),
-        ..auth
-    };
-    match &checked {
-        Ok(()) => auth.log(crate::access::AuthResult::Success),
-        Err(ReplayRejection::Replayed) => {
-            auth.log(crate::access::AuthResult::Failed("nip98_replay"))
-        }
-        Err(ReplayRejection::Unavailable) => auth.log(crate::access::AuthResult::Denied(
-            "replay_check_unavailable",
-        )),
-    }
-    checked.map_err(ReplayRejection::into_api_error)
+) -> Result<(), ReplayRejection> {
+    check_nip98_replay_with_guard(state.nip98_replay.as_ref(), tenant, event_id_bytes).await
 }
 
 /// Why the replay check refused a proof.
 #[derive(Debug, PartialEq, Eq)]
-enum ReplayRejection {
+pub(crate) enum ReplayRejection {
     Replayed,
     Unavailable,
 }
 
 impl ReplayRejection {
-    fn into_api_error(self) -> (StatusCode, Json<Value>) {
-        let message = match self {
-            Self::Replayed => "NIP-98: replay detected",
-            Self::Unavailable => "NIP-98: replay check unavailable",
+    /// The access-log result for this refusal.
+    pub(crate) fn auth_result(&self) -> crate::access::AuthResult {
+        match self {
+            Self::Replayed => crate::access::AuthResult::Failed("nip98_replay"),
+            Self::Unavailable => crate::access::AuthResult::Denied("replay_check_unavailable"),
+        }
+    }
+}
+
+impl From<ReplayRejection> for (StatusCode, Json<Value>) {
+    fn from(rejection: ReplayRejection) -> Self {
+        let message = match rejection {
+            ReplayRejection::Replayed => "NIP-98: replay detected",
+            ReplayRejection::Unavailable => "NIP-98: replay check unavailable",
         };
         api_error(StatusCode::UNAUTHORIZED, message)
     }
+}
+
+impl IntoResponse for ReplayRejection {
+    fn into_response(self) -> Response {
+        <(StatusCode, Json<Value>)>::from(self).into_response()
+    }
+}
+
+/// The access-log result for a refusal from [`enforce_http_admission`].
+pub(crate) fn admission_refusal(e: &(StatusCode, Json<Value>)) -> crate::access::AuthResult {
+    crate::access::AuthResult::Denied(match e.0 {
+        StatusCode::TOO_MANY_REQUESTS => "quota_exceeded",
+        _ => "admission_unavailable",
+    })
 }
 
 async fn check_nip98_replay_with_guard(
@@ -1127,26 +1235,14 @@ pub async fn submit_event(
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(&url);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
-    let pubkey_hex = pubkey.to_hex();
+    let caller = ProvenCaller::new(admission, &url, &tenant);
+    let pubkey_hex = caller.pubkey.to_hex();
 
     // Everything after auth — admission, replay, membership, parse, ingest —
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome = submit_event_authed(
-        &state,
-        &tenant,
-        &headers,
-        &body,
-        pubkey,
-        event_id_bytes,
-        auth,
-        signed_created_at,
-    )
-    .await;
+    let outcome = submit_event_authed(&state, &tenant, &headers, &body, caller).await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, kind, .. } => {
@@ -1260,25 +1356,17 @@ async fn submit_event_authed(
     tenant: &TenantContext,
     headers: &HeaderMap,
     body: &[u8],
-    pubkey: nostr::PublicKey,
-    event_id_bytes: [u8; 32],
-    auth: crate::access::AuthAttempt<'_>,
-    signed_auth_created_at: Option<u64>,
+    mut caller: ProvenCaller<'_>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
-    if let Err(e) = enforce_http_admission(state, tenant, &pubkey).await {
+    if let Err(e) = caller.rate_limit_and_replay(state, tenant).await {
         return SubmitOutcome::Err {
             status: e.0,
             response: e,
         };
     }
-    if let Err(e) = check_nip98_replay(state, tenant, event_id_bytes, auth).await {
-        return SubmitOutcome::Err {
-            status: e.0,
-            response: e,
-        };
-    }
+    let (pubkey, signed_auth_created_at) = (caller.pubkey, caller.signed_at);
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let event: nostr::Event = match serde_json::from_slice(body) {
@@ -1331,7 +1419,7 @@ async fn submit_event_authed(
         )
         .await
     };
-    let nip_oa_owner = match membership {
+    let nip_oa_owner = match caller.admit_member(membership) {
         Ok(owner) => owner.or_else(|| {
             if !state.config.require_relay_membership {
                 super::relay_members::extract_nip_oa_owner(
@@ -1482,26 +1570,14 @@ pub async fn query_events(
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(&url);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
-    let pubkey_hex = pubkey.to_hex();
+    let caller = ProvenCaller::new(admission, &url, &tenant);
+    let pubkey_hex = caller.pubkey.to_hex();
 
     // Admission, replay, membership, and filter execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result = query_events_authed(
-        &state,
-        &tenant,
-        &headers,
-        &body,
-        pubkey,
-        event_id_bytes,
-        auth,
-        signed_created_at,
-    )
-    .await;
+    let result = query_events_authed(&state, &tenant, &headers, &body, caller).await;
     match &result {
         Ok(Json(Value::Array(events))) => {
             tracing::info!(
@@ -1535,24 +1611,22 @@ async fn query_events_authed(
     tenant: &TenantContext,
     headers: &HeaderMap,
     body: &[u8],
-    pubkey: nostr::PublicKey,
-    event_id_bytes: [u8; 32],
-    auth: crate::access::AuthAttempt<'_>,
-    signed_auth_created_at: Option<u64>,
+    mut caller: ProvenCaller<'_>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_http_admission(state, tenant, &pubkey).await?;
-    check_nip98_replay(state, tenant, event_id_bytes, auth).await?;
+    caller.rate_limit_and_replay(state, tenant).await?;
+    let pubkey = caller.pubkey;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
-    super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
-        signed_auth_created_at,
+        caller.signed_at,
     )
-    .await?;
+    .await;
+    caller.admit_member(membership)?;
 
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
@@ -2166,26 +2240,14 @@ pub async fn count_events(
         .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(&url);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
-    let pubkey_hex = pubkey.to_hex();
+    let caller = ProvenCaller::new(admission, &url, &tenant);
+    let pubkey_hex = caller.pubkey.to_hex();
 
     // Admission, replay, membership, and count execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result = count_events_authed(
-        &state,
-        &tenant,
-        &headers,
-        &body,
-        pubkey,
-        event_id_bytes,
-        auth,
-        signed_created_at,
-    )
-    .await;
+    let result = count_events_authed(&state, &tenant, &headers, &body, caller).await;
     match &result {
         Ok(Json(value)) => {
             let count = value.get("count").and_then(Value::as_u64);
@@ -2217,24 +2279,22 @@ async fn count_events_authed(
     tenant: &TenantContext,
     headers: &HeaderMap,
     body: &[u8],
-    pubkey: nostr::PublicKey,
-    event_id_bytes: [u8; 32],
-    auth: crate::access::AuthAttempt<'_>,
-    signed_auth_created_at: Option<u64>,
+    mut caller: ProvenCaller<'_>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_http_admission(state, tenant, &pubkey).await?;
-    check_nip98_replay(state, tenant, event_id_bytes, auth).await?;
+    caller.rate_limit_and_replay(state, tenant).await?;
+    let pubkey = caller.pubkey;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
-    super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
-        signed_auth_created_at,
+        caller.signed_at,
     )
-    .await?;
+    .await;
+    caller.admit_member(membership)?;
 
     let raw: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
@@ -3009,27 +3069,28 @@ async fn authorize_moderation_read(
         .map(|auth| auth.proof(auth.event_id_bytes))
         .map_err(|e| e.into_response())
     })?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(&url);
-    let event_id_bytes = admission.into_extra();
-
-    check_nip98_replay(state, &tenant, event_id_bytes, auth)
+    let mut caller = ProvenCaller::new(admission, &url, &tenant);
+    caller
+        .replay(state, &tenant)
         .await
-        .map_err(|e| e.into_response())?;
-    let pubkey_bytes = pubkey.to_bytes().to_vec();
+        .map_err(IntoResponse::into_response)?;
+    let pubkey_bytes = caller.pubkey.to_bytes().to_vec();
 
     // Membership and community ban, same step as the other NIP-98 routes.
-    super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         super::relay_members::extract_auth_tag_header(headers),
         None,
     )
-    .await
-    .map_err(|e| e.into_response())?;
+    .await;
+    caller
+        .check(membership, super::relay_members::membership_refusal)
+        .map_err(IntoResponse::into_response)?;
 
-    crate::handlers::moderation_authz::authorize_moderation_action(
+    // Moderator authority is this route's last admission step.
+    let moderator = crate::handlers::moderation_authz::authorize_moderation_action(
         &tenant,
         state,
         &pubkey_bytes,
@@ -3037,14 +3098,16 @@ async fn authorize_moderation_read(
         crate::handlers::moderation_authz::ModerationTarget::None,
         crate::handlers::moderation_authz::ModerationAction::ViewQueue,
     )
-    .await
-    .map_err(|_| {
-        api_error(
-            StatusCode::FORBIDDEN,
-            "restricted: moderator access required",
-        )
-        .into_response()
-    })?;
+    .await;
+    caller
+        .admit(moderator, |_| AuthResult::Denied("not_moderator"))
+        .map_err(|_| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "restricted: moderator access required",
+            )
+            .into_response()
+        })?;
 
     Ok(tenant)
 }
@@ -3539,31 +3602,46 @@ pub(crate) mod postgres_tests {
         }
     }
 
+    /// Drive one request's line through the replay step the way
+    /// [`ProvenCaller`] does, then end the request without a decision.
     async fn replay_auth_lines(answer: Option<bool>) -> Vec<serde_json::Value> {
         let (_guard, out) = crate::access::tests::capture_scoped();
         let tenant = fresh_tenant("relay-a.example");
-        let auth = crate::access::AuthAttempt::http(
-            crate::access::AuthMethod::Nip98,
-            "/query?secret=1",
-            Some(Keys::generate().public_key()),
-            true,
+        let mut line = AuthLine::new(
+            crate::access::AuthAttempt::http(
+                crate::access::AuthMethod::Nip98,
+                "/query?secret=1",
+                Some(Keys::generate().public_key()),
+                true,
+            )
+            .in_community(tenant.community()),
         );
-        let _ = check_and_log_replay(
-            &FixedReplayGuard(answer),
-            &tenant,
-            fresh_nip98_event_id_bytes(),
-            auth,
-        )
-        .await;
+        line.abort_reason("request_ended");
+        let checked = line.gate(
+            check_nip98_replay_with_guard(
+                &FixedReplayGuard(answer),
+                &tenant,
+                fresh_nip98_event_id_bytes(),
+            )
+            .await,
+            ReplayRejection::auth_result,
+        );
+        if checked.is_ok() {
+            assert!(out.lines().is_empty(), "a passed replay check logs nothing");
+        }
+        drop(line);
         out.lines()
     }
 
+    /// Replay never logs success on its own: a refusal is the request's one
+    /// line, and a pass leaves the decision to the later admission steps
+    /// (here none run, so the request ends `aborted`).
     #[tokio::test(flavor = "current_thread")]
-    async fn nip98_replay_check_logs_one_terminal_auth_line_per_outcome() {
+    async fn nip98_replay_check_logs_only_its_refusal() {
         for (answer, outcome, reason) in [
-            (Some(true), "success", None),
-            (Some(false), "failed", Some("nip98_replay")),
-            (None, "denied", Some("replay_check_unavailable")),
+            (Some(true), "aborted", "request_ended"),
+            (Some(false), "failed", "nip98_replay"),
+            (None, "denied", "replay_check_unavailable"),
         ] {
             let lines = replay_auth_lines(answer).await;
             assert_eq!(lines.len(), 1, "{answer:?}: {lines:?}");
@@ -3571,12 +3649,9 @@ pub(crate) mod postgres_tests {
             assert_eq!(line["event"], "auth");
             assert_eq!(line["method"], "nip98");
             assert_eq!(line["outcome"], outcome);
+            assert_eq!(line["reason"], reason);
             assert_eq!(line["route"], "/query", "query string must not be logged");
             assert!(line["community"].is_string());
-            match reason {
-                Some(r) => assert_eq!(line["reason"], r),
-                None => assert!(line.get("reason").is_none()),
-            }
             assert!(!line.to_string().contains("simulated outage"));
         }
     }
@@ -3636,7 +3711,7 @@ pub(crate) mod postgres_tests {
             .await
             .expect_err("guard error MUST fail closed, never admit");
         assert_eq!(rejection, ReplayRejection::Unavailable);
-        let (status, body) = rejection.into_api_error();
+        let (status, body) = <(StatusCode, Json<Value>)>::from(rejection);
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -5838,6 +5913,224 @@ pub(crate) mod postgres_tests {
         let resp_headers = resp.headers().clone();
         let resp_body = to_bytes(resp.into_body(), 8192).await.unwrap_or_default();
         (status, resp_headers, resp_body)
+    }
+
+    // ── HTTP auth access lines: one line, at the final decision ─────────────
+
+    const QUERY_BODY: &[u8] = br#"[{"kinds":[1],"limit":1}]"#;
+
+    /// `state` with a community at a fresh host, and that host.
+    async fn with_community(state: &crate::state::AppState) -> String {
+        let host = format!("auth-line-{}.local", uuid::Uuid::new_v4().simple());
+        state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community");
+        host
+    }
+
+    /// POST a NIP-98-signed `/query` through the full router; returns the
+    /// status and the request's access auth lines.
+    async fn signed_query_auth_lines(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        keys: &Keys,
+    ) -> (axum::http::StatusCode, Vec<serde_json::Value>) {
+        let headers =
+            make_nip98_headers(keys, &format!("https://{host}/query"), "POST", QUERY_BODY);
+        let (_guard, out) = crate::access::tests::capture_scoped();
+        let status = oneshot_request(state, "POST", "/query", host, headers, QUERY_BODY).await;
+        let lines = out
+            .lines()
+            .into_iter()
+            .filter(|line| line["event"] == "auth")
+            .collect();
+        (status, lines)
+    }
+
+    fn assert_one_auth_line(
+        lines: &[serde_json::Value],
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
+        assert_eq!(lines.len(), 1, "exactly one auth line: {lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], outcome, "{line}");
+        match reason {
+            Some(reason) => assert_eq!(line["reason"], reason, "{line}"),
+            None => assert!(line.get("reason").is_none(), "{line}"),
+        }
+        assert_eq!(line["route"], "/query");
+        line.clone()
+    }
+
+    /// Positive control: an admitted `/query` logs one success, after the
+    /// membership and ban checks.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn admitted_query_logs_one_success_line() {
+        let state = nip_fi_off_test_state().await.expect("local Postgres");
+        let host = with_community(&state).await;
+        let keys = Keys::generate();
+        let (status, lines) = signed_query_auth_lines(state, &host, &keys).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let line = assert_one_auth_line(&lines, "success", None);
+        assert_eq!(line["method"], "nip98");
+        assert_eq!(line["pubkey"], keys.public_key().to_hex());
+        assert_eq!(line["pubkey_verified"], true);
+    }
+
+    /// A valid proof from a banned identity is refused by the ban check
+    /// after replay: one `denied` line, never a `success`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn banned_query_logs_one_denied_line() {
+        let state = nip_fi_off_test_state().await.expect("local Postgres");
+        let host = with_community(&state).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind community");
+        let keys = Keys::generate();
+        sqlx::query(
+            "INSERT INTO community_bans (community_id, pubkey, banned, actor_pubkey) \
+             VALUES ($1, $2, true, $2)",
+        )
+        .bind(tenant.community().as_uuid())
+        .bind(keys.public_key().to_bytes().as_slice())
+        .execute(state.db.pool())
+        .await
+        .expect("ban");
+        let (status, lines) = signed_query_auth_lines(state, &host, &keys).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_one_auth_line(&lines, "denied", Some("banned"));
+    }
+
+    /// On a members-only relay a valid proof from a nonmember is refused by
+    /// the membership check: one `denied` line.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn nonmember_query_logs_one_denied_line() {
+        let mut state = (*nip_fi_off_test_state().await.expect("local Postgres")).clone();
+        Arc::make_mut(&mut state.config).require_relay_membership = true;
+        let host = with_community(&state).await;
+        let (status, lines) =
+            signed_query_auth_lines(Arc::new(state), &host, &Keys::generate()).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_one_auth_line(&lines, "denied", Some("not_relay_member"));
+    }
+
+    /// The shared API rate limit refuses before replay: one `denied` line
+    /// for an exhausted quota and for an unreachable limiter.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres and Redis"]
+    async fn rate_limited_query_logs_one_denied_line() {
+        let base = nip_fi_off_test_state().await.expect("local Postgres");
+        let host = with_community(&base).await;
+
+        let mut quota = (*base).clone();
+        let mut auth_config = quota.config.auth.clone();
+        auth_config.rate_limits.human_api_calls_per_min = 0;
+        quota.auth = Arc::new(buzz_auth::AuthService::new(auth_config));
+        let (status, lines) =
+            signed_query_auth_lines(Arc::new(quota), &host, &Keys::generate()).await;
+        assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_one_auth_line(&lines, "denied", Some("quota_exceeded"));
+
+        let mut unavailable = (*base).clone();
+        let dead = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        unavailable.admission_rate_limiter =
+            Arc::new(buzz_pubsub::rate_limiter::RedisRateLimiter::new(dead));
+        let (status, lines) =
+            signed_query_auth_lines(Arc::new(unavailable), &host, &Keys::generate()).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_one_auth_line(&lines, "denied", Some("admission_unavailable"));
+    }
+
+    /// The outer assertion guard refuses before any handler runs, so it logs
+    /// the refusal itself: a missing assertion in Enforce and every request
+    /// in DenyProtected. In Shadow it refuses nothing and logs nothing, so the
+    /// handler's own line is the request's only one.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn assertion_guard_logs_its_refusals_and_shadow_logs_nothing() {
+        let enforce = nip_fi_enforce_test_state().await.expect("local Postgres");
+        let host = with_community(&enforce).await;
+        let keys = Keys::generate();
+
+        let (status, lines) = signed_query_auth_lines(enforce.clone(), &host, &keys).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        let line = assert_one_auth_line(&lines, "failed", Some("assertion_missing"));
+        assert_eq!(line["method"], "nip_fi");
+
+        let mut deny = (*enforce).clone();
+        Arc::make_mut(&mut deny.config).nip_fi.mode = buzz_auth::NipFiMode::DenyProtected;
+        let (status, lines) = signed_query_auth_lines(Arc::new(deny), &host, &keys).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_one_auth_line(&lines, "denied", Some("authorization_unavailable"));
+
+        let mut shadow = (*enforce).clone();
+        Arc::make_mut(&mut shadow.config).nip_fi.mode = buzz_auth::NipFiMode::Shadow;
+        let (status, lines) = signed_query_auth_lines(Arc::new(shadow), &host, &keys).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let line = assert_one_auth_line(&lines, "success", None);
+        assert_eq!(line["method"], "nip98");
+    }
+
+    /// A failed workflow-deletion write reaches the HTTP ERROR log as a fixed
+    /// kind: a database error quoting the event's content never appears.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn failed_workflow_deletion_logs_no_database_error_text() {
+        let state = nip_fi_off_test_state().await.expect("local Postgres");
+        let host = with_community(&state).await;
+        let marker = format!("wfdel-marker-{}", uuid::Uuid::new_v4().simple());
+        // A row trigger that fails with the inserted content as its message,
+        // for marker events only.
+        for sql in [
+            "CREATE OR REPLACE FUNCTION access_log_test_fail() RETURNS trigger \
+             LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION '%', NEW.content; END$$",
+            "DROP TRIGGER IF EXISTS access_log_test_fail ON events",
+            "CREATE TRIGGER access_log_test_fail BEFORE INSERT ON events FOR EACH ROW \
+             WHEN (NEW.content LIKE 'wfdel-marker-%') EXECUTE FUNCTION access_log_test_fail()",
+        ] {
+            sqlx::query(sql)
+                .execute(state.db.pool())
+                .await
+                .expect("install trigger");
+        }
+
+        let keys = Keys::generate();
+        let coordinate = format!(
+            "30620:{}:{}",
+            keys.public_key().to_hex(),
+            uuid::Uuid::new_v4()
+        );
+        let event = nostr::EventBuilder::new(nostr::Kind::EventDeletion, &marker)
+            .tag(nostr::Tag::parse(["a", &coordinate]).unwrap())
+            .sign_with_keys(&keys)
+            .unwrap();
+        let body = nostr::JsonUtil::as_json(&event).into_bytes();
+        let headers = make_nip98_headers(&keys, &format!("https://{host}/events"), "POST", &body);
+        let (guard, out) = crate::access::tests::capture_scoped();
+        let status =
+            oneshot_request(Arc::clone(&state), "POST", "/events", &host, headers, &body).await;
+        drop(guard);
+        sqlx::query("DROP TRIGGER access_log_test_fail ON events")
+            .execute(state.db.pool())
+            .await
+            .expect("remove trigger");
+
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let raw = out.raw();
+        let error = raw
+            .lines()
+            .find(|line| line.contains("\"level\":\"ERROR\""))
+            .unwrap_or_else(|| panic!("an ERROR line: {raw}"));
+        assert!(error.contains("workflow deletion write failed"), "{error}");
+        assert!(!raw.contains(&marker), "marker leaked: {raw}");
     }
 
     // ── F4: bridge POST /events — enforce mode, no assertion → 401 ──────────
@@ -9028,15 +9321,17 @@ pub(crate) mod postgres_tests {
                 &tenant,
                 &headers,
                 serde_json::to_vec(&event).expect("event json").as_slice(),
-                agent.public_key(),
-                fresh_nip98_event_id_bytes(),
-                crate::access::AuthAttempt::http(
-                    crate::access::AuthMethod::Nip98,
-                    "/api/events",
-                    Some(agent.public_key()),
-                    true,
-                ),
-                Some(nostr::Timestamp::now().as_secs()),
+                ProvenCaller {
+                    pubkey: agent.public_key(),
+                    event_id_bytes: fresh_nip98_event_id_bytes(),
+                    signed_at: Some(nostr::Timestamp::now().as_secs()),
+                    line: AuthLine::new(crate::access::AuthAttempt::http(
+                        crate::access::AuthMethod::Nip98,
+                        "/api/events",
+                        Some(agent.public_key()),
+                        true,
+                    )),
+                },
             )
             .await;
             assert!(

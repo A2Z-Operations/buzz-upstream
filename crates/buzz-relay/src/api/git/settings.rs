@@ -194,34 +194,39 @@ async fn authenticate(
             require_payload,
         ),
     )?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(path);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
+    let mut caller = bridge::ProvenCaller::new(admission, path, &tenant);
+    let (pubkey, signed_created_at) = (caller.pubkey, caller.signed_at);
 
-    bridge::enforce_http_admission(state, &tenant, &pubkey)
-        .await
-        .map_err(IntoResponse::into_response)?;
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes, auth)
+    caller
+        .rate_limit_and_replay(state, &tenant)
         .await
         .map_err(IntoResponse::into_response)?;
     let tag = relay_members::extract_auth_tag_header(headers);
-    relay_members::enforce_relay_membership(
+    let membership = relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         pubkey.as_bytes(),
         tag,
         signed_created_at,
     )
-    .await
-    .map_err(IntoResponse::into_response)?;
-    deny_banned_git_principal(
+    .await;
+    caller
+        .check(membership, relay_members::membership_refusal)
+        .map_err(IntoResponse::into_response)?;
+    let ban = deny_banned_git_principal(
         &state.db,
         tenant.community(),
         &pubkey,
         tag,
         signed_created_at,
     )
-    .await?;
+    .await;
+    caller.admit(ban, |refused| {
+        crate::access::AuthResult::Denied(match refused.status() {
+            StatusCode::FORBIDDEN => "banned",
+            _ => "ban_check_unavailable",
+        })
+    })?;
     // Admission ignores kind= restrictions by design (NIP-AA). Repository
     // management must not turn a message-only credential into write authority.
     // This HTTP operation has no event kind: only kind-unrestricted credentials

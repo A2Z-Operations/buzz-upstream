@@ -55,6 +55,15 @@ impl AssertionRejection {
             Self::Verifier(err) => err.code(),
         }
     }
+
+    /// The access-log result: an unavailable verifier is a refusal, every
+    /// other rejection is a failed proof.
+    pub(crate) const fn auth_result(self) -> crate::access::AuthResult {
+        match self {
+            Self::VerifierUnavailable => crate::access::AuthResult::Denied(self.code()),
+            _ => crate::access::AuthResult::Failed(self.code()),
+        }
+    }
 }
 
 /// Resolve the community served at the request `Host` — enforce-mode

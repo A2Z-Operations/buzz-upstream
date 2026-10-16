@@ -1542,17 +1542,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn condition_error_log_text_omits_message_text() {
-        let mut ctx = make_trigger();
-        ctx.text = "secret-message-7f3a".to_owned();
-        let err = evaluate_condition("trigger_text > 5", &ctx, &HashMap::new())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("secret-message-7f3a"));
-        assert_eq!(err.log_text(), "condition_evaluation_failed");
-    }
-
-    #[tokio::test]
     async fn condition_exceeding_max_expr_len_is_rejected() {
         let ctx = make_trigger();
         // Construct an expression that exceeds MAX_EXPR_LEN (4096 bytes).

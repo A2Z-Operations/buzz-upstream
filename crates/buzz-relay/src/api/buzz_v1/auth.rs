@@ -118,29 +118,43 @@ pub(super) async fn authorize(
             bridge_error((response.status(), Json(Value::Null)))
         }
     })?;
-    let actor = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(uri.path());
-    let (event_id, signed_at) = admission.into_extra();
-    bridge::enforce_http_admission(state, &tenant, &actor)
-        .await
-        .map_err(bridge_error)?;
-    bridge::check_nip98_replay(state, &tenant, event_id, auth)
+    let mut caller = bridge::ProvenCaller::new(admission, uri.path(), &tenant);
+    caller
+        .rate_limit_and_replay(state, &tenant)
         .await
         .map_err(bridge_error)?;
     let principal = Principal {
         tenant,
-        actor,
-        signed_at,
+        actor: caller.pubkey,
+        signed_at: caller.signed_at,
     };
-    recheck(state, headers, &principal).await?;
+    caller
+        .admit(
+            admission_checks(state, headers, &principal).await,
+            |(_, refusal)| *refusal,
+        )
+        .map_err(|(error, _)| error)?;
     Ok(principal)
 }
 
+/// Re-run the per-request admission checks for an authorized principal.
 pub(super) async fn recheck(
     state: &AppState,
     headers: &HeaderMap,
     principal: &Principal,
 ) -> Result<(), Error> {
+    admission_checks(state, headers, principal)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// Relay membership, then community ban. A refusal carries its access-log
+/// result alongside the response error.
+async fn admission_checks(
+    state: &AppState,
+    headers: &HeaderMap,
+    principal: &Principal,
+) -> Result<(), (Error, crate::access::AuthResult)> {
     relay_members::enforce_relay_membership(
         state,
         principal.tenant.community(),
@@ -149,14 +163,25 @@ pub(super) async fn recheck(
         principal.signed_at,
     )
     .await
-    .map_err(bridge_error)?;
+    .map_err(|e| {
+        let refusal = relay_members::membership_refusal(&e);
+        (bridge_error(e), refusal)
+    })?;
     let restrictions = state
         .db
         .moderation_restriction_state(principal.tenant.community(), &principal.actor.to_bytes())
         .await
-        .map_err(|_| Error::unavailable())?;
+        .map_err(|_| {
+            (
+                Error::unavailable(),
+                crate::access::AuthResult::Denied("ban_check_unavailable"),
+            )
+        })?;
     if restrictions.banned {
-        return Err(Error::new(StatusCode::FORBIDDEN, "forbidden"));
+        return Err((
+            Error::new(StatusCode::FORBIDDEN, "forbidden"),
+            crate::access::AuthResult::Denied("banned"),
+        ));
     }
     // Timeouts block posting conversation content, not personal reading.
     Ok(())

@@ -5538,15 +5538,16 @@ mod access_log_tests {
             format!("Nostr {token}").parse().unwrap(),
         );
 
-        let (result, out) = crate::access::tests::capture(|| {
+        let (refused, out) = crate::access::tests::capture(|| {
             verify_git_proof(
                 &headers,
                 "GET",
                 "https://relay.example/git/o/r.git/info/refs",
                 "/git/o/r.git/info/refs",
             )
+            .is_err()
         });
-        assert!(result.is_err());
+        assert!(refused);
         let lines = out.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0]["outcome"], "failed");

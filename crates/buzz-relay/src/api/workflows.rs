@@ -80,28 +80,25 @@ async fn authorize_workflow_read(
             false,
         ),
     )?;
-    let pubkey = *admission.proven_pubkey();
-    let auth = admission.auth_attempt(path);
-    let (event_id_bytes, signed_created_at) = admission.into_extra();
-
-    bridge::enforce_http_admission(state, &tenant, &pubkey)
-        .await
-        .map_err(|e| e.into_response())?;
-    bridge::check_nip98_replay(state, &tenant, event_id_bytes, auth)
+    let mut caller = bridge::ProvenCaller::new(admission, path, &tenant);
+    caller
+        .rate_limit_and_replay(state, &tenant)
         .await
         .map_err(|e| e.into_response())?;
 
-    let pubkey_bytes = pubkey.to_bytes().to_vec();
+    let pubkey_bytes = caller.pubkey.to_bytes().to_vec();
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
-    super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
-        signed_created_at,
+        caller.signed_at,
     )
-    .await
-    .map_err(|e| e.into_response())?;
+    .await;
+    caller
+        .admit_member(membership)
+        .map_err(|e| e.into_response())?;
 
     // A workflow the caller cannot read answers exactly like a missing one, so
     // the response never reveals which workflow IDs exist.
