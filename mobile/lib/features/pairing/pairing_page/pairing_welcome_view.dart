@@ -15,7 +15,6 @@ class _PairingWelcomeView extends StatelessWidget {
   final bool enteringCommunityLink;
   final VoidCallback? onCommunityLink;
   final VoidCallback? onBuilderlab;
-  final VoidCallback? onImportKey;
   final String? accountStatus;
   final Widget? setupContent;
   final String builderlabLabel;
@@ -37,7 +36,6 @@ class _PairingWelcomeView extends StatelessWidget {
     this.enteringCommunityLink = false,
     this.onCommunityLink,
     this.onBuilderlab,
-    this.onImportKey,
     this.accountStatus,
     this.setupContent,
     this.builderlabLabel = 'Connect to Builderlab',
@@ -104,11 +102,6 @@ class _PairingWelcomeView extends StatelessWidget {
                   style: context._onboardingGhostButtonStyle,
                   onPressed: isBusy ? null : onAlreadyUseBuzz,
                   child: const Text('Use pairing code'),
-                ),
-                TextButton(
-                  style: context._onboardingGhostButtonStyle,
-                  onPressed: isBusy ? null : onImportKey,
-                  child: const Text('Import a Nostr key'),
                 ),
               ] else ...[
                 if (!connectionLanding) ...[

@@ -48,7 +48,6 @@ class PairingPage extends HookConsumerWidget {
   final bool enteringCommunityLink;
   final VoidCallback? onCommunityLink;
   final VoidCallback? onBuilderlab;
-  final VoidCallback? onImportKey;
   final String? accountStatus;
   final Widget? setupContent;
   final String builderlabLabel;
@@ -64,7 +63,6 @@ class PairingPage extends HookConsumerWidget {
     this.enteringCommunityLink = false,
     this.onCommunityLink,
     this.onBuilderlab,
-    this.onImportKey,
     this.accountStatus,
     this.setupContent,
     this.builderlabLabel = 'Connect to Builderlab',
@@ -270,7 +268,6 @@ class PairingPage extends HookConsumerWidget {
                       ref.read(pendingDeepLinkProvider.notifier).open(uri);
                     },
                     onBuilderlab: onBuilderlab,
-                    onImportKey: onImportKey,
                     accountStatus: accountStatus,
                     setupContent: setupContent,
                     builderlabLabel: builderlabLabel,

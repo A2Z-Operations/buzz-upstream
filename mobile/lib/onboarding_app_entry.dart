@@ -8,9 +8,6 @@ import 'features/onboarding/hosted_connect_sheet.dart';
 import 'features/pairing/pairing_provider.dart';
 import 'hosted_app_gate.dart';
 import 'shared/hosted/hosted_flow.dart';
-import 'shared/hosted/account_identity_store.dart';
-import 'shared/identity_transfer/nsec_import_sheet.dart';
-import 'shared/identity_transfer/nsec_transfer.dart';
 import 'shared/hosted/hosted_flow_problem_message.dart';
 
 /// Navigation over the existing branded welcome surface.
@@ -21,7 +18,6 @@ class OnboardingAppEntry extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final existingUser = useState(false);
-    final importedIdentity = useState(false);
     final enteringCommunityLink = useState(false);
     final flow = ref.watch(hostedFlowProvider);
     useListenable(flow);
@@ -87,8 +83,6 @@ class OnboardingAppEntry extends HookConsumerWidget {
         ? 'Connecting to Builderlab…'
         : flow.noCommunitiesToAdd
         ? 'No communities available to add. Scan a QR code or use an invite link.'
-        : importedIdentity.value
-        ? 'Identity saved. Continue with Builderlab to back it up and find your communities.'
         : connected
         ? 'Connected to Builderlab.'
         : null;
@@ -109,21 +103,6 @@ class OnboardingAppEntry extends HookConsumerWidget {
       child: PairingPage(
         connectionLanding: true,
         addingCommunity: addingCommunity,
-        onImportKey: () async {
-          final imported = await showNsecImportSheet(
-            context,
-            onImport: (nsec) async {
-              await NsecTransfer.importAccount(
-                nsec,
-                AccountIdentityStore(),
-                checkCurrent: () {
-                  if (!context.mounted) throw StateError('Import cancelled');
-                },
-              );
-            },
-          );
-          if (context.mounted && imported) importedIdentity.value = true;
-        },
         existingUser: existingUser.value,
         enteringCommunityLink: enteringCommunityLink.value,
         onCommunityLink: () => enteringCommunityLink.value = true,
