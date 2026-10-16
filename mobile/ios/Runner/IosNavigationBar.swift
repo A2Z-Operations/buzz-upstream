@@ -620,7 +620,7 @@ private final class IosNavigationBarView: NSObject, FlutterPlatformView {
     let surface = UIVisualEffectView()
     if #available(iOS 26.0, *) {
       let glass = UIGlassEffect(style: .regular)
-      glass.tintColor = controlBackground
+      glass.isInteractive = true
       surface.effect = glass
     } else {
       surface.backgroundColor = controlBackground

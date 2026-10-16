@@ -213,8 +213,8 @@ class _MorphingQuickActionsButton extends HookWidget {
                                             customBorder: const CircleBorder(),
                                             onTap: onToggle,
                                             child: Center(
-                                              child: Icon(
-                                                icon,
+                                              child: ComposeMorphIcon(
+                                                compose: icon == BuzzIcons.edit,
                                                 color:
                                                     defaultTargetPlatform ==
                                                         TargetPlatform.iOS

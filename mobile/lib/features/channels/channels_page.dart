@@ -1,5 +1,6 @@
 import 'channel_unread.dart';
 import '../../shared/widgets/collapsible_section_body.dart';
+import '../../shared/widgets/compose_morph_icon.dart';
 import '../../shared/me/me_sync.dart';
 import 'dart:async';
 import 'dart:io';
