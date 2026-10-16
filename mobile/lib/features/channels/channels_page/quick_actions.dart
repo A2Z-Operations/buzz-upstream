@@ -8,23 +8,27 @@ const double _kMorphOpenBounce = 0.14;
 const double _kMorphCloseBounce = 0.06;
 const double _kMorphClosedSize = 56;
 const double _kMorphOpenHeight = 216;
-const double _kMorphOpenRadius = 20;
+const double _kMorphOpenRadius = mobileTabBarHeight / 2;
 const double _kMorphSlide = 40;
 const double _kMorphScale = 0.97;
 const double _kMorphBlur = 2;
-const double _kQuickActionCardOverlayOpacity = 0.1;
+
 const double _kQuickActionCardRadius = _kMorphOpenRadius - Grid.xxs;
 
 class _MorphingQuickActionsButton extends HookWidget {
   final bool open;
   final double openEdgeOffset;
-  final VoidCallback onToggle;
+  final VoidCallback? onToggle;
+  final String label;
+  final IconData icon;
   final ValueChanged<_QuickAction> onSelected;
 
   const _MorphingQuickActionsButton({
     required this.open,
     required this.openEdgeOffset,
     required this.onToggle,
+    required this.label,
+    required this.icon,
     required this.onSelected,
   });
 
@@ -124,7 +128,7 @@ class _MorphingQuickActionsButton extends HookWidget {
             height: height,
             child: _QuickActionsSurface(
               radius: radius,
-              child: ClipRRect(
+              child: ClipRSuperellipse(
                 borderRadius: borderRadius,
                 clipBehavior: Clip.antiAlias,
                 child: Material(
@@ -200,22 +204,22 @@ class _MorphingQuickActionsButton extends HookWidget {
                                           ((1 - _kMorphScale) *
                                               surfaceProgress),
                                       child: Tooltip(
-                                        message: 'Create or start conversation',
+                                        message: label,
                                         child: Semantics(
                                           button: true,
-                                          label: 'Create or start conversation',
+                                          label: label,
                                           expanded: open,
                                           child: InkWell(
                                             customBorder: const CircleBorder(),
                                             onTap: onToggle,
                                             child: Center(
                                               child: Icon(
-                                                BuzzIcons.plus,
+                                                icon,
                                                 color:
                                                     defaultTargetPlatform ==
                                                         TargetPlatform.iOS
-                                                    ? Colors.white
-                                                    : context.colors.onPrimary,
+                                                    ? context.colors.onSurface
+                                                    : Colors.white,
                                               ),
                                             ),
                                           ),
@@ -251,10 +255,12 @@ class _QuickActionsSurface extends StatelessWidget {
   Widget build(BuildContext context) {
     final isIos = defaultTargetPlatform == TargetPlatform.iOS;
     return DecoratedBox(
-      decoration: BoxDecoration(
-        color: isIos ? null : context.colors.primary,
-        borderRadius: BorderRadius.circular(radius),
-        boxShadow: [
+      decoration: ShapeDecoration(
+        color: isIos ? null : const Color(0xFF262626),
+        shape: RoundedSuperellipseBorder(
+          borderRadius: BorderRadius.circular(radius),
+        ),
+        shadows: [
           BoxShadow(
             color: context.colors.shadow.withValues(alpha: isIos ? 0.10 : 0.24),
             blurRadius: isIos ? 20 : 12,
@@ -267,8 +273,7 @@ class _QuickActionsSurface extends StatelessWidget {
               key: const ValueKey('quick-actions-ios-glass'),
               enabled: true,
               usesGlass: true,
-              glassTintColor: Colors.black,
-              color: Colors.black,
+              color: context.controlSurface,
               providesSheetSurface: false,
               padding: EdgeInsets.zero,
               minimumRadius: radius,
@@ -335,18 +340,20 @@ class _QuickActionItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isIos = defaultTargetPlatform == TargetPlatform.iOS;
-    final foreground = isIos ? Colors.white : context.colors.onPrimary;
+    final foreground = isIos ? context.colors.onSurface : Colors.white;
     final background = isIos
-        ? foreground.withValues(alpha: _kQuickActionCardOverlayOpacity)
+        ? context.controlSurface
         : Color.alphaBlend(
-            foreground.withValues(alpha: _kQuickActionCardOverlayOpacity),
-            context.colors.primary,
+            Colors.white.withValues(alpha: 0.1),
+            const Color(0xFF262626),
           );
 
     return Expanded(
       child: Material(
         color: background,
-        borderRadius: BorderRadius.circular(_kQuickActionCardRadius),
+        shape: RoundedSuperellipseBorder(
+          borderRadius: BorderRadius.circular(_kQuickActionCardRadius),
+        ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: onTap,

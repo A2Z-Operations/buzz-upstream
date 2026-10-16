@@ -89,13 +89,7 @@ final class JumpToLatestGlassButtonPlatformView: NSObject, FlutterPlatformView {
     }
     configuration.cornerStyle = .capsule
     configuration.baseForegroundColor = .label
-    configuration.image = UIImage(
-      systemName: "arrow.down",
-      withConfiguration: UIImage.SymbolConfiguration(
-        pointSize: 16,
-        weight: .semibold
-      )
-    )
+    configuration.image = NativeTabler.image("arrow.down", size: 16)
     button.configuration = configuration
     button.accessibilityLabel = "Jump to latest message"
     button.translatesAutoresizingMaskIntoConstraints = false
@@ -450,13 +444,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       let pointSize: CGFloat = icon == "shutter"
         ? controlSize * Self.shutterIconRatio
         : 17
-      buttonImage = UIImage(
-        systemName: buttonIconName,
-        withConfiguration: UIImage.SymbolConfiguration(
-          pointSize: pointSize,
-          weight: .semibold
-        )
-      )
+      buttonImage = NativeTabler.image(buttonIconName, size: pointSize)
     }
     updateDisplayedContent()
     button.setNeedsUpdateConfiguration()
