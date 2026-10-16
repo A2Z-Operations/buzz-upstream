@@ -3,13 +3,10 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/hosted/hosted_flow.dart';
-import '../../shared/hosted/hosted_flow_problem_message.dart';
-import '../../shared/utils/string_utils.dart';
-import '../../shared/theme/grid.dart';
-import '../../shared/theme/theme_extensions.dart';
-import 'hosted_community_selection.dart';
+import '../../shared/widgets/modal_presentation.dart';
+import 'hosted_connect_sheet.dart';
 
-/// Presents the app-scoped real flow without retaining credentials or keys.
+/// Presents setup with the same modal chrome as the app's other sheets.
 class HostedConnectPage extends HookConsumerWidget {
   const HostedConnectPage({
     super.key,
@@ -21,118 +18,34 @@ class HostedConnectPage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    useListenable(flow);
-    final working = flow.stage == HostedFlowStage.working;
-    final message = switch (flow.stage) {
-      HostedFlowStage.idle => 'Continue connecting your account.',
-      HostedFlowStage.working =>
-        flow.addingCommunityName == null
-            ? 'Securing your account and finding communities…'
-            : 'Adding ${flow.addingCommunityName}…',
-      HostedFlowStage.chooseCommunities =>
-        flow.communities.isEmpty
-            ? 'No communities to add. Create one in Builderlab, then refresh, or enter a community link.'
-            : 'Choose your communities',
-      HostedFlowStage.communityConflict =>
-        '${flow.addingCommunityName} is already saved with a different identity. '
-            'Keep that identity and skip this addition, or return to your choices?',
-      HostedFlowStage.chooseIdentity =>
-        flow.identityChoices.any((choice) => choice.fromCloud)
-            ? 'Use your Builderlab identity on this device? It differs from your saved community identities. Those keys and your cloud backups will be kept. This app cannot change the selected Builderlab identity later.'
-            : 'Choose the identity to connect to Builderlab. It will be bound to your account and backed up. Existing keys will be kept. This app cannot change the selected Builderlab identity later.',
-      HostedFlowStage.signIn => 'Complete sign-in in your browser.',
-      HostedFlowStage.browserReturned =>
-        'Continue setup in your browser. Open your community in Buzz when it is ready.',
-      HostedFlowStage.complete => 'Your community is ready.',
-      HostedFlowStage.blocked => hostedFlowProblemMessage(flow.problem),
-    };
-    void close() {
-      onClose();
-    }
-
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) close();
-      },
-      child: Stack(
-        children: [
-          ModalBarrier(color: Colors.black54, dismissible: false),
-          AlertDialog(
-            title: const Text('Connect to Builderlab'),
-            content: SizedBox(
-              width: 440,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(message, style: context.textTheme.titleLarge),
-                    const SizedBox(height: Grid.sm),
-                    for (final choice in flow.identityChoices)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: Grid.sm),
-                        child: OutlinedButton(
-                          onPressed: () => flow.chooseIdentity(choice.pubkey),
-                          child: Padding(
-                            padding: const EdgeInsets.all(Grid.sm),
-                            child: Column(
-                              children: [
-                                Text(choice.label),
-                                Text(fullNpub(choice.pubkey) ?? choice.pubkey),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    if (flow.stage == HostedFlowStage.chooseCommunities)
-                      HostedCommunitySelection(flow: flow),
-                    if (flow.stage == HostedFlowStage.communityConflict)
-                      FilledButton(
-                        onPressed: flow.skipConflictingCommunity,
-                        child: const Text('Keep saved identity and skip'),
-                      ),
-                    if (flow.canChangeCommunities)
-                      OutlinedButton(
-                        onPressed: flow.backToCommunityChoices,
-                        child: const Text('Back to choices'),
-                      ),
-                    if ((flow.stage == HostedFlowStage.blocked ||
-                            flow.stage == HostedFlowStage.communityConflict) &&
-                        flow.addedCommunityCount > 0)
-                      Text(
-                        '${flow.addedCommunityCount} '
-                        '${flow.addedCommunityCount == 1 ? "community" : "communities"} added and kept.'
-                        '${flow.canRetry && flow.stage == HostedFlowStage.blocked ? " Retry continues the remaining additions." : ""}',
-                      ),
-                    if (working)
-                      const Center(child: CircularProgressIndicator()),
-                    if (!working &&
-                        flow.stage != HostedFlowStage.chooseIdentity &&
-                        flow.stage != HostedFlowStage.chooseCommunities &&
-                        flow.stage != HostedFlowStage.communityConflict &&
-                        flow.stage != HostedFlowStage.complete &&
-                        flow.stage != HostedFlowStage.browserReturned &&
-                        flow.canRetry)
-                      FilledButton(
-                        onPressed: flow.retry,
-                        child: Text(
-                          flow.stage == HostedFlowStage.signIn
-                              ? 'Start login again'
-                              : 'Try again',
-                        ),
-                      ),
-                    TextButton(
-                      onPressed: close,
-                      child: const Text('Leave setup'),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
+    useEffect(() {
+      var active = true;
+      ModalRoute<dynamic>? sheetRoute;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!active || !context.mounted) return;
+        await showBuzzModalBottomSheet<void>(
+          context: context,
+          title: 'Connect to Builderlab',
+          useRootNavigator: true,
+          isScrollControlled: true,
+          useSafeArea: true,
+          builder: (sheetContext) {
+            sheetRoute = ModalRoute.of(sheetContext);
+            return HostedConnectSheet(flow: flow);
+          },
+        );
+        if (active) onClose();
+      });
+      return () {
+        active = false;
+        final route = sheetRoute;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (route != null && route.isActive) {
+            route.navigator?.removeRoute(route);
+          }
+        });
+      };
+    }, [flow]);
+    return const SizedBox.shrink();
   }
 }

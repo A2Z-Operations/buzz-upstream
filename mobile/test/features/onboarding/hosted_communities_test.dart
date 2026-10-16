@@ -1,4 +1,5 @@
 import 'package:buzz/features/onboarding/hosted_connect_page.dart';
+import 'package:buzz/shared/widgets/buzz_sheet_header.dart';
 import 'package:buzz/hosted_app_gate.dart';
 import 'package:buzz/onboarding_app_entry.dart';
 import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
@@ -127,15 +128,41 @@ void main() {
         expect(find.byType(HostedConnectPage), findsNothing);
         expect(find.text('Scan a QR code'), findsOneWidget);
         expect(find.text('Use pairing code'), findsOneWidget);
+        expect(
+          find.text(
+            'No communities available to add. Scan a QR code or use an invite link.',
+          ),
+          findsOneWidget,
+        );
         f.rows = [f.row('denied')];
         f.beforeAdmission = (_) async => throw AccountFailure.denied;
         await tester.tap(find.text('Continue with Builderlab'));
         await tester.pumpAndSettle();
-        expect(find.byType(AlertDialog), findsOneWidget);
-        expect(find.text('Scan a QR code'), findsOneWidget);
-        await tester.tap(find.text('Leave setup').hitTestable());
+        expect(find.byType(BuzzSheetHeader), findsOneWidget);
+        expect(
+          find.text(
+            'No communities available to add. Scan a QR code or use an invite link.',
+          ),
+          findsNothing,
+        );
+        final semantics = tester.ensureSemantics();
         await tester.pumpAndSettle();
-        expect(find.byType(AlertDialog), findsNothing);
+        expect(
+          tester
+              .binding
+              .renderViews
+              .single
+              .owner!
+              .semanticsOwner!
+              .rootSemanticsNode!
+              .toStringDeep(),
+          isNot(contains('Scan a QR code')),
+        );
+        semantics.dispose();
+        expect(find.text('Scan a QR code'), findsOneWidget);
+        await tester.tap(find.byTooltip('Close sheet').hitTestable());
+        await tester.pumpAndSettle();
+        expect(find.byType(BuzzSheetHeader), findsNothing);
         expect(find.text('Scan a QR code'), findsOneWidget);
       }
     },

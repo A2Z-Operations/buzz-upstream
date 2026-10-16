@@ -443,28 +443,6 @@ class HostedFlow extends ChangeNotifier {
     return _enqueue(() => _continue(generation));
   }
 
-  Future<void> refreshCommunities() {
-    if (!accountOnly || stage != HostedFlowStage.chooseCommunities) {
-      return Future.value();
-    }
-    _addingCommunities = false;
-    return retry();
-  }
-
-  Future<void> openCommunityCreation() async {
-    if (stage != HostedFlowStage.chooseCommunities) return;
-    final generation = _generation;
-    try {
-      if (!await _openWeb(HostedEnvironment.origin.resolve('/buzz'))) {
-        throw BrowserAuthFailure.unavailable;
-      }
-    } catch (error) {
-      if (!_disposed && generation == _generation) {
-        _set(HostedFlowStage.blocked, _problemFor(error));
-      }
-    }
-  }
-
   Future<void> _continueCommunities(
     int generation,
     String subject,
@@ -480,7 +458,7 @@ class HostedFlow extends ChangeNotifier {
       communities = listed;
       selectedRelays = Set.unmodifiable(listed.map((item) => item.relayUrl));
       if (listed.isEmpty) {
-        await leave();
+        await leave(noCommunities: true);
         return;
       }
       if (listed.length != 1) {
@@ -514,7 +492,7 @@ class HostedFlow extends ChangeNotifier {
       communities = List.unmodifiable(
         communities.where((item) => selectedRelays.contains(item.relayUrl)),
       );
-      await leave();
+      await leave(noCommunities: true);
       return;
     }
     await browser.clearIntent();
@@ -606,7 +584,10 @@ class HostedFlow extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool noCommunitiesToAdd = false;
+
   void _clearCommunityBatch() {
+    noCommunitiesToAdd = false;
     communities = const [];
     selectedRelays = const {};
     _addedRelays.clear();
@@ -616,12 +597,13 @@ class HostedFlow extends ChangeNotifier {
     addingCommunityName = null;
   }
 
-  Future<void> leave() async {
+  Future<void> leave({bool noCommunities = false}) async {
     ++_generation;
     final generation = _generation;
     _target = null;
     accountOnly = false;
     _clearCommunityBatch();
+    noCommunitiesToAdd = noCommunities;
     try {
       await browser.cancel();
       if (_disposed || generation != _generation) return;

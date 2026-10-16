@@ -34,7 +34,9 @@ class OnboardingAppEntry extends HookConsumerWidget {
             flow.stage == HostedFlowStage.signIn);
     final connected = flow.account.account != null;
     final problem = flow.accountOnly ? flow.problem : null;
-    final status = connected
+    final status = flow.noCommunitiesToAdd
+        ? 'No communities available to add. Scan a QR code or use an invite link.'
+        : connected
         ? 'Connected to Builderlab. Your session is saved securely on this device.'
         : problem != null
         ? switch (problem) {
